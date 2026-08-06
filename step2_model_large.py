@@ -78,6 +78,7 @@ def _allreduce(val, op):
 
 def rprint(*a, **k) -> None:
     if RANK == 0:
+        k.setdefault("flush", True)
         print(*a, **k)
 
 

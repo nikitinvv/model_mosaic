@@ -46,6 +46,7 @@ def _barrier() -> None:
 
 def rprint(*a, **k) -> None:
     if RANK == 0:
+        k.setdefault("flush", True)
         print(*a, **k)
 
 
