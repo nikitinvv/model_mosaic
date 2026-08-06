@@ -1,0 +1,5 @@
+# x tile origins (detector px).  axis=0, tile=404, overlap=25, axis_inset=25, z stacks=9, sample ⌀3.58 mm
+-25
+354
+733
+1112
