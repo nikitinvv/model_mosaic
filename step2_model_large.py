@@ -230,27 +230,47 @@ def _run_radon(theta: np.ndarray, proj_paths: list[str]) -> None:
     rprint(f"fd limit: soft={_FD_ACHIEVED} (requested >= {_FD_TARGET}); "
            f"MMAP_BATCH={MMAP_BATCH}")
 
+    # Bootstrap the NTHETA proj_*.tif files.  Rank 0 creates one sample file
+    # first to derive the TIFF pixel-data offset (all files share the same
+    # layout since they have identical shape/dtype), then broadcasts pix_off.
+    # All ranks then create their round-robin share of files in parallel via
+    # a thread pool — massively faster than rank 0 alone for large NTHETA.
     expected_pix_bytes = NZ * N * 4
     pix_off = None
     if RANK == 0:
-        # Compute the pixel-data offset once from the first file (all files
-        # share the same TIFF layout since they have identical shape/dtype).
-        for p in proj_paths:
-            if os.path.exists(p):
-                os.remove(p)
-            mm = tifffile.memmap(p, shape=(NZ, N), dtype=np.float32,
-                                 bigtiff=True)
-            mm.flush()
-            del mm
-            if pix_off is None:
-                with tifffile.TiffFile(p) as tf:
-                    pix_off = int(tf.pages[0].dataoffsets[0])
-            need = pix_off + expected_pix_bytes
-            if os.path.getsize(p) < need:
-                os.truncate(p, need)
+        p0 = proj_paths[0]
+        if os.path.exists(p0):
+            os.remove(p0)
+        mm = tifffile.memmap(p0, shape=(NZ, N), dtype=np.float32, bigtiff=True)
+        mm.flush()
+        del mm
+        with tifffile.TiffFile(p0) as tf:
+            pix_off = int(tf.pages[0].dataoffsets[0])
+        need = pix_off + expected_pix_bytes
+        if os.path.getsize(p0) < need:
+            os.truncate(p0, need)
     if _COMM is not None:
         pix_off = _COMM.bcast(pix_off, root=0)
+    need = pix_off + expected_pix_bytes
+
+    def _bootstrap_one(i: int) -> None:
+        p = proj_paths[i]
+        if os.path.exists(p):
+            os.remove(p)
+        mm = tifffile.memmap(p, shape=(NZ, N), dtype=np.float32, bigtiff=True)
+        mm.flush()
+        del mm
+        if os.path.getsize(p) < need:
+            os.truncate(p, need)
+
+    # Rank 0 has already done file 0.  Distribute the remainder round-robin.
+    my_boot = [i for i in range(NTHETA)
+               if i % SIZE == RANK and not (RANK == 0 and i == 0)]
+    with ThreadPoolExecutor(max_workers=N_LOAD_THREADS) as bpool:
+        list(bpool.map(_bootstrap_one, my_boot))
     _barrier()
+    rprint(f"bootstrap done ({NTHETA} files, {SIZE} ranks × "
+           f"{N_LOAD_THREADS} threads)")
 
     proj_min, proj_max = np.inf, -np.inf
 
