@@ -231,7 +231,10 @@ def _run_radon(theta: np.ndarray, proj_paths: list[str]) -> None:
            f"MMAP_BATCH={MMAP_BATCH}")
 
     expected_pix_bytes = NZ * N * 4
+    pix_off = None
     if RANK == 0:
+        # Compute the pixel-data offset once from the first file (all files
+        # share the same TIFF layout since they have identical shape/dtype).
         for p in proj_paths:
             if os.path.exists(p):
                 os.remove(p)
@@ -239,11 +242,14 @@ def _run_radon(theta: np.ndarray, proj_paths: list[str]) -> None:
                                  bigtiff=True)
             mm.flush()
             del mm
-            with tifffile.TiffFile(p) as tf:
-                pix_off = int(tf.pages[0].dataoffsets[0])
+            if pix_off is None:
+                with tifffile.TiffFile(p) as tf:
+                    pix_off = int(tf.pages[0].dataoffsets[0])
             need = pix_off + expected_pix_bytes
             if os.path.getsize(p) < need:
                 os.truncate(p, need)
+    if _COMM is not None:
+        pix_off = _COMM.bcast(pix_off, root=0)
     _barrier()
 
     proj_min, proj_max = np.inf, -np.inf
@@ -279,13 +285,15 @@ def _run_radon(theta: np.ndarray, proj_paths: list[str]) -> None:
                 proj_chunk_h = res_h[:, :k].real.astype(np.float32, copy=False)
                 del res_h
 
-                # Threaded scatter: each thread owns one file's whole
-                # open/write/flush lifecycle, so concurrent fd usage is
-                # bounded by pool size (N_LOAD_THREADS).
+                # Threaded scatter with raw np.memmap at the known pixel
+                # offset — skips tifffile's header re-parse on every open,
+                # which is prone to `not a TIFF file: header=b''` under
+                # concurrent shared-filesystem writes.
                 batch_ntheta = tb1 - tb0
 
                 def _scatter_one(i: int) -> None:
-                    mm = tifffile.memmap(proj_paths[tb0 + i], mode='r+')
+                    mm = np.memmap(proj_paths[tb0 + i], dtype=np.float32,
+                                   mode='r+', shape=(NZ, N), offset=pix_off)
                     mm[z0:z1] = proj_chunk_h[i]
                     mm.flush()
 

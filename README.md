@@ -98,6 +98,13 @@ Shared filesystem (Lustre/GPFS/NFS) is assumed — `--path` should point at the
 same location from every node.  Each MPI rank writes only its own shard, and
 ranks synchronise via `MPI.Barrier` between stages.
 
+**Site-specific `--path` defaults for the init dataset:**
+
+| site  | init folder location                    | pass to `--path`                |
+|-------|-----------------------------------------|---------------------------------|
+| APS   | `/data2/brain_sym_mosaic/init`          | `--path /data2/brain_sym_mosaic`|
+| MaxIV | `/data/ingest/vviknik/init` *(current)* | `--path /data/ingest/vviknik`   |
+
 ---
 
 ## What each step produces
