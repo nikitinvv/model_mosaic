@@ -1,9 +1,27 @@
 # model_mosaic
 
-Simulate an extended-FOV **mosaic X-ray tomography scan** from a reconstructed
-volume: layout the tile grid → upsample the input volume → forward-project via
-USFFT Radon → propagate via Fresnel → slice the propagated data into per-tile
-HDF5 files ready for downstream stitching.
+Simulate an extended-FOV **mosaic X-ray phase-contrast tomography scan** from a
+reconstructed volume.  The simulation is a full two-physics forward model —
+first **tomographic projection** through the object via a non-uniform-FFT Radon
+transform, then **near-field wave propagation** of the resulting complex
+transmission function through free space via the **Fresnel transform** — so the
+output isn't just a Radon sinogram but the actual intensity that would be
+recorded on a detector in a holographic / propagation-based phase-contrast
+experiment:
+
+```
+     δ (refractive index)  ──R──► proj = R(δ)              (USFFT Radon)
+                                    │
+                                    ▼
+              ψ = exp(1j · (x22 + 1j · β))                  (weak absorption)
+                                    │
+                                    ▼
+              data = |D_prop(ψ)|²                           (Fresnel propagation)
+```
+
+Pipeline: layout the tile grid → upsample the input volume → forward-project
+via USFFT Radon → propagate via Fresnel → slice the propagated data into
+per-tile HDF5 files ready for downstream stitching.
 
 ![Mosaic scan schematic](mosaic_schematic.png)
 
@@ -158,9 +176,12 @@ propagates via `Propagation.D`, and writes `data.h5 = |D(ψ)|²` chunked
 ![step2 data angle 0](docs/step2_data_angle0.png)
 
 **Step 3 — extract** slices `data.h5` into per-tile HDF5 files using
-the mosaic layout.  One tile at `(z=4, x=2)` at ~45°:
+the mosaic layout.  First and last tiles at ~45° — `(z=0, x=0)` is the
+top-of-sample tile containing the rotation axis (tile 0's disk), and
+`(z=8, x=3)` is the bottom-of-sample outer annulus, mostly air:
 
-![step3 extract tile 4_2](docs/step3_extract_tile_4_2.png)
+![step3 extract tile 0_0](docs/step3_extract_tile_0_0.png)
+![step3 extract tile 8_3](docs/step3_extract_tile_8_3.png)
 
 ---
 

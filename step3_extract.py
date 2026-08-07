@@ -156,6 +156,17 @@ def main() -> None:
                 d = g.create_dataset("data", data=tile,
                                      chunks=(1, DET_H, DET_W))
                 g.create_dataset("theta", data=theta_deg)   # DEGREES
+                # Synthetic flat/dark fields for downstream reconstruction:
+                # data_white = ones (perfect flat), data_dark = zeros (no noise).
+                # One image each, matching the standard tomography convention.
+                g.create_dataset(
+                    "data_white",
+                    data=np.ones((1, DET_H, DET_W), dtype=np.float32),
+                )
+                g.create_dataset(
+                    "data_dark",
+                    data=np.zeros((1, DET_H, DET_W), dtype=np.float32),
+                )
                 d.attrs["z_tile"]  = zi
                 d.attrs["x_tile"]  = xi
                 d.attrs["z_start"] = r0
