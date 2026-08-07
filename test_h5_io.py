@@ -118,12 +118,20 @@ def _describe(name: str, shape, chunks, dtype_bytes: int) -> None:
 
 
 def _create_h5(path: str, name: str, shape, chunks, dtype="float32") -> None:
-    """Collective create — all ranks call together with same args."""
+    """Collective create with fill_time=NEVER — skips the default per-chunk
+    zero-fill that HDF5 does at allocation time.  At TB scale with millions
+    of chunks the fill alone can take longer than the entire benchmark.
+    Chunks start undefined; overwritten by the subsequent write loops."""
     if RANK == 0 and os.path.exists(path):
         os.remove(path)
     _barrier()
     with h5py.File(path, "w", **_H5_KW) as f:
-        f.create_dataset(name, shape=shape, dtype=dtype, chunks=chunks)
+        space = h5py.h5s.create_simple(shape)
+        tid   = h5py.h5t.py_create(np.dtype(dtype), logical=True)
+        dcpl  = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_chunk(chunks)
+        dcpl.set_fill_time(h5py.h5d.FILL_TIME_NEVER)
+        h5py.h5d.create(f.id, name.encode(), tid, space, dcpl=dcpl).close()
     _barrier()
 
 
