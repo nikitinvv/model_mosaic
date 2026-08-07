@@ -122,10 +122,10 @@ All bulk data lives in **single HDF5 files** written in parallel with
       /exchange/data          (OUT_NZ·UPS, OUT_NYX·UPS, OUT_NYX·UPS) f32
   model_big{UPS}x/
       proj.h5                 ← step2 Radon stage
-          /exchange/data      (NTHETA, NZ, N) f32   chunks (1, NCHUNK, N)
+          /exchange/data      (NTHETA, NZ, N) f32   chunks (1, NZCHUNK, N)
           /exchange/theta     (NTHETA,) f32         angles in DEGREES
       data.h5                 ← step2 Fresnel stage (|D(ψ)|²)
-          /exchange/data      (NTHETA, NZ, N) f32   chunks (1, DATA_CHUNK_Z, N)
+          /exchange/data      (NTHETA, NZ, N) f32   chunks (1, NZ, N)  # one full plane per chunk
           /exchange/theta     (NTHETA,) f32         angles in DEGREES
   mosaic_h5/
       0_0.h5  0_1.h5  …       ← step3 per-tile HDF5 for stitching
@@ -164,14 +164,14 @@ Mid-sample z-slice (`data[1280, :, :]` at UPS=1):
 ![step1 upsample slice](docs/step1_upsample_slice.png)
 
 **Step 2 — model (Radon)** produces the linear Radon transform `R(δ)`
-into `proj.h5` `(NTHETA, NZ, N)` with chunks `(1, NCHUNK, N)`.  Angle 0°
+into `proj.h5` `(NTHETA, NZ, N)` with chunks `(1, NZCHUNK, N)`.  Angle 0°
 plane (`data[0, :, :]`):
 
 ![step2 proj angle 0](docs/step2_proj_angle0.png)
 
 **Step 2 — model (Fresnel)** turns `proj` into `ψ = exp(1j·(x22 + 1j·β))`,
 propagates via `Propagation.D`, and writes `data.h5 = |D(ψ)|²` chunked
-`(1, DATA_CHUNK_Z, N)`.  Same angle:
+`(1, NZ, N)`.  Same angle:
 
 ![step2 data angle 0](docs/step2_data_angle0.png)
 
@@ -203,7 +203,7 @@ Launcher: [set_affinity_gpu.sh](set_affinity_gpu.sh).
 ## Typical run — small scale (UPS=1 or 2, prototyping)
 
 Use **step2_model_big.py** — GPU-only Tomo; fastest as long as
-`(NCHUNK × (2N)²)` fits in GPU RAM.
+`(NZCHUNK × (2N)²)` fits in GPU RAM.
 
 ```bash
 cd mosaic_modeling
@@ -220,7 +220,7 @@ mpirun -n 4 set_affinity_gpu.sh \
 # 2. Radon + Fresnel → model_big{UPS}x/proj.h5 and data.h5
 mpirun -n 4 set_affinity_gpu.sh \
     python step2_model_big.py --ups $UPS --path $PATH_DATA \
-                              --nchunk 32 --nprop-batch 8
+                              --nzchunk 32 --npropchunk 8
 
 # 3. Slice data.h5 into per-tile HDF5 files (MPI-parallel; -n = tiles/rank)
 mpirun -n 4 python step3_extract.py --ups $UPS --path $PATH_DATA
@@ -231,7 +231,7 @@ mpirun -n 4 python step3_extract.py --ups $UPS --path $PATH_DATA
 ## Full-scale run — UPS ≥ 8
 
 Use **step2_model_large.py**.  At `UPS=8`, `N=21952`, and a full
-`Tomo._buf_fde` would be `NCHUNK · (2N)² · 8 B ≈ 15 GB · NCHUNK` — the
+`Tomo._buf_fde` would be `NZCHUNK · (2N)² · 8 B ≈ 15 GB · NZCHUNK` — the
 GPU-only Tomo doesn't fit.  `TomoLarge` keeps the big padded frequency-domain
 buffer on the **host** and streams small chunks through the GPU, so peak GPU
 memory scales with the chunk sizes rather than with `(2N)²`.
@@ -255,12 +255,12 @@ mpirun -n 8 set_affinity_gpu.sh \
 
 # Multi-node example: 4 nodes × 4 GPUs each = 16 ranks.
 # TomoLarge peak host memory per R call:
-#   fde  ≈ NCHUNK · (2N)² · 8 B  ≈ NCHUNK · 15 GB
-#   sino ≈ NCHUNK · THETA_BATCH · N · 8 B
-# so at NCHUNK=1 and THETA_BATCH=NTHETA that's ~15 + 2.5 + 2.5 = 20 GB/rank.
+#   fde  ≈ NZCHUNK · (2N)² · 8 B  ≈ NZCHUNK · 15 GB
+#   sino ≈ NZCHUNK · THETA_BATCH · N · 8 B
+# so at NZCHUNK=1 and THETA_BATCH=NTHETA that's ~15 + 2.5 + 2.5 = 20 GB/rank.
 mpirun -n 16 --map-by ppr:4:node set_affinity_gpu.sh \
     python step2_model_large.py --ups $UPS --path $PATH_DATA \
-                                --nchunk 1 --nprop-batch 1 \
+                                --nzchunk 1 --npropchunk 1 \
                                 --chunk-n 686 --chunk-theta 343 --chunk-xy 686
 
 # step3 is CPU-only but MPI-shards tiles across ranks — worth running on
@@ -285,8 +285,8 @@ mpiexec -n 16 --ppn 4 --depth=8 --cpu-bind depth \
 |                 | `step2_model_big.py`               | `step2_model_large.py`                     |
 |-----------------|------------------------------------|--------------------------------------------|
 | Tomo backend    | GPU-only (`Tomo`)                  | Host-chunked (`TomoLarge`)                 |
-| Peak GPU memory | `NCHUNK · (2N)² · 8 B`             | `~CHUNK_N²` (much smaller)                 |
-| Peak host memory| small (chunk read + result strip)  | `NCHUNK · (2N)² · 8 B` (moved to host)     |
+| Peak GPU memory | `NZCHUNK · (2N)² · 8 B`             | `~CHUNK_N²` (much smaller)                 |
+| Peak host memory| small (chunk read + result strip)  | `NZCHUNK · (2N)² · 8 B` (moved to host)     |
 | Best for        | `UPS ≤ 4` on a 40 GB GPU           | `UPS ≥ 8`, or any `N` too big for the GPU  |
 | Extra CLI       | —                                  | `--chunk-n`, `--chunk-theta`, `--chunk-xy` |
 
@@ -321,8 +321,8 @@ Full options: `python step<N>_<name>.py --help`.
 | `--path`    | `/data2/brain_sym_mosaic` | reads `big{UPS}x`, writes `model_big{UPS}x` |
 | `--ntheta`  | `3·N/4` | override for cheaper prototyping (e.g. `--ntheta 128`) |
 | `--stage`   | `both`  | `radon` \| `prop` \| `both` — skip stages if resuming |
-| `--nchunk`  | `8` / `1` | z-slices per Radon call (memory ↔ speed) |
-| `--nprop-batch` | `8` / `1` | angles per Fresnel batch |
+| `--nzchunk`  | `8` / `1` | z-slices per Radon call (memory ↔ speed) |
+| `--npropchunk` | `8` / `1` | angles per Fresnel batch |
 | `--n-load-threads` | `8` | threaded I/O (read *and* scatter-write) |
 | `--beta-ratio` | `100` | weak-absorption ratio; β = phase/BETA_RATIO |
 | `--phase-scale` | `1.0` | amplify phase to make Fresnel fringes visible |

@@ -102,21 +102,18 @@ def _parse_args() -> argparse.Namespace:
                    help="voxel = detector pixel, meters (parallel beam)")
     p.add_argument("--distance",  type=float, default=1.0,
                    help="sample → detector distance, meters")
-    p.add_argument("--nchunk",       type=int, default=8,
+    p.add_argument("--nzchunk",       type=int, default=8,
                    help="z-slices per Radon call")
-    p.add_argument("--nprop-batch",  type=int, default=8,
+    p.add_argument("--npropchunk",  type=int, default=8,
                    help="angles per Fresnel batch")
     p.add_argument("--n-load-threads", type=int, default=8)
     p.add_argument("--stage", choices=("both", "radon", "prop"), default="both")
     p.add_argument("--theta-batch", type=int, default=0,
                    help="angles per Tomo batch (0 = all in one)")
-    p.add_argument("--data-chunk-z", type=int, default=128,
-                   help="z-chunk size for data.h5 (larger = better read locality; "
-                        "chunk bytes = chunk_z · N · 4)")
-    p.add_argument("--theta-chunk", type=int, default=64,
+    p.add_argument("--nthetachunk", type=int, default=64,
                    help="θ-chunk size for proj.h5 (larger = fewer h5 chunks per "
                         "stage-1 write; too large amplifies stage-2 read of "
-                        "NPROP_BATCH angles.  Chunk bytes = θchunk · NCHUNK · N · 4)")
+                        "NPROPCHUNK angles.  Chunk bytes = θchunk · NZCHUNK · N · 4)")
     return p.parse_args()
 
 
@@ -144,12 +141,11 @@ ENERGY    = _A.energy
 VOXELSIZE = _A.voxelsize
 DISTANCE  = _A.distance
 
-NCHUNK          = _A.nchunk
-NPROP_BATCH     = _A.nprop_batch
+NZCHUNK          = _A.nzchunk
+NPROPCHUNK     = _A.npropchunk
 N_LOAD_THREADS  = _A.n_load_threads
 STAGE           = _A.stage
-DATA_CHUNK_Z    = min(_A.data_chunk_z, NZ)
-THETA_CHUNK     = max(1, min(_A.theta_chunk, NTHETA))
+NTHETACHUNK     = max(1, min(_A.nthetachunk, NTHETA))
 
 THETA_BATCH = _A.theta_batch
 if THETA_BATCH <= 0 or THETA_BATCH >= NTHETA:
@@ -177,14 +173,14 @@ def main() -> None:
           f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','')}",
           flush=True)
     _barrier()
-    rprint(f"UPS={UPS}  nz={NZ} n={N} ntheta={NTHETA} nchunk={NCHUNK}  "
+    rprint(f"UPS={UPS}  nz={NZ} n={N} ntheta={NTHETA} nchunk={NZCHUNK}  "
            f"mask_r={MASK_R}  norm_const={float(NORM_CONST):.4g} "
            f"(applied at propagation)")
     rprint(f"src={SRC_H5}")
     rprint(f"proj={PROJ_H5}")
     rprint(f"data={DATA_H5}")
     rprint(f"GPU est. — Tomo._buf_fde: "
-           f"{NCHUNK * (2*N)**2 * 8 / 1e9:.1f} GB")
+           f"{NZCHUNK * (2*N)**2 * 8 / 1e9:.1f} GB")
 
     if STAGE in {"both", "radon"}:
         _run_radon(theta_rad, theta_deg)
@@ -209,7 +205,7 @@ def _run_radon(theta_rad: np.ndarray, theta_deg: np.ndarray) -> None:
         os.remove(PROJ_H5)
     _barrier()
 
-    proj_chunks = (THETA_CHUNK, NCHUNK, N)
+    proj_chunks = (NTHETACHUNK, NZCHUNK, N)
     check_chunk_bytes(proj_chunks, 4, label="proj.h5")
     with h5py.File(PROJ_H5, "w", **_H5_MPI_KW) as f:
         g = f.create_group("exchange")
@@ -224,7 +220,7 @@ def _run_radon(theta_rad: np.ndarray, theta_deg: np.ndarray) -> None:
     proj_min, proj_max = np.inf, -np.inf
 
     # Contiguous z-chunk assignment so each h5 chunk is written by exactly one rank.
-    n_chunks_total = (NZ + NCHUNK - 1) // NCHUNK
+    n_chunks_total = (NZ + NZCHUNK - 1) // NZCHUNK
     per_rank = (n_chunks_total + SIZE - 1) // SIZE
     my_chunk_lo = RANK * per_rank
     my_chunk_hi = min(my_chunk_lo + per_rank, n_chunks_total)
@@ -242,20 +238,20 @@ def _run_radon(theta_rad: np.ndarray, theta_deg: np.ndarray) -> None:
             rprint(f"[theta batch {tb+1}/{N_THETA_BATCHES}] angles [{tb0}, {tb1})")
 
             rprint("building Tomo (allocating buffers + cuFFT plans)...")
-            cl_tomo = Tomo(N, NCHUNK, b_theta, mask_r=MASK_R)
+            cl_tomo = Tomo(N, NZCHUNK, b_theta, mask_r=MASK_R)
             rprint("Tomo ready.")
 
             t_read = t_radon = t_write = 0.0
 
             for ci, chunk_idx in enumerate(my_chunks):
-                z0 = chunk_idx * NCHUNK
-                z1 = min(z0 + NCHUNK, NZ)
+                z0 = chunk_idx * NZCHUNK
+                z1 = min(z0 + NZCHUNK, NZ)
                 k  = z1 - z0
 
                 t0 = time.perf_counter()
                 chunk_h = load_chunk(src_dset, z0, z1)
-                if k < NCHUNK:
-                    pad = np.zeros((NCHUNK, N, N), dtype=np.float32)
+                if k < NZCHUNK:
+                    pad = np.zeros((NZCHUNK, N, N), dtype=np.float32)
                     pad[:k] = chunk_h
                     chunk_h = pad
                 t_read += time.perf_counter() - t0
@@ -267,7 +263,7 @@ def _run_radon(theta_rad: np.ndarray, theta_deg: np.ndarray) -> None:
                 vol_d.imag = cp.float32(0)
                 del delta_d
 
-                proj_d_c = cl_tomo.R(vol_d)          # [len(b_theta), NCHUNK, N]
+                proj_d_c = cl_tomo.R(vol_d)          # [len(b_theta), NZCHUNK, N]
                 del vol_d
 
                 proj_chunk_h = cp.asnumpy(proj_d_c[:, :k].real).astype(
@@ -277,7 +273,7 @@ def _run_radon(theta_rad: np.ndarray, theta_deg: np.ndarray) -> None:
                 t_radon += time.perf_counter() - t0
 
                 # Independent parallel write: this rank writes to its own
-                # z-chunk in proj.h5.  With chunks=(THETA_CHUNK, NCHUNK, N)
+                # z-chunk in proj.h5.  With chunks=(NTHETACHUNK, NZCHUNK, N)
                 # each rank owns disjoint z-blocks, so no chunk is touched
                 # by two ranks — safe for independent MPI-IO.  Slab-loop
                 # keeps each collective transfer under the MPI-IO 2 GiB
@@ -344,18 +340,16 @@ def _run_propagation(theta_deg: np.ndarray) -> None:
            f"Fresnel number (per pixel)={fresnel_number:.4g}")
     rprint(f"propagating full sinogram {NZ}×{N} (no crop)")
     rprint(f"GPU est. — Prop._buf_big + fker: "
-           f"{(NPROP_BATCH + 1) * (2*NZ) * (2*N) * 8 / 1e9:.3f} GB  "
-           f"(NPROP_BATCH={NPROP_BATCH})")
+           f"{(NPROPCHUNK + 1) * (2*NZ) * (2*N) * 8 / 1e9:.3f} GB  "
+           f"(NPROPCHUNK={NPROPCHUNK})")
 
-    # Bootstrap data.h5.  Chunk shape (1, DATA_CHUNK_Z, N) balances per-plane
-    # writes (touch NZ/DATA_CHUNK_Z chunks per angle) against per-tile reads
-    # in step3_extract (a DET_H × DET_W crop hits ceil(DET_H/DATA_CHUNK_Z)+1
-    # chunks in z).
+    # Bootstrap data.h5.  One full (NZ, N) plane per chunk — matches the
+    # per-angle Fresnel write pattern exactly (each write touches one chunk).
     if RANK == 0 and os.path.exists(DATA_H5):
         os.remove(DATA_H5)
     _barrier()
 
-    data_chunks = (1, DATA_CHUNK_Z, N)
+    data_chunks = (1, NZ, N)
     check_chunk_bytes(data_chunks, 4, label="data.h5")
     with h5py.File(DATA_H5, "w", **_H5_MPI_KW) as f:
         g = f.create_group("exchange")
@@ -367,7 +361,7 @@ def _run_propagation(theta_deg: np.ndarray) -> None:
            f"{np.prod(data_chunks)*4/1e6:.1f} MB/chunk; "
            f"{NTHETA * NZ * N * 4 / 1e12:.2f} TB total)")
 
-    cl_prop = Propagation(N, NZ, NPROP_BATCH, 1,
+    cl_prop = Propagation(N, NZ, NPROPCHUNK, 1,
                           wavelength, VOXELSIZE, [DISTANCE])
 
     # Contiguous angle sharding so each data.h5 angle-chunk has one writer.
@@ -390,8 +384,8 @@ def _run_propagation(theta_deg: np.ndarray) -> None:
         proj_dset = fp["exchange/data"]
         data_dset = fd["exchange/data"]
 
-        for i0 in range(i_start, i_end, NPROP_BATCH):
-            i1 = min(i0 + NPROP_BATCH, i_end)
+        for i0 in range(i_start, i_end, NPROPCHUNK):
+            i1 = min(i0 + NPROPCHUNK, i_end)
             b  = i1 - i0
 
             # Read the angle batch from proj.h5 (b, NZ, N), slab-safe.

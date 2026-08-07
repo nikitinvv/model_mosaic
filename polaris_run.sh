@@ -15,7 +15,7 @@
 #   init.h5, big{UPS}x.h5, model_big{UPS}x/{proj.h5, data.h5}, mosaic_h5/*
 #
 # For UPS ≥ 8 swap step2_model_big.py → step2_model_large.py (host-chunked
-# TomoLarge; keep --nchunk 1 and set --chunk-n/--chunk-theta/--chunk-xy).
+# TomoLarge; keep --nzchunk 1 and set --chunk-n/--chunk-theta/--chunk-xy).
 
 NNODES=$(wc -l < $PBS_NODEFILE)
 NRANKS=4              # ranks per node (= GPUs per node on Polaris)
@@ -74,11 +74,11 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
 # ---------- 2. Radon + Fresnel → proj.h5, data.h5 -------------------------
 # For UPS ≥ 8, swap to step2_model_large.py:
 #   python step2_model_large.py --ups "$UPS" --path "$PATH_DATA" \
-#       --nchunk 1 --nprop-batch 1 \
+#       --nzchunk 1 --npropchunk 1 \
 #       --chunk-n 686 --chunk-theta 343 --chunk-xy 686
 "${MPIEXEC[@]}" \
     python step2_model_big.py --ups "$UPS" --path "$PATH_DATA" \
-                              --nchunk 32 --nprop-batch 8
+                              --nzchunk 32 --npropchunk 8
 
 # ---------- 3. data.h5 → mosaic_h5/{z}_{x}.h5 -----------------------------
 # CPU-only but MPI-shards tiles across ranks.  set_affinity_gpu_polaris.sh
