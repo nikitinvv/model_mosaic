@@ -1,7 +1,13 @@
 #!/usr/bin/env python
 """Extract a centred sub-volume from a 3-D reconstruction TIFF, apply a
 soft-edged circular mask (and optional 3-D sharpen + smoothing), and save
-as a per-slice TIFF stack.  Threaded I/O, optional MPI + GPU.
+as a single HDF5 file at {path}/init.h5.
+
+    /exchange/data   (OUT_NZ, OUT_NYX, OUT_NYX) float32
+    /exchange/theta  (0,) float32   (placeholder; angles filled by step2)
+
+Chunked (1, OUT_NYX, OUT_NYX) so downstream per-slice reads hit one chunk.
+Threaded I/O, optional MPI + GPU.
 """
 from __future__ import annotations
 
@@ -10,6 +16,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+import h5py
 import numpy as np
 import tifffile
 from scipy.ndimage import gaussian_filter1d
@@ -31,6 +38,10 @@ except Exception:
     _RANK = 0
     _SIZE = 1
 
+_H5_HAS_MPI = h5py.get_config().mpi
+_H5_MPI_KW  = ({"driver": "mpio", "comm": _COMM}
+               if _COMM is not None and _H5_HAS_MPI else {})
+
 
 # ---------- CLI ----------------------------------------------------------
 def _parse_args() -> argparse.Namespace:
@@ -40,7 +51,7 @@ def _parse_args() -> argparse.Namespace:
         "4500_2048_0_0.0_0.003_0.05_0.02_20_1.1_0/rec_obj_real/0096.tiff"),
         help="source 3-D reconstruction TIFF (multi-page)")
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
-        help="base output directory; init tifs go to {path}/init")
+        help="base output directory; init.h5 goes to {path}/init.h5")
     p.add_argument("--src-nz",  type=int, default=3264, help="source nz (pages)")
     p.add_argument("--src-nyx", type=int, default=3264, help="source ny=nx")
     p.add_argument("--out-nz",  type=int, default=2560, help="output total z")
@@ -69,7 +80,7 @@ def _parse_args() -> argparse.Namespace:
 _A = _parse_args()
 
 SRC_TIFF      = _A.src
-DST_DIR       = f"{_A.path}/init"
+DST_H5        = f"{_A.path}/init.h5"
 SRC_NZ        = _A.src_nz
 SRC_NY = SRC_NX = _A.src_nyx
 OUT_NZ        = _A.out_nz
@@ -92,7 +103,6 @@ Z0 = (SRC_NZ - SAMPLE_NZ) // 2
 Y0 = (SRC_NY - OUT_NYX) // 2
 X0 = (SRC_NX - OUT_NYX) // 2
 
-# Bind each rank to its own GPU (round-robin over visible devices).
 if _HAVE_GPU:
     cp.cuda.Device(_RANK % cp.cuda.runtime.getDeviceCount()).use()
 
@@ -105,7 +115,6 @@ _tiff_local = threading.local()
 
 
 def _read_src_plane(z: int) -> np.ndarray:
-    """Return one (SRC_NY, SRC_NX) plane from the source volume."""
     if _SRC is not None:
         return _SRC[z]
     tf = getattr(_tiff_local, 'tf', None)
@@ -116,8 +125,6 @@ def _read_src_plane(z: int) -> np.ndarray:
 
 
 def _z_weight(z_out: int) -> float:
-    """Cosine-tapered z-window: 0 in the padded ends, cosine ramp of
-    Z_TAPER px inside each sample edge, 1 in the middle."""
     if z_out < Z_PAD or z_out >= Z_PAD + SAMPLE_NZ:
         return 0.0
     d = min(z_out - Z_PAD, Z_PAD + SAMPLE_NZ - 1 - z_out)
@@ -128,8 +135,6 @@ def _z_weight(z_out: int) -> float:
 
 
 def make_mask() -> np.ndarray:
-    """Circular mask with a smooth cosine taper of MASK_TAPER pixels at the
-    boundary.  Limits the mask's spectrum to ~1/MASK_TAPER cycles/px."""
     r = CIRCLE_DIAM / 2.0
     c = (OUT_NYX - 1) / 2.0
     y, x = np.ogrid[:OUT_NYX, :OUT_NYX]
@@ -141,7 +146,6 @@ def make_mask() -> np.ndarray:
 
 
 def _read_masked(z_out: int, mask: np.ndarray) -> np.ndarray:
-    """Return the (OUT_NYX, OUT_NYX) plane at output-z index z_out."""
     w = _z_weight(z_out)
     if w == 0.0:
         return np.zeros((OUT_NYX, OUT_NYX), dtype=np.float32)
@@ -154,17 +158,7 @@ def _read_masked(z_out: int, mask: np.ndarray) -> np.ndarray:
     return plane
 
 
-def _write_slice(z_out: int, plane: np.ndarray) -> None:
-    tifffile.imwrite(
-        os.path.join(DST_DIR, f"init_{z_out:05d}.tif"),
-        plane.astype(np.float32, copy=False),
-        compression=None,
-    )
-
-
 def _apply_filters_gpu(vol: np.ndarray) -> np.ndarray:
-    """Run the unsharp mask (if enabled) and the main 3-D Gaussian on the
-    GPU in a single host↔device round-trip; in-place."""
     d = cp.asarray(vol)
     if SHARPEN_AMOUNT != 0.0 and SHARPEN_SIGMA > 0:
         blur = _cp_gaussian_filter(d, sigma=SHARPEN_SIGMA,
@@ -182,7 +176,6 @@ def _apply_filters_gpu(vol: np.ndarray) -> np.ndarray:
 
 def _gaussian_3d_threaded(vol: np.ndarray, sigma: float,
                           pool: ThreadPoolExecutor) -> None:
-    """In-place 3-D Gaussian using scipy 1-D separable passes across threads."""
     if sigma <= 0:
         return
     nz, ny, _ = vol.shape
@@ -201,7 +194,7 @@ def _gaussian_3d_threaded(vol: np.ndarray, sigma: float,
     list(pool.map(_z, range(0, ny, y_chunk)))
 
 
-def process_chunk(z_start: int, z_end: int, mask: np.ndarray,
+def process_chunk(z_start: int, z_end: int, mask: np.ndarray, dset,
                   pool: ThreadPoolExecutor) -> None:
     _sig_max = max(SHARPEN_SIGMA if SHARPEN_AMOUNT != 0.0 else 0.0,
                    SMOOTH_SIGMA)
@@ -214,7 +207,6 @@ def process_chunk(z_start: int, z_end: int, mask: np.ndarray,
 
     def _read(i: int) -> None:
         vol[i] = _read_masked(z_lo + i, mask)
-
     list(pool.map(_read, range(n)))
 
     if _HAVE_GPU:
@@ -228,49 +220,70 @@ def process_chunk(z_start: int, z_end: int, mask: np.ndarray,
         _gaussian_3d_threaded(vol, SMOOTH_SIGMA, pool)
 
     offset = z_start - z_lo
-    def _write(i: int) -> None:
-        _write_slice(z_start + i, vol[offset + i])
-
-    list(pool.map(_write, range(z_end - z_start)))
+    # Bulk write of the interior [z_start, z_end) to the h5 dataset.
+    dset[z_start:z_end, :, :] = vol[offset:offset + (z_end - z_start)]
 
 
 def main() -> None:
+    # Delete any pre-existing init.h5 on rank 0, then create + write theta placeholder.
     if _RANK == 0:
-        os.makedirs(DST_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(DST_H5) or ".", exist_ok=True)
+        if os.path.exists(DST_H5):
+            os.remove(DST_H5)
     if _COMM is not None:
         _COMM.Barrier()
+
     mask = make_mask()
     _sig_max = max(SHARPEN_SIGMA if SHARPEN_AMOUNT != 0.0 else 0.0,
                    SMOOTH_SIGMA)
     _halo = int(np.ceil(3 * _sig_max)) if _sig_max > 0 else 0
     if _RANK == 0:
         backend = f"gpu×{_SIZE}" if _HAVE_GPU else f"cpu×{_SIZE}"
-        print(f"src : {SRC_TIFF}")
-        print(f"dst : {DST_DIR}")
+        print(f"src : {SRC_TIFF}", flush=True)
+        print(f"dst : {DST_H5}", flush=True)
         print(f"backend={backend}  threads/rank={N_THREADS}  "
-              f"chunk_z={CHUNK_Z}  nz={OUT_NZ}  nyx={OUT_NYX}")
+              f"chunk_z={CHUNK_Z}  nz={OUT_NZ}  nyx={OUT_NYX}  "
+              f"h5 mpi={_H5_HAS_MPI}", flush=True)
         print(f"z: sample slices [{Z_PAD},{Z_PAD+SAMPLE_NZ})={SAMPLE_NZ}px "
               f"from src z=[{Z0},{Z0+SAMPLE_NZ}); "
               f"padded 0 in [0,{Z_PAD}) and [{Z_PAD+SAMPLE_NZ},{OUT_NZ}); "
-              f"cosine taper {Z_TAPER} px each end")
+              f"cosine taper {Z_TAPER} px each end", flush=True)
         print(f"yx=[{Y0},{Y0+OUT_NYX})  "
               f"mask: circle ⌀{CIRCLE_DIAM} px, cosine taper {MASK_TAPER} px  "
-              f"(sum={int(mask.sum())}, pi*r^2 ~ {np.pi*(CIRCLE_DIAM/2)**2:.0f})")
-        print(f"3-D unsharp:  amount={SHARPEN_AMOUNT} sigma={SHARPEN_SIGMA}")
-        print(f"3-D smoothing: sigma={SMOOTH_SIGMA}   halo={_halo} slices")
+              f"(sum={int(mask.sum())}, pi*r^2 ~ {np.pi*(CIRCLE_DIAM/2)**2:.0f})",
+              flush=True)
+        print(f"3-D unsharp:  amount={SHARPEN_AMOUNT} sigma={SHARPEN_SIGMA}",
+              flush=True)
+        print(f"3-D smoothing: sigma={SMOOTH_SIGMA}   halo={_halo} slices",
+              flush=True)
 
+    # Collective create of init.h5.
+    with h5py.File(DST_H5, "w", **_H5_MPI_KW) as f:
+        g = f.create_group("exchange")
+        g.create_dataset("data", shape=(OUT_NZ, OUT_NYX, OUT_NYX),
+                         dtype="float32",
+                         chunks=(1, OUT_NYX, OUT_NYX))
+
+    if _COMM is not None:
+        _COMM.Barrier()
+
+    # Reopen for parallel writes and process this rank's chunks.
     chunks = [(z, min(z + CHUNK_Z, OUT_NZ))
               for z in range(0, OUT_NZ, CHUNK_Z)]
     my_chunks = chunks[_RANK::_SIZE]
 
-    with ThreadPoolExecutor(max_workers=N_THREADS) as pool:
+    with h5py.File(DST_H5, "r+", **_H5_MPI_KW) as f, \
+         ThreadPoolExecutor(max_workers=N_THREADS) as pool:
+        dset = f["exchange/data"]
         for i, (z_start, z_end) in enumerate(my_chunks):
-            process_chunk(z_start, z_end, mask, pool)
+            process_chunk(z_start, z_end, mask, dset, pool)
             print(f"[rank {_RANK}] {i+1}/{len(my_chunks)}  "
                   f"z=[{z_start},{z_end})", flush=True)
 
     if _COMM is not None:
         _COMM.Barrier()
+    if _RANK == 0:
+        print("init.h5 done.", flush=True)
 
 
 if __name__ == "__main__":

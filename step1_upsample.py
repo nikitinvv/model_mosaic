@@ -1,20 +1,19 @@
 #!/usr/bin/env python
-"""Upsample a (2560, 2744, 2744) init volume by UPS× in each axis and save
-one TIFF per output z-slice.  Method: bilinear xy + linear z blend
-(trilinear).  Trilinear is separable, so xy-linear per plane + linear
-blend between two adjacent upsampled planes gives the true 3-D linear
-result at a fraction of the memory of a whole-volume 3-D zoom.
+"""Upsample a (2560, 2744, 2744) init volume by UPS× in each axis, saving
+the result as a single HDF5 file at {path}/big{UPS}x.h5.
 
-  - xy: cupyx.scipy.ndimage.zoom(order=1) on GPU (PIL BILINEAR fallback).
-  - z : convex combination between two adjacent xy-upsampled planes.
-  - Pipeline: a background CPU thread prefetches the next input plane
-        from disk while the GPU is blending/writing the current pair.
+    /exchange/data   (2560·UPS, 2744·UPS, 2744·UPS) float32
+                     chunks (1, 2744·UPS, 2744·UPS) — per-slice reads hit one chunk
+
+Method: bilinear xy + linear z blend (trilinear, separable).  For each
+input z, a background thread prefetches the next input plane while the
+GPU upsamples in xy and blends UPS output planes between the current pair.
 
 Multi-GPU via MPI (mpi4py optional).  GPU affinity is delegated to the
-launcher: wrap with set_affinity_gpu.sh so each rank sees exactly one GPU
-via CUDA_VISIBLE_DEVICES.
+launcher: wrap with set_affinity_gpu.sh so each rank sees one GPU via
+CUDA_VISIBLE_DEVICES.
 
-    mpirun -n <NGPU> set_affinity_gpu.sh python step0_upsample.py --ups 4
+    mpirun -n <NGPU> set_affinity_gpu.sh python step1_upsample.py --ups 4
 """
 from __future__ import annotations
 
@@ -22,8 +21,8 @@ import argparse
 import os
 from concurrent.futures import ThreadPoolExecutor
 
+import h5py
 import numpy as np
-import tifffile
 
 
 # --------------------- MPI (optional) ------------------------------------
@@ -50,18 +49,20 @@ def rprint(*a, **k) -> None:
         print(*a, **k)
 
 
+_H5_HAS_MPI = h5py.get_config().mpi
+_H5_MPI_KW  = ({"driver": "mpio", "comm": _COMM}
+               if _COMM is not None and _H5_HAS_MPI else {})
+
+
 # --------------------- CLI -----------------------------------------------
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ups",  type=int, default=4,
                    help="upsample factor (in every axis)")
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
-                   help=("base directory; reads {path}/init/init_*.tif and "
-                         "writes {path}/big{UPS}x/big_*.tif"))
+                   help="base directory; reads {path}/init.h5, writes {path}/big{UPS}x.h5")
     p.add_argument("--in-nz",  type=int, default=2560, help="input nz")
     p.add_argument("--in-nyx", type=int, default=2744, help="input ny=nx")
-    p.add_argument("--n-write", type=int, default=8,
-                   help="parallel SSD writers per rank")
     p.add_argument("--n-read",  type=int, default=2,
                    help="background input prefetchers per rank")
     return p.parse_args()
@@ -71,15 +72,13 @@ _A = _parse_args()
 
 UPS     = _A.ups
 BASE    = _A.path
-SRC_DIR = f"{BASE}/init"
-DST_DIR = f"{BASE}/big{UPS}x"
+SRC_H5  = f"{BASE}/init.h5"
+DST_H5  = f"{BASE}/big{UPS}x.h5"
 
 IN_NZ   = _A.in_nz
 IN_NYX  = _A.in_nyx
 OUT_NZ  = IN_NZ  * UPS
 OUT_NYX = IN_NYX * UPS
-
-N_WRITE = _A.n_write
 N_READ  = _A.n_read
 
 
@@ -95,24 +94,18 @@ except Exception as _e:                                       # noqa: BLE001
 
 
 # --------------------- I/O helpers ---------------------------------------
-def _read_plane(zi: int) -> np.ndarray:
-    src = os.path.join(SRC_DIR, f"init_{zi:05d}.tif")
-    im = tifffile.imread(src)
+def _read_plane(src_dset, zi: int) -> np.ndarray:
+    im = src_dset[zi, :, :]
     if im.shape != (IN_NYX, IN_NYX):
         raise RuntimeError(
-            f"unexpected shape {im.shape} in {src}, expected "
+            f"unexpected shape {im.shape} at z={zi}, expected "
             f"({IN_NYX},{IN_NYX})")
     return im.astype(np.float32, copy=False)
-
-
-def _write(path: str, data: np.ndarray) -> None:
-    tifffile.imwrite(path, data, compression=None)
 
 
 # --------------------- upsample + linear-z blend --------------------------
 if _HAS_GPU:
     def _upsample_xy(im_np: np.ndarray):
-        """H2D + bilinear zoom by UPS in xy, returns cupy array."""
         im_d = cp.asarray(im_np)
         return _gpu_zoom(im_d, zoom=UPS, order=1, mode="nearest")
 
@@ -139,10 +132,17 @@ else:
 
 # --------------------- main -----------------------------------------------
 def main() -> None:
-    # GPU affinity is set externally (set_affinity_gpu.sh → CUDA_VISIBLE_DEVICES),
-    # so cupy sees exactly one device per rank and we just use it.
+    # Collective create of big{UPS}x.h5 on all ranks (rank 0 also removes stale file first).
     if RANK == 0:
-        os.makedirs(DST_DIR, exist_ok=True)
+        if os.path.exists(DST_H5):
+            os.remove(DST_H5)
+    _barrier()
+
+    with h5py.File(DST_H5, "w", **_H5_MPI_KW) as f:
+        g = f.create_group("exchange")
+        g.create_dataset("data", shape=(OUT_NZ, OUT_NYX, OUT_NYX),
+                         dtype="float32",
+                         chunks=(1, OUT_NYX, OUT_NYX))
     _barrier()
 
     # Partition input z-slices contiguously across ranks.
@@ -151,11 +151,11 @@ def main() -> None:
     i_end    = min(i_start + per_rank, IN_NZ)
     local_n  = i_end - i_start
 
-    rprint(f"input : {IN_NZ}×{IN_NYX}×{IN_NYX}   dir={SRC_DIR}")
-    rprint(f"output: {OUT_NZ}×{OUT_NYX}×{OUT_NYX}  dir={DST_DIR}")
+    rprint(f"input : {IN_NZ}×{IN_NYX}×{IN_NYX}   src={SRC_H5}")
+    rprint(f"output: {OUT_NZ}×{OUT_NYX}×{OUT_NYX}  dst={DST_H5}")
     rprint(f"upsample: {UPS}×  method=trilinear (bilinear xy + linear z)  "
            f"backend={'GPU' if _HAS_GPU else 'CPU'}  "
-           f"read={N_READ}  write={N_WRITE}  MPI ranks={SIZE}")
+           f"read={N_READ}  h5 mpi={_H5_HAS_MPI}  MPI ranks={SIZE}")
     rprint(f"estimated storage: "
            f"{OUT_NZ * OUT_NYX * OUT_NYX * 4 / 1e12:.2f} TB")
 
@@ -175,52 +175,40 @@ def main() -> None:
         rprint("nothing to do for this rank")
         return
 
-    read_pool  = ThreadPoolExecutor(max_workers=N_READ,
-                                    thread_name_prefix=f"r{RANK}-read")
-    write_pool = ThreadPoolExecutor(max_workers=N_WRITE,
-                                    thread_name_prefix=f"r{RANK}-write")
+    with h5py.File(SRC_H5, "r", **_H5_MPI_KW) as fsrc, \
+         h5py.File(DST_H5, "r+", **_H5_MPI_KW) as fdst, \
+         ThreadPoolExecutor(max_workers=N_READ,
+                            thread_name_prefix=f"r{RANK}-read") as read_pool:
+        src_dset = fsrc["exchange/data"]
+        dst_dset = fdst["exchange/data"]
 
-    pending: list = []
-    max_pending = 2 * N_WRITE
+        # 2-plane rolling buffer.  Prefetch next input plane in a background thread.
+        up_curr_d   = _upsample_xy(_read_plane(src_dset, i_start))
+        fut_next_np = (read_pool.submit(_read_plane, src_dset, i_start + 1)
+                       if i_start + 1 < IN_NZ else None)
 
-    def submit_write(path: str, buf: np.ndarray) -> None:
-        while len(pending) >= max_pending:
-            pending.pop(0).result()
-        pending.append(write_pool.submit(_write, path, buf))
+        for zi in range(i_start, i_end):
+            if fut_next_np is not None:
+                next_np     = fut_next_np.result()
+                fut_next_np = (read_pool.submit(_read_plane, src_dset, zi + 2)
+                               if zi + 2 < IN_NZ else None)
+                up_next_d = _upsample_xy(next_np)
+                del next_np
+            else:
+                up_next_d = up_curr_d          # end of volume: hold
 
-    # -------- LINEAR in z (2-plane rolling buffer) ------------------------
-    up_curr_d   = _upsample_xy(_read_plane(i_start))
-    fut_next_np = (read_pool.submit(_read_plane, i_start + 1)
-                   if i_start + 1 < IN_NZ else None)
+            for r in range(UPS):
+                out_z = zi * UPS + r
+                dst_dset[out_z, :, :] = _blend_and_pull(up_curr_d, up_next_d, r)
 
-    for zi in range(i_start, i_end):
-        if fut_next_np is not None:
-            next_np     = fut_next_np.result()
-            fut_next_np = (read_pool.submit(_read_plane, zi + 2)
-                           if zi + 2 < IN_NZ else None)
-            up_next_d = _upsample_xy(next_np)
-            del next_np
-        else:
-            up_next_d = up_curr_d          # end of volume: hold
+            up_curr_d = up_next_d
 
-        for r in range(UPS):
-            submit_write(
-                os.path.join(DST_DIR, f"big_{zi * UPS + r:05d}.tif"),
-                _blend_and_pull(up_curr_d, up_next_d, r),
-            )
+            done = zi - i_start + 1
+            if done % 8 == 0 or done == local_n:
+                print(f"  [rank {RANK}] input {done}/{local_n}  "
+                      f"(wrote up to output slice {zi*UPS + UPS - 1})",
+                      flush=True)
 
-        up_curr_d = up_next_d
-
-        done = zi - i_start + 1
-        if done % 8 == 0 or done == local_n:
-            print(f"  [rank {RANK}] input {done}/{local_n}  "
-                  f"(wrote up to output slice {zi*UPS + UPS - 1})",
-                  flush=True)
-
-    for f in pending:
-        f.result()
-    read_pool.shutdown()
-    write_pool.shutdown()
     _barrier()
     rprint("upsample done.")
 

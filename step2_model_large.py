@@ -1,25 +1,30 @@
 #!/usr/bin/env python
-"""Same pipeline as model_radon_big.py but uses the host-chunked Radon
+"""Same pipeline as step2_model_big.py but uses the host-chunked Radon
 implementation in tomo_large.py, which stages small pieces of the padded
 frequency-domain buffer through the GPU and keeps the big (nz, 2N, 2N)
 `fde` and (nz, ntheta, N) `sino` arrays on the HOST.  Peak GPU memory
 becomes proportional to the chunk sizes, not to (2N)², so much larger N
 can be modelled on a 40 GB GPU.
 
-Pipeline (identical to model_radon_big.py):
+Pipeline (identical to step2_model_big.py):
     x22  = R(delta) / NORM_CONST     (norm_const = sqrt(N/NTHETA))
     beta = x22 / BETA_RATIO          (weak absorption; BETA_RATIO=100)
     psi  = exp(1j·(x22 + 1j·beta))   = exp(-beta)·(cos + 1j·sin)
     data = |D_prop(psi)|²
 
-Chunk sizes passed to TomoLarge.R must divide the sizes they slice into:
-  CHUNK_N     divides N and 2N       (stripes across the xy axis)
-  CHUNK_THETA divides NTHETA         (angle grouping)
-  CHUNK_XY    divides 2N             (spatial gather-bin size)
+I/O uses single HDF5 files with parallel writes (h5py MPI-IO):
+    {path}/big{UPS}x.h5         input volume
+    {path}/model_big{UPS}x/proj.h5, data.h5    outputs
 
-Multi-GPU via MPI, memmap TIFF outputs, sparse-truncated bootstrap files,
-batched memmap opens (MMAP_BATCH).  GPU affinity via set_affinity_gpu.sh.
-Launch:
+Chunk sizes passed to TomoLarge.R must divide the sizes they slice into:
+  --chunk-n     divides N and 2N       (stripes across the xy axis)
+  --chunk-theta divides NTHETA         (angle grouping)
+  --chunk-xy    divides 2N             (spatial gather-bin size)
+
+Defaults 686 / 343 / 686 are divisors of 2744 and 2058, so they work for
+any integer --ups ≥ 1.
+
+Multi-GPU via MPI, GPU affinity via set_affinity_gpu.sh.  Launch:
     mpirun -n <NGPU> set_affinity_gpu.sh python step2_model_large.py \\
         --ups 8 --path /data2/brain_sym_mosaic
 """
@@ -27,29 +32,14 @@ from __future__ import annotations
 
 import argparse
 import os
-import resource
 from concurrent.futures import ThreadPoolExecutor
 
+import h5py
 import numpy as np
 import cupy as cp
-import tifffile
 
 from tomo_large  import TomoLarge
 from propagation import Propagation
-
-
-def _raise_fd_limit(target: int) -> int:
-    try:
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        want = max(target, soft)
-        if hard > 0:
-            want = min(want, hard)
-        if want > soft:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
-            soft = want
-        return soft
-    except Exception:
-        return -1
 
 
 # ---------- MPI (optional) -----------------------------------------------
@@ -82,14 +72,19 @@ def rprint(*a, **k) -> None:
         print(*a, **k)
 
 
+_H5_HAS_MPI = h5py.get_config().mpi
+_H5_MPI_KW  = ({"driver": "mpio", "comm": _COMM}
+               if _COMM is not None and _H5_HAS_MPI else {})
+
+
 # ---------- CLI ----------------------------------------------------------
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ups",  type=int, default=8,
-                   help="upsample factor (matches upsample_big.py --ups)")
+                   help="upsample factor (matches step1_upsample --ups)")
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
-                   help="base directory; reads {path}/big{UPS}x, writes {path}/model_big{UPS}x")
+                   help="base directory; reads {path}/big{UPS}x.h5, writes {path}/model_big{UPS}x/")
     p.add_argument("--in-nz",  type=int, default=2560, help="init nz (before UPS)")
     p.add_argument("--in-n",   type=int, default=2744, help="init N  (before UPS)")
     p.add_argument("--ntheta", type=int, default=None,
@@ -107,27 +102,24 @@ def _parse_args() -> argparse.Namespace:
                    help="angles per Fresnel batch")
     p.add_argument("--n-load-threads", type=int, default=8)
     p.add_argument("--stage", choices=("both", "radon", "prop"), default="both")
-    p.add_argument("--mmap-batch",  type=int, default=256)
     p.add_argument("--theta-batch", type=int, default=0,
                    help="angles per Tomo batch (0 = all in one)")
-    # Chunk sizes.  686=2·7³ and 343=7³ are both divisors of 2744=2³·7³,
-    # so any (positive integer) UPS keeps N=2744·UPS divisible by them.
-    p.add_argument("--chunk-n",     type=int, default=686,
-                   help="TomoLarge xy stripe (must divide N=2744·UPS)")
-    p.add_argument("--chunk-theta", type=int, default=343,
-                   help="TomoLarge angle chunk (must divide NTHETA)")
-    p.add_argument("--chunk-xy",    type=int, default=686,
-                   help="TomoLarge gather-bin size (must divide 2N)")
+    p.add_argument("--chunk-n",     type=int, default=686)
+    p.add_argument("--chunk-theta", type=int, default=343)
+    p.add_argument("--chunk-xy",    type=int, default=686)
+    p.add_argument("--data-chunk-z", type=int, default=128,
+                   help="z-chunk size for data.h5")
     return p.parse_args()
 
 
 _A = _parse_args()
 
-# ---------- config from CLI ---------------------------------------------
 UPS      = _A.ups
 BASE_DIR = _A.path
-SRC_DIR  = f"{BASE_DIR}/big{UPS}x"
+SRC_H5   = f"{BASE_DIR}/big{UPS}x.h5"
 DST_DIR  = f"{BASE_DIR}/model_big{UPS}x"
+PROJ_H5  = f"{DST_DIR}/proj.h5"
+DATA_H5  = f"{DST_DIR}/data.h5"
 
 NZ         = _A.in_nz * UPS
 N          = _A.in_n  * UPS
@@ -146,19 +138,16 @@ NCHUNK          = _A.nchunk
 NPROP_BATCH     = _A.nprop_batch
 N_LOAD_THREADS  = _A.n_load_threads
 STAGE           = _A.stage
-MMAP_BATCH      = _A.mmap_batch
 
 CHUNK_N     = _A.chunk_n
 CHUNK_THETA = _A.chunk_theta
 CHUNK_XY    = _A.chunk_xy
+DATA_CHUNK_Z = min(_A.data_chunk_z, NZ)
 
 THETA_BATCH = _A.theta_batch
 if THETA_BATCH <= 0 or THETA_BATCH >= NTHETA:
     THETA_BATCH = NTHETA
 N_THETA_BATCHES = (NTHETA + THETA_BATCH - 1) // THETA_BATCH
-
-_FD_TARGET   = MMAP_BATCH * 4 + 256
-_FD_ACHIEVED = _raise_fd_limit(_FD_TARGET)
 
 
 def _validate_chunks() -> None:
@@ -173,36 +162,36 @@ def _validate_chunks() -> None:
         raise SystemExit("chunk-size problems:\n  " + "\n  ".join(problems))
 
 
-def load_chunk(z_start: int, z_end: int, pool: ThreadPoolExecutor) -> np.ndarray:
-    """Return a (k, N, N) complex64 host array for the requested z-strip."""
+def load_chunk(src_dset, z_start: int, z_end: int) -> np.ndarray:
+    """(k, N, N) complex64 host array (imag=0) for TomoLarge input."""
     k = z_end - z_start
     buf = np.empty((k, N, N), dtype=np.complex64)
-
-    def _read(i: int) -> None:
-        im = tifffile.imread(os.path.join(SRC_DIR, f"big_{z_start + i:05d}.tif"))
-        buf[i].real = im
-        buf[i].imag = 0
-
-    list(pool.map(_read, range(k)))
+    buf.real = src_dset[z_start:z_end, :, :]
+    buf.imag = 0
     return buf
 
 
 def main() -> None:
     _validate_chunks()
-    os.makedirs(DST_DIR, exist_ok=True)
-    # GPU affinity is set externally (set_affinity_gpu.sh → CUDA_VISIBLE_DEVICES).
-    theta = np.linspace(0.0, ANG_MAX, NTHETA, endpoint=False).astype("float32")
-    rprint(f"[MPI] size={SIZE}  (GPU affinity via set_affinity_gpu.sh)")
+    if RANK == 0:
+        os.makedirs(DST_DIR, exist_ok=True)
+    _barrier()
+
+    theta_rad = np.linspace(0.0, ANG_MAX, NTHETA, endpoint=False).astype("float32")
+    theta_deg = np.rad2deg(theta_rad).astype("float32")
+
     dev_id   = cp.cuda.runtime.getDevice()
     dev_name = cp.cuda.runtime.getDeviceProperties(dev_id)['name'].decode()
+    rprint(f"[MPI] size={SIZE}  (GPU affinity via set_affinity_gpu.sh)  h5 mpi={_H5_HAS_MPI}")
     print(f"  rank {RANK}: gpu={dev_id} ({dev_name})  "
           f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','')}",
           flush=True)
     _barrier()
     rprint(f"UPS={UPS}  nz={NZ} n={N} ntheta={NTHETA} nchunk={NCHUNK}  "
            f"norm_const={float(NORM_CONST):.4g} (applied at propagation)")
-    rprint(f"src={SRC_DIR}")
-    rprint(f"dst={DST_DIR}")
+    rprint(f"src={SRC_H5}")
+    rprint(f"proj={PROJ_H5}")
+    rprint(f"data={DATA_H5}")
     rprint(f"chunks: CHUNK_N={CHUNK_N}  CHUNK_THETA={CHUNK_THETA}  CHUNK_XY={CHUNK_XY}")
     rprint(f"THETA_BATCH={THETA_BATCH}  n_theta_batches={N_THETA_BATCHES}  "
            f"(re-reads input volume {N_THETA_BATCHES}×)")
@@ -211,89 +200,65 @@ def main() -> None:
     rprint(f"HOST est. per R call: fde≈{fde_gb:.1f} GB, sino≈{sino_gb:.2f} GB, "
            f"res≈{sino_gb:.2f} GB")
 
-    proj_paths = [os.path.join(DST_DIR, f"proj_{i:05d}.tif")
-                  for i in range(NTHETA)]
-
     if STAGE in {"both", "radon"}:
-        _run_radon(theta, proj_paths)
+        _run_radon(theta_rad, theta_deg)
     else:
-        rprint(f"STAGE={STAGE}: skipping Radon; assuming proj_*.tif already on disk")
+        rprint(f"STAGE={STAGE}: skipping Radon; assuming proj.h5 already on disk")
     _barrier()
 
     if STAGE == "radon":
         rprint("STAGE=radon: skipping propagation.")
         return
 
-    _run_propagation(proj_paths)
+    _run_propagation(theta_deg)
 
 
-def _run_radon(theta: np.ndarray, proj_paths: list[str]) -> None:
-    rprint(f"fd limit: soft={_FD_ACHIEVED} (requested >= {_FD_TARGET}); "
-           f"MMAP_BATCH={MMAP_BATCH}")
-
-    # Bootstrap the NTHETA proj_*.tif files.  Rank 0 creates one sample file
-    # first to derive the TIFF pixel-data offset (all files share the same
-    # layout since they have identical shape/dtype), then broadcasts pix_off.
-    # All ranks then create their round-robin share of files in parallel via
-    # a thread pool — massively faster than rank 0 alone for large NTHETA.
-    expected_pix_bytes = NZ * N * 4
-    pix_off = None
-    if RANK == 0:
-        p0 = proj_paths[0]
-        if os.path.exists(p0):
-            os.remove(p0)
-        mm = tifffile.memmap(p0, shape=(NZ, N), dtype=np.float32, bigtiff=True)
-        mm.flush()
-        del mm
-        with tifffile.TiffFile(p0) as tf:
-            pix_off = int(tf.pages[0].dataoffsets[0])
-        need = pix_off + expected_pix_bytes
-        if os.path.getsize(p0) < need:
-            os.truncate(p0, need)
-    if _COMM is not None:
-        pix_off = _COMM.bcast(pix_off, root=0)
-    need = pix_off + expected_pix_bytes
-
-    def _bootstrap_one(i: int) -> None:
-        p = proj_paths[i]
-        if os.path.exists(p):
-            os.remove(p)
-        mm = tifffile.memmap(p, shape=(NZ, N), dtype=np.float32, bigtiff=True)
-        mm.flush()
-        del mm
-        if os.path.getsize(p) < need:
-            os.truncate(p, need)
-
-    # Rank 0 has already done file 0.  Distribute the remainder round-robin.
-    my_boot = [i for i in range(NTHETA)
-               if i % SIZE == RANK and not (RANK == 0 and i == 0)]
-    with ThreadPoolExecutor(max_workers=N_LOAD_THREADS) as bpool:
-        list(bpool.map(_bootstrap_one, my_boot))
+def _run_radon(theta_rad: np.ndarray, theta_deg: np.ndarray) -> None:
+    # Bootstrap proj.h5.
+    if RANK == 0 and os.path.exists(PROJ_H5):
+        os.remove(PROJ_H5)
     _barrier()
-    rprint(f"bootstrap done ({NTHETA} files, {SIZE} ranks × "
-           f"{N_LOAD_THREADS} threads)")
+
+    with h5py.File(PROJ_H5, "w", **_H5_MPI_KW) as f:
+        g = f.create_group("exchange")
+        g.create_dataset("data", shape=(NTHETA, NZ, N), dtype="float32",
+                         chunks=(1, NCHUNK, N))
+        g.create_dataset("theta", data=theta_deg)
+    _barrier()
+    rprint(f"proj.h5 created  (chunks=(1, {NCHUNK}, {N}); "
+           f"{NTHETA * NZ * N * 4 / 1e12:.2f} TB total)")
 
     proj_min, proj_max = np.inf, -np.inf
 
+    # Contiguous z-chunk assignment so each h5 chunk is written by one rank.
     n_chunks_total = (NZ + NCHUNK - 1) // NCHUNK
-    my_chunks = list(range(RANK, n_chunks_total, SIZE))
+    per_rank = (n_chunks_total + SIZE - 1) // SIZE
+    my_chunk_lo = RANK * per_rank
+    my_chunk_hi = min(my_chunk_lo + per_rank, n_chunks_total)
+    my_chunks = list(range(my_chunk_lo, my_chunk_hi))
 
     chunks_arg = [CHUNK_N, CHUNK_THETA, CHUNK_XY]
 
-    with ThreadPoolExecutor(max_workers=N_LOAD_THREADS) as pool:
+    with h5py.File(SRC_H5,  "r",  **_H5_MPI_KW) as fsrc, \
+         h5py.File(PROJ_H5, "r+", **_H5_MPI_KW) as fdst:
+        src_dset  = fsrc["exchange/data"]
+        proj_dset = fdst["exchange/data"]
+
         for tb in range(N_THETA_BATCHES):
             tb0 = tb * THETA_BATCH
             tb1 = min(tb0 + THETA_BATCH, NTHETA)
-            b_theta = theta[tb0:tb1]
+            b_theta = theta_rad[tb0:tb1]
             rprint(f"[theta batch {tb+1}/{N_THETA_BATCHES}] angles [{tb0}, {tb1})")
 
+            rprint("building TomoLarge...")
             cl_tomo = TomoLarge(N, b_theta, ROTATION_AXIS)
+            rprint("TomoLarge ready.")
 
             for ci, chunk_idx in enumerate(my_chunks):
                 z0 = chunk_idx * NCHUNK
                 z1 = min(z0 + NCHUNK, NZ)
                 k  = z1 - z0
-                chunk_h = load_chunk(z0, z1, pool)
+                chunk_h = load_chunk(src_dset, z0, z1)
                 if k < NCHUNK:
                     pad = np.zeros((NCHUNK, N, N), dtype=np.complex64)
                     pad[:k] = chunk_h
@@ -306,25 +271,14 @@ def _run_radon(theta: np.ndarray, proj_paths: list[str]) -> None:
                 proj_chunk_h = res_h[:, :k].real.astype(np.float32, copy=False)
                 del res_h
 
-                # Threaded scatter with raw np.memmap at the known pixel
-                # offset — skips tifffile's header re-parse on every open,
-                # which is prone to `not a TIFF file: header=b''` under
-                # concurrent shared-filesystem writes.
-                batch_ntheta = tb1 - tb0
-
-                def _scatter_one(i: int) -> None:
-                    mm = np.memmap(proj_paths[tb0 + i], dtype=np.float32,
-                                   mode='r+', shape=(NZ, N), offset=pix_off)
-                    mm[z0:z1] = proj_chunk_h[i]
-                    mm.flush()
-
-                list(pool.map(_scatter_one, range(batch_ntheta)))
+                # Independent parallel write to disjoint z-chunk.
+                proj_dset[tb0:tb1, z0:z1, :] = proj_chunk_h
 
                 proj_min = min(proj_min, float(proj_chunk_h.min()))
                 proj_max = max(proj_max, float(proj_chunk_h.max()))
                 del proj_chunk_h
 
-                if (ci + 1) % 32 == 0 or chunk_idx == n_chunks_total - 1:
+                if (ci + 1) % 4 == 0 or (ci + 1) == len(my_chunks):
                     print(f"  [rank {RANK}] tb{tb+1}/{N_THETA_BATCHES}  "
                           f"chunk {ci+1}/{len(my_chunks)}  z={z1}", flush=True)
 
@@ -343,7 +297,7 @@ def _run_radon(theta: np.ndarray, proj_paths: list[str]) -> None:
            f"{proj_max/float(NORM_CONST):.4g}] rad)")
 
 
-# ---------- stage 2 kernels + Fresnel prop (identical to model_radon_big) ----
+# --------------------- Stage 2 kernels + Fresnel prop -----------------------
 _psi_from_proj = cp.ElementwiseKernel(
     "float32 delta_raw, float32 inv_norm, float32 inv_beta_ratio",
     "complex64 psi",
@@ -363,17 +317,29 @@ _abs2_c64_to_f32 = cp.ElementwiseKernel(
 )
 
 
-def _run_propagation(proj_paths: list[str]) -> None:
+def _run_propagation(theta_deg: np.ndarray) -> None:
     wavelength = 1.24e-9 / ENERGY
     fresnel_number = (VOXELSIZE ** 2) / (wavelength * DISTANCE)
 
     rprint(f"prop: E={ENERGY} keV  lambda={wavelength:.4e} m  "
            f"voxel={VOXELSIZE} m  distance={DISTANCE} m  "
            f"Fresnel number (per pixel)={fresnel_number:.4g}")
-    rprint(f"propagating full sinogram {NZ}×{N} (no crop)")
     rprint(f"GPU est. — Prop._buf_big + fker: "
            f"{(NPROP_BATCH + 1) * (2*NZ) * (2*N) * 8 / 1e9:.3f} GB  "
            f"(NPROP_BATCH={NPROP_BATCH})")
+
+    if RANK == 0 and os.path.exists(DATA_H5):
+        os.remove(DATA_H5)
+    _barrier()
+
+    with h5py.File(DATA_H5, "w", **_H5_MPI_KW) as f:
+        g = f.create_group("exchange")
+        g.create_dataset("data", shape=(NTHETA, NZ, N), dtype="float32",
+                         chunks=(1, DATA_CHUNK_Z, N))
+        g.create_dataset("theta", data=theta_deg)
+    _barrier()
+    rprint(f"data.h5 created  (chunks=(1, {DATA_CHUNK_Z}, {N}); "
+           f"{NTHETA * NZ * N * 4 / 1e12:.2f} TB total)")
 
     cl_prop = Propagation(N, NZ, NPROP_BATCH, 1,
                           wavelength, VOXELSIZE, [DISTANCE])
@@ -389,17 +355,16 @@ def _run_propagation(proj_paths: list[str]) -> None:
     inv_norm       = np.float32(1.0 / float(NORM_CONST))
     inv_beta_ratio = np.float32(1.0 / BETA_RATIO)
 
-    with ThreadPoolExecutor(max_workers=max(NPROP_BATCH, 2)) as io_pool:
+    with h5py.File(PROJ_H5, "r",  **_H5_MPI_KW) as fp, \
+         h5py.File(DATA_H5, "r+", **_H5_MPI_KW) as fd:
+        proj_dset = fp["exchange/data"]
+        data_dset = fd["exchange/data"]
+
         for i0 in range(i_start, i_end, NPROP_BATCH):
             i1 = min(i0 + NPROP_BATCH, i_end)
             b  = i1 - i0
 
-            proj_batch_h = np.zeros((NPROP_BATCH, NZ, N), dtype=np.float32)
-
-            def _load(kk: int) -> None:
-                proj_batch_h[kk] = tifffile.imread(proj_paths[i0 + kk])
-
-            list(io_pool.map(_load, range(b)))
+            proj_batch_h = proj_dset[i0:i1, :, :]
 
             proj_d = cp.asarray(proj_batch_h)
             del proj_batch_h
@@ -422,13 +387,7 @@ def _run_propagation(proj_paths: list[str]) -> None:
             if np.isnan(data_batch_h).any():
                 d_has_nan = True
 
-            def _write(kk: int) -> None:
-                tifffile.imwrite(
-                    os.path.join(DST_DIR, f"data_{i0 + kk:05d}.tif"),
-                    data_batch_h[kk], compression=None,
-                )
-
-            list(io_pool.map(_write, range(b)))
+            data_dset[i0:i1, :, :] = data_batch_h
             del data_batch_h
 
             print(f"  [rank {RANK}] prop  angles {i0}..{i1-1}", flush=True)
@@ -443,8 +402,7 @@ def _run_propagation(proj_paths: list[str]) -> None:
 
     rprint(f"data stats: min={d_min:.4g} max={d_max:.4g} "
            f"mean={d_sum/d_cnt:.4g} nan={d_has_nan}")
-    rprint(f"wrote {NTHETA} data tiffs to {DST_DIR}  "
-           f"(intermediate proj_*.tif left in place)")
+    rprint(f"wrote {NTHETA} angles to {DATA_H5}")
 
 
 if __name__ == "__main__":

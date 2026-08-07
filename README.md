@@ -26,9 +26,9 @@ via cupy.  All the USFFT / Fresnel machinery is vendored locally
 
 ## Installation
 
-Everything is Python; the only compiled dependencies are **cupy**
-(needs a CUDA-capable GPU and a matching CUDA toolkit) and **mpi4py**
-(needs an MPI runtime — OpenMPI is easiest to get from conda-forge).
+Compiled dependencies: **cupy** (CUDA-capable GPU + matching toolkit),
+**mpi4py** (MPI runtime), and **parallel HDF5** + `h5py-mpi` (all step
+scripts write single-file h5 outputs via MPI-IO).
 
 ```bash
 # Create a fresh env.
@@ -39,11 +39,24 @@ conda activate mosaic
 # On the APS beamline machines this is CUDA 12:
 conda install -c conda-forge cupy cuda-version=12
 
-# MPI runtime + Python bindings (skip if you already have a system OpenMPI).
-conda install -c conda-forge openmpi mpi4py
+# MPI runtime + parallel-HDF5 stack (openmpi → mpi4py → h5py-mpi all
+# from conda-forge so they link against the same MPI/HDF5).
+conda install -c conda-forge "openmpi>=4" mpi4py
+conda install -c conda-forge "h5py=*=mpi_openmpi*" hdf5="*=mpi_openmpi*"
 
 # Everything else.
-conda install -c conda-forge tifffile h5py matplotlib scipy numpy
+conda install -c conda-forge tifffile matplotlib scipy numpy
+```
+
+**On Polaris (ALCF)** don't install openmpi from conda — use the site's
+Cray MPICH and the `cray-hdf5-parallel` module.  A working recipe:
+```bash
+module load cray-hdf5-parallel
+conda create -n mosaic python=3.12
+conda activate mosaic
+conda install -c conda-forge cupy cuda-version=12 tifffile matplotlib scipy numpy
+CC=cc MPICC=cc pip install --no-cache-dir --no-binary=mpi4py mpi4py
+HDF5_MPI=ON HDF5_DIR=$HDF5_DIR CC=cc pip install --no-cache-dir --no-binary=h5py h5py
 ```
 
 Verify:
@@ -51,10 +64,12 @@ Verify:
 ```bash
 python -c "import cupy; print(cupy.__version__, cupy.cuda.runtime.getDeviceCount(), 'GPUs')"
 mpirun -n 2 python -c "from mpi4py import MPI; print(MPI.COMM_WORLD.Get_rank())"
+python -c "import h5py; print('h5py mpi=', h5py.get_config().mpi)"   # must be True
 ```
 
-If `cupy.cuda.runtime.getDeviceCount()` returns 0, your CUDA driver /
-cupy build don't match — install the matching `cuda-version=…` again.
+If `h5py mpi= False`, the step scripts fall back to single-process
+opens per rank, which serialises writes — noticeably slower.  Rebuild
+h5py against the MPI-enabled HDF5.
 
 ---
 
@@ -62,10 +77,8 @@ cupy build don't match — install the matching `cuda-version=…` again.
 
 ```
    ┌───────────────────┐
-   │  init/  (input)   │  2560 × 2744 × 2744 per-slice TIFFs, float32
-   │  init_00000.tif   │  (produced by upsample_extract.py, or dropped in)
-   │  init_00001.tif   │
-   │  …                │
+   │  init.h5  (input) │  /exchange/data (2560, 2744, 2744) float32
+   │                   │  (produced by upsample_extract.py, or dropped in)
    └────────┬──────────┘
             │
    step0_schematic.py       ─ plan tile layout, save PNG + positions.txt
@@ -79,54 +92,73 @@ cupy build don't match — install the matching `cuda-version=…` again.
    step3_extract.py         ─ model_big{UPS}x → mosaic_h5/{z}_{x}.h5
 ```
 
-Each step reads from and writes to subdirectories of a single `--path` root:
+Each step reads from and writes to files under a single `--path` root.
+All bulk data lives in **single HDF5 files** written in parallel with
+`h5py` MPI-IO — no per-slice / per-angle TIFF fan-out:
 
 ```
 <path>/
-  init/                       ← input (per-slice TIFFs of the source volume)
-  big{UPS}x/                  ← step1_upsample output
+  init.h5                     ← input (upsample_extract output; or drop your own)
+      /exchange/data          (OUT_NZ, OUT_NYX, OUT_NYX) f32   chunks (1, OUT_NYX, OUT_NYX)
+  big{UPS}x.h5                ← step1_upsample output
+      /exchange/data          (OUT_NZ·UPS, OUT_NYX·UPS, OUT_NYX·UPS) f32
   model_big{UPS}x/
-      proj_00000.tif  …       ← Radon stage output (linear R(δ))
-      data_00000.tif  …       ← Fresnel stage output (|D(ψ)|²)
+      proj.h5                 ← step2 Radon stage
+          /exchange/data      (NTHETA, NZ, N) f32   chunks (1, NCHUNK, N)
+          /exchange/theta     (NTHETA,) f32         angles in DEGREES
+      data.h5                 ← step2 Fresnel stage (|D(ψ)|²)
+          /exchange/data      (NTHETA, NZ, N) f32   chunks (1, DATA_CHUNK_Z, N)
+          /exchange/theta     (NTHETA,) f32         angles in DEGREES
   mosaic_h5/
-      0_0.h5  0_1.h5  …       ← per-tile HDF5 for stitching
+      0_0.h5  0_1.h5  …       ← step3 per-tile HDF5 for stitching
   mosaic_schematic{UPS}.png   ← layout figure
   mosaic_positions{UPS}.txt   ← x tile origins (px)
 ```
 
 Shared filesystem (Lustre/GPFS/NFS) is assumed — `--path` should point at the
-same location from every node.  Each MPI rank writes only its own shard, and
-ranks synchronise via `MPI.Barrier` between stages.
+same location from every node.  Each MPI rank writes to its own disjoint
+h5-chunk region (safe for independent MPI-IO), and ranks synchronise via
+`MPI.Barrier` between stages.
 
-**Site-specific `--path` defaults for the init dataset:**
+**Lustre striping** — before the first run, set striping on the model
+output directory and the big{UPS}x.h5 file to spread I/O across OSTs:
 
-| site  | init folder location                    | pass to `--path`                |
-|-------|-----------------------------------------|---------------------------------|
-| APS   | `/data2/brain_sym_mosaic/init`          | `--path /data2/brain_sym_mosaic`|
-| MaxIV | `/data/ingest/vviknik/init` *(current)* | `--path /data/ingest/vviknik`   |
+```bash
+lfs setstripe -c -1 -S 4M <path>/model_big${UPS}x   # inherits by new files
+lfs setstripe -c -1 -S 4M <path>/big${UPS}x.h5      # once the file exists
+```
+
+**Site-specific `--path` defaults:**
+
+| site  | typical init location                | pass to `--path`                |
+|-------|--------------------------------------|---------------------------------|
+| APS   | `/data2/brain_sym_mosaic/init.h5`    | `--path /data2/brain_sym_mosaic`|
+| MaxIV | `/data/ingest/vviknik/init.h5`       | `--path /data/ingest/vviknik`   |
+| Polaris| `/eagle/APS_IRI/vnikitin/mosaic_brain/init.h5` | `--path /eagle/APS_IRI/vnikitin/mosaic_brain` |
 
 ---
 
 ## What each step produces
 
-**Step 1 — upsample** writes per-slice TIFFs of the trilinearly-interpolated
-volume.  Mid-sample z-slice from `big1x/big_01280.tif`:
+**Step 1 — upsample** writes a single `big{UPS}x.h5` (trilinear).
+Mid-sample z-slice (`data[1280, :, :]` at UPS=1):
 
 ![step1 upsample slice](docs/step1_upsample_slice.png)
 
-**Step 2 — model (Radon)** produces the linear Radon transform `R(δ)` and
-scatters it into one BigTIFF per angle.  Angle 0° (`proj_00000.tif`):
+**Step 2 — model (Radon)** produces the linear Radon transform `R(δ)`
+into `proj.h5` `(NTHETA, NZ, N)` with chunks `(1, NCHUNK, N)`.  Angle 0°
+plane (`data[0, :, :]`):
 
 ![step2 proj angle 0](docs/step2_proj_angle0.png)
 
 **Step 2 — model (Fresnel)** turns `proj` into `ψ = exp(1j·(x22 + 1j·β))`,
-propagates via `Propagation.D`, and writes `data_{i:05d}.tif = |D(ψ)|²`.
-Same angle:
+propagates via `Propagation.D`, and writes `data.h5 = |D(ψ)|²` chunked
+`(1, DATA_CHUNK_Z, N)`.  Same angle:
 
 ![step2 data angle 0](docs/step2_data_angle0.png)
 
-**Step 3 — extract** slices the propagated data into per-tile HDF5 files
-using the mosaic layout.  One tile at position `(z=4, x=2)` at ~45°:
+**Step 3 — extract** slices `data.h5` into per-tile HDF5 files using
+the mosaic layout.  One tile at `(z=4, x=2)` at ~45°:
 
 ![step3 extract tile 4_2](docs/step3_extract_tile_4_2.png)
 
@@ -160,17 +192,17 @@ PATH_DATA=/data2/brain_sym_mosaic
 # 0. Plan the mosaic (produces mosaic_schematic{UPS}.png + positions txt)
 python step0_schematic.py --ups $UPS --path $PATH_DATA
 
-# 1. Upsample the init volume by UPS× (per-slice TIFFs on disk)
+# 1. Upsample init.h5 into big{UPS}x.h5
 mpirun -n 4 set_affinity_gpu.sh \
     python step1_upsample.py --ups $UPS --path $PATH_DATA
 
-# 2. Radon + Fresnel — one big TIFF per angle, per stage
+# 2. Radon + Fresnel → model_big{UPS}x/proj.h5 and data.h5
 mpirun -n 4 set_affinity_gpu.sh \
     python step2_model_big.py --ups $UPS --path $PATH_DATA \
                               --nchunk 32 --nprop-batch 8
 
-# 3. Slice per-angle projections into per-tile HDF5 files
-python step3_extract.py --ups $UPS --path $PATH_DATA
+# 3. Slice data.h5 into per-tile HDF5 files (MPI-parallel; -n = tiles/rank)
+mpirun -n 4 python step3_extract.py --ups $UPS --path $PATH_DATA
 ```
 
 ---
@@ -210,7 +242,19 @@ mpirun -n 16 --map-by ppr:4:node set_affinity_gpu.sh \
                                 --nchunk 1 --nprop-batch 1 \
                                 --chunk-n 686 --chunk-theta 343 --chunk-xy 686
 
-python step3_extract.py --ups $UPS --path $PATH_DATA
+# step3 is CPU-only but MPI-shards tiles across ranks — worth running on
+# many ranks when tile count × NTHETA is large.
+mpirun -n 16 python step3_extract.py --ups $UPS --path $PATH_DATA
+```
+
+**On Polaris** replace `mpirun` with `mpiexec --ppn 4 --depth=8 --cpu-bind depth`
+and use `set_affinity_gpu_polaris.sh` (which reads `PMI_LOCAL_RANK` and
+reverse-maps GPU indices for NUMA locality):
+
+```bash
+mpiexec -n 16 --ppn 4 --depth=8 --cpu-bind depth \
+    ./set_affinity_gpu_polaris.sh \
+    python step2_model_large.py --ups $UPS --path $PATH_DATA
 ```
 
 ---
@@ -278,21 +322,23 @@ Full options: `python step<N>_<name>.py --help`.
 ## Resuming / partial runs
 
 - **Only Radon** (skip Fresnel): `step2_model_*.py --stage radon`
-- **Only Fresnel** (`proj_*.tif` already on disk): `step2_model_*.py --stage prop`
-- **Change UPS mid-experiment**: everything is UPS-tagged (`big8x`, `model_big8x`, `mosaic_schematic8.png`, `mosaic_positions8.txt`), so runs at different UPS values coexist under the same `--path` without collision.
+- **Only Fresnel** (`proj.h5` already on disk): `step2_model_*.py --stage prop`
+- **Change UPS mid-experiment**: everything is UPS-tagged (`big{UPS}x.h5`, `model_big{UPS}x/`, `mosaic_schematic{UPS}.png`, `mosaic_positions{UPS}.txt`), so runs at different UPS values coexist under the same `--path` without collision.
 
 ---
 
-## Preparing the `init/` folder
+## Preparing `init.h5`
 
-If you don't already have per-slice TIFFs, [upsample_extract.py](upsample_extract.py)
-crops + masks + soft-tapers a 3-D multi-page TIFF from a reconstruction:
+If you don't already have an `init.h5`, [upsample_extract.py](upsample_extract.py)
+crops + masks + soft-tapers a 3-D multi-page TIFF from a reconstruction and
+writes the result as `{path}/init.h5`:
 
 ```bash
-python upsample_extract.py \
+mpirun -n 4 python upsample_extract.py \
     --src /local/tomodata3/vnikitin/…/rec_obj_real/0096.tiff \
     --path /data2/brain_sym_mosaic
 ```
 
 Optional (not part of the numbered pipeline).  If you already have a proper
-2560 × 2744 × 2744 per-slice init stack, skip it.
+`init.h5` with `/exchange/data` of shape `(OUT_NZ, OUT_NYX, OUT_NYX)`
+float32, skip it.

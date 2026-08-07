@@ -7,49 +7,76 @@
 #PBS -q debug
 #PBS -N holotomo
 #PBS -j oe
-
+#
+# End-to-end mosaic-modelling pipeline on Polaris (ALCF).
+# Submit:  qsub polaris_run.sh
+#
+# The pipeline writes h5 files under $PATH_DATA:
+#   init.h5, big{UPS}x.h5, model_big{UPS}x/{proj.h5, data.h5}, mosaic_h5/*
+#
+# For UPS ≥ 8 swap step2_model_big.py → step2_model_large.py (host-chunked
+# TomoLarge; keep --nchunk 1 and set --chunk-n/--chunk-theta/--chunk-xy).
 
 NNODES=$(wc -l < $PBS_NODEFILE)
-NRANKS=4
+NRANKS=4              # ranks per node (= GPUs per node on Polaris)
 NTHREADS=4
 NDEPTH=8
 export NTOTRANKS=$(( NNODES * NRANKS ))
 
 SCRIPT_DIR="${PBS_O_WORKDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-echo $SCRIPT_DIR
-
 echo "Sample dir:  ${SCRIPT_DIR}"
 echo "Jobid: $PBS_JOBID"
 echo "Running on host: $(hostname)"
 echo "Running on nodes: $(cat $PBS_NODEFILE)"
 echo "NUM_OF_NODES=${NNODES}  TOTAL_NUM_RANKS=${NTOTRANKS}  RANKS_PER_NODE=${NRANKS}"
 
-module use /soft/modulefiles;  module load conda; conda activate base
+module use /soft/modulefiles
+module load conda
+conda activate base
 CONDA_NAME=$(echo ${CONDA_PREFIX} | tr '\/' '\t' | sed -E 's/mconda3|\/base//g' | awk '{print $NF}')
 VENV_DIR="/home/vvnikitin/venvs/${CONDA_NAME}"
 source "${VENV_DIR}/bin/activate"
 
 cd "${SCRIPT_DIR}"
 
-UPS=1
-PATH_DATA=/eagle/APS_IRI/vnikitin/mosaic_brain/
+# ---------- job config ---------------------------------------------------
+UPS=${UPS:-1}
+PATH_DATA=${PATH_DATA:-/eagle/APS_IRI/vnikitin/mosaic_brain}
 
-# 0. Plan the mosaic (produces mosaic_schematic{UPS}.png + positions txt)
-python step0_schematic.py --ups $UPS --path $PATH_DATA
+echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$NTOTRANKS ==="
 
-# 1. Upsample the init volume by UPS× (per-slice TIFFs on disk)
-mpiexec -n ${NTOTRANKS} --ppn ${NRANKS} --depth=${NDEPTH} --cpu-bind depth --env OMP_NUM_THREADS=${NTHREADS} "${SCRIPT_DIR}/set_affinity_gpu_polaris.sh" \
-    python step1_upsample.py --ups $UPS --path $PATH_DATA
+# Set Lustre striping on the model output directory the first time this
+# UPS is used — spreads each h5 file across all OSTs, avoids single-OST
+# contention when many ranks write in parallel.  Harmless to re-run
+# (setstripe on an existing dir affects only newly-created files).
+mkdir -p "${PATH_DATA}/model_big${UPS}x"
+lfs setstripe -c -1 -S 4M "${PATH_DATA}/model_big${UPS}x" 2>/dev/null || true
 
-# 2. Radon + Fresnel — one big TIFF per angle, per stage
-mpiexec -n ${NTOTRANKS} --ppn ${NRANKS} --depth=${NDEPTH} --cpu-bind depth --env OMP_NUM_THREADS=${NTHREADS} "${SCRIPT_DIR}/set_affinity_gpu_polaris.sh" \
-    python step2_model_big.py --ups $UPS --path $PATH_DATA \
+MPIEXEC=(mpiexec -n "${NTOTRANKS}" --ppn "${NRANKS}"
+         --depth="${NDEPTH}" --cpu-bind depth
+         --env OMP_NUM_THREADS="${NTHREADS}"
+         "${SCRIPT_DIR}/set_affinity_gpu_polaris.sh")
+
+# ---------- 0. plan mosaic layout ----------------------------------------
+python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
+
+# ---------- 1. init.h5 → big{UPS}x.h5 ------------------------------------
+"${MPIEXEC[@]}" \
+    python step1_upsample.py --ups "$UPS" --path "$PATH_DATA"
+
+# ---------- 2. Radon + Fresnel → proj.h5, data.h5 -------------------------
+# For UPS ≥ 8, swap to step2_model_large.py:
+#   python step2_model_large.py --ups "$UPS" --path "$PATH_DATA" \
+#       --nchunk 1 --nprop-batch 1 \
+#       --chunk-n 686 --chunk-theta 343 --chunk-xy 686
+"${MPIEXEC[@]}" \
+    python step2_model_big.py --ups "$UPS" --path "$PATH_DATA" \
                               --nchunk 32 --nprop-batch 8
 
-# 3. Slice per-angle projections into per-tile HDF5 files
-python step3_extract.py --ups $UPS --path $PATH_DATA
+# ---------- 3. data.h5 → mosaic_h5/{z}_{x}.h5 -----------------------------
+# CPU-only but MPI-shards tiles across ranks.  set_affinity_gpu_polaris.sh
+# is harmless here (just sets CUDA_VISIBLE_DEVICES that Python ignores).
+"${MPIEXEC[@]}" \
+    python step3_extract.py --ups "$UPS" --path "$PATH_DATA"
 
-
-# # mpiexec -n ${NTOTRANKS} --ppn ${NRANKS} --depth=${NDEPTH} --cpu-bind depth --env OMP_NUM_THREADS=${NTHREADS} "${SCRIPT_DIR}/set_affinity_gpu_polaris.sh" python "${SCRIPT_DIR}/step0.py" "${SCRIPT_DIR}/config_step0.conf"
-# mpiexec -n ${NTOTRANKS} --ppn ${NRANKS} --depth=${NDEPTH} --cpu-bind depth --env OMP_NUM_THREADS=${NTHREADS} "${SCRIPT_DIR}/set_affinity_gpu_polaris.sh" python "${SCRIPT_DIR}/${SCRIPT}" "${SCRIPT_DIR}/${CONFIG}"
-# # mpiexec -n ${NTOTRANKS} --ppn ${NRANKS} --depth=${NDEPTH} --cpu-bind depth --env OMP_NUM_THREADS=${NTHREADS} "${SCRIPT_DIR}/set_affinity_gpu_polaris.sh" python "${SCRIPT_DIR}/steps15.py" "${SCRIPT_DIR}/config_steps15.conf"
+echo "=== pipeline done ==="
