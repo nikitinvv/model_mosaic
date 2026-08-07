@@ -19,8 +19,7 @@ Differs from test_h5_io.py in three ways:
 Meant to be run single-node (no MPI) so we can compare against
 test_h5_io.py under matched shapes and pick a direction before hybridising.
 
-Uses helpers from ./doe-maxiv/dxchange_hdf5_chunks.py — the repo must
-sit next to this script.
+Uses helpers from ./dxchange_hdf5_chunks.py (vendored from doe-maxiv).
 
 Example:
     python test_h5_buffer_io.py --path /eagle/APS_IRI/vnikitin/iotest_buf_ups2 \\
@@ -35,17 +34,12 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
-import sys
 import time
 
 import numpy as np
 from multiprocessing import shared_memory
 
-_DOE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "doe-maxiv")
-if _DOE_DIR not in sys.path:
-    sys.path.insert(0, _DOE_DIR)
-
-from dxchange_hdf5_chunks import tomo_initx, tomo_readx, tomo_writex  # noqa: E402
+from dxchange_hdf5_chunks import tomo_initx, tomo_readx, tomo_writex
 
 
 def _hb(b: float) -> str:
