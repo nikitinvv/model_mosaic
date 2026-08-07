@@ -45,12 +45,19 @@ PATH_DATA=${PATH_DATA:-/eagle/APS_IRI/vnikitin/mosaic_brain}
 
 echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$NTOTRANKS ==="
 
-# Set Lustre striping on the model output directory the first time this
-# UPS is used — spreads each h5 file across all OSTs, avoids single-OST
-# contention when many ranks write in parallel.  Harmless to re-run
-# (setstripe on an existing dir affects only newly-created files).
-mkdir -p "${PATH_DATA}/model_big${UPS}x"
-lfs setstripe -c -1 -S 4M "${PATH_DATA}/model_big${UPS}x" 2>/dev/null || true
+# Set Lustre striping on every dir that will hold a big h5 file.  All new
+# files in these dirs inherit the setting.  We also `lfs migrate` any
+# already-existing big h5 files in case they were created with the default
+# stripe_count=1 (which serialises many-rank reads onto one OST).
+mkdir -p "${PATH_DATA}" "${PATH_DATA}/model_big${UPS}x"
+lfs setstripe -c -1 -S 4M "${PATH_DATA}"                    2>/dev/null || true
+lfs setstripe -c -1 -S 4M "${PATH_DATA}/model_big${UPS}x"   2>/dev/null || true
+for f in "${PATH_DATA}/init.h5" "${PATH_DATA}/big${UPS}x.h5"; do
+    if [[ -f "$f" ]] && [[ "$(lfs getstripe -c "$f" 2>/dev/null | tail -1)" == "1" ]]; then
+        echo "  migrating $f to full-stripe layout..."
+        lfs migrate -c -1 -S 4M "$f"
+    fi
+done
 
 MPIEXEC=(mpiexec -n "${NTOTRANKS}" --ppn "${NRANKS}"
          --depth="${NDEPTH}" --cpu-bind depth

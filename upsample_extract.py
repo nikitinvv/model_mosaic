@@ -14,12 +14,15 @@ from __future__ import annotations
 import argparse
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import h5py
 import numpy as np
 import tifffile
 from scipy.ndimage import gaussian_filter1d
+
+from h5_mpi_slab import check_chunk_bytes, mpiio_write_axis0
 
 try:
     import cupy as cp
@@ -220,8 +223,10 @@ def process_chunk(z_start: int, z_end: int, mask: np.ndarray, dset,
         _gaussian_3d_threaded(vol, SMOOTH_SIGMA, pool)
 
     offset = z_start - z_lo
-    # Bulk write of the interior [z_start, z_end) to the h5 dataset.
-    dset[z_start:z_end, :, :] = vol[offset:offset + (z_end - z_start)]
+    # Bulk write of the interior [z_start, z_end) to the h5 dataset,
+    # slab-safe (kept under MPI-IO 2 GiB per-collective-transfer limit).
+    mpiio_write_axis0(dset, z_start, z_end,
+                      vol[offset:offset + (z_end - z_start)])
 
 
 def main() -> None:
@@ -258,11 +263,13 @@ def main() -> None:
               flush=True)
 
     # Collective create of init.h5.
+    dst_chunks = (1, OUT_NYX, OUT_NYX)
+    check_chunk_bytes(dst_chunks, 4, label=DST_H5)
     with h5py.File(DST_H5, "w", **_H5_MPI_KW) as f:
         g = f.create_group("exchange")
         g.create_dataset("data", shape=(OUT_NZ, OUT_NYX, OUT_NYX),
                          dtype="float32",
-                         chunks=(1, OUT_NYX, OUT_NYX))
+                         chunks=dst_chunks)
 
     if _COMM is not None:
         _COMM.Barrier()
@@ -275,10 +282,16 @@ def main() -> None:
     with h5py.File(DST_H5, "r+", **_H5_MPI_KW) as f, \
          ThreadPoolExecutor(max_workers=N_THREADS) as pool:
         dset = f["exchange/data"]
+        t_chunk_total = 0.0
         for i, (z_start, z_end) in enumerate(my_chunks):
+            t0 = time.perf_counter()
             process_chunk(z_start, z_end, mask, dset, pool)
+            dt = time.perf_counter() - t0
+            t_chunk_total += dt
             print(f"[rank {_RANK}] {i+1}/{len(my_chunks)}  "
-                  f"z=[{z_start},{z_end})", flush=True)
+                  f"z=[{z_start},{z_end})  {dt:.1f}s", flush=True)
+        print(f"[rank {_RANK}] total per-rank chunk time: "
+              f"{t_chunk_total:.1f}s ({len(my_chunks)} chunks)", flush=True)
 
     if _COMM is not None:
         _COMM.Barrier()

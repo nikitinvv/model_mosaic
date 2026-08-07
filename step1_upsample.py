@@ -19,10 +19,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import h5py
 import numpy as np
+
+from h5_mpi_slab import check_chunk_bytes, mpiio_write_axis0
 
 
 # --------------------- MPI (optional) ------------------------------------
@@ -138,11 +141,13 @@ def main() -> None:
             os.remove(DST_H5)
     _barrier()
 
+    dst_chunks = (1, OUT_NYX, OUT_NYX)
+    check_chunk_bytes(dst_chunks, 4, label=f"{DST_H5}")
     with h5py.File(DST_H5, "w", **_H5_MPI_KW) as f:
         g = f.create_group("exchange")
         g.create_dataset("data", shape=(OUT_NZ, OUT_NYX, OUT_NYX),
                          dtype="float32",
-                         chunks=(1, OUT_NYX, OUT_NYX))
+                         chunks=dst_chunks)
     _barrier()
 
     # Partition input z-slices contiguously across ranks.
@@ -187,19 +192,34 @@ def main() -> None:
         fut_next_np = (read_pool.submit(_read_plane, src_dset, i_start + 1)
                        if i_start + 1 < IN_NZ else None)
 
+        t_read = t_upsample = t_write = 0.0
+
         for zi in range(i_start, i_end):
+            t0 = time.perf_counter()
             if fut_next_np is not None:
                 next_np     = fut_next_np.result()
                 fut_next_np = (read_pool.submit(_read_plane, src_dset, zi + 2)
                                if zi + 2 < IN_NZ else None)
+                t_read += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
                 up_next_d = _upsample_xy(next_np)
                 del next_np
+                t_upsample += time.perf_counter() - t0
             else:
                 up_next_d = up_curr_d          # end of volume: hold
 
             for r in range(UPS):
                 out_z = zi * UPS + r
-                dst_dset[out_z, :, :] = _blend_and_pull(up_curr_d, up_next_d, r)
+                t0 = time.perf_counter()
+                plane = _blend_and_pull(up_curr_d, up_next_d, r)
+                t_upsample += time.perf_counter() - t0
+
+                # Single-plane write — slab helper is a no-op here (already <2 GiB
+                # unless OUT_NYX > ~23000), but reuses the same code path.
+                t0 = time.perf_counter()
+                mpiio_write_axis0(dst_dset, out_z, out_z + 1, plane[None, ...])
+                t_write += time.perf_counter() - t0
 
             up_curr_d = up_next_d
 
@@ -208,6 +228,9 @@ def main() -> None:
                 print(f"  [rank {RANK}] input {done}/{local_n}  "
                       f"(wrote up to output slice {zi*UPS + UPS - 1})",
                       flush=True)
+
+        print(f"  [rank {RANK}] timing: read={t_read:.1f}s "
+              f"upsample={t_upsample:.1f}s write={t_write:.1f}s", flush=True)
 
     _barrier()
     rprint("upsample done.")
