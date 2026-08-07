@@ -186,6 +186,19 @@ def main() -> None:
     proj_chunks = tuple(args.proj_chunks) if args.proj_chunks else (1, 1,      N     )
     data_chunks = tuple(args.data_chunks) if args.data_chunks else (1, OUT_NZ, N     )
 
+    def _validate(name, shape, chunks):
+        if any(c > s for c, s in zip(chunks, shape)):
+            axes = ", ".join(f"axis{i}: chunk {c} > shape {s}"
+                             for i, (c, s) in enumerate(zip(chunks, shape))
+                             if c > s)
+            raise SystemExit(
+                f"[test_h5_io] {name} chunks={chunks} exceed shape={shape} "
+                f"({axes}).  Every chunk axis must be ≤ the dataset axis.")
+    _validate("init.h5",       init_shape, init_chunks)
+    _validate(f"big{UPS}x.h5", big_shape,  big_chunks)
+    _validate("proj.h5",       proj_shape, proj_chunks)
+    _validate("data.h5",       data_shape, data_chunks)
+
     # z-slices per Radon call = proj-chunks[1] so each rank writes to whole
     # z-chunks (no partial-chunk R-M-W).
     NZCHUNK     = proj_chunks[1]
@@ -225,23 +238,29 @@ def main() -> None:
     i1_in = min(i0_in + per_rank_in, IN_NZ)
 
     rng = np.random.default_rng(1234 + RANK)
+    total = max(1, i1_in - i0_in)
+    step  = max(1, total // 10)
     _barrier()
     t0 = time.perf_counter()
+    rprint(f"  seeding init.h5  ({total} planes/rank)…")
     with h5py.File(INIT_H5, "r+", **_H5_KW) as f:
         dset = f["data"]
-        for zi in range(i0_in, i1_in):
+        for i, zi in enumerate(range(i0_in, i1_in), start=1):
             dset[zi, :, :] = rng.random((IN_NYX, IN_NYX), dtype=np.float32)
+            if i % step == 0 or i == total:
+                print(f"    [rank {RANK}] init seed {i}/{total}", flush=True)
     _barrier()
     t_init_write = time.perf_counter() - t0
 
     # Stage 1 pattern: read one init plane at a time, write UPS output planes.
     _barrier()
     t_read = t_write = 0.0
+    rprint(f"  upsample loop  ({total} input planes/rank × {UPS} out planes each)…")
     with h5py.File(INIT_H5, "r",  **_H5_KW) as fsrc, \
          h5py.File(BIG_H5,  "r+", **_H5_KW) as fdst:
         src_dset = fsrc["data"]
         dst_dset = fdst["data"]
-        for zi in range(i0_in, i1_in):
+        for i, zi in enumerate(range(i0_in, i1_in), start=1):
             t = time.perf_counter()
             plane = src_dset[zi, :, :]
             t_read += time.perf_counter() - t
@@ -254,6 +273,9 @@ def main() -> None:
                 dst_dset[zi * UPS + r, :, :] = up_plane
                 t_write += time.perf_counter() - t
             del up_plane
+            if i % step == 0 or i == total:
+                print(f"    [rank {RANK}] upsample {i}/{total}  "
+                      f"(read={t_read:.1f}s write={t_write:.1f}s)", flush=True)
     _barrier()
 
     slices_per_rank = i1_in - i0_in
@@ -281,11 +303,14 @@ def main() -> None:
     _barrier()
     t_read = t_write = 0.0
     fake_proj = rng.random((NTHETA, NZCHUNK, N), dtype=np.float32)  # payload buffer
+    total = max(1, len(my_z_chunks))
+    step  = max(1, total // 10)
+    rprint(f"  radon loop  ({total} z-chunks/rank, {NZCHUNK} slices each)…")
     with h5py.File(BIG_H5,  "r",  **_H5_KW) as fsrc, \
          h5py.File(PROJ_H5, "r+", **_H5_KW) as fdst:
         src_dset = fsrc["data"]
         proj_dset = fdst["data"]
-        for ci, cidx in enumerate(my_z_chunks):
+        for ci, cidx in enumerate(my_z_chunks, start=1):
             z0 = cidx * NZCHUNK
             z1 = min(z0 + NZCHUNK, OUT_NZ)
             k  = z1 - z0
@@ -298,9 +323,9 @@ def main() -> None:
             proj_dset[0:NTHETA, z0:z1, :] = fake_proj[:, :k, :]
             t_write += time.perf_counter() - t
 
-            if (ci + 1) % 16 == 0 or ci + 1 == len(my_z_chunks):
-                print(f"    [rank {RANK}] radon z-chunk {ci+1}/{len(my_z_chunks)}",
-                      flush=True)
+            if ci % step == 0 or ci == total:
+                print(f"    [rank {RANK}] radon {ci}/{total}  "
+                      f"(read={t_read:.1f}s write={t_write:.1f}s)", flush=True)
     _barrier()
     bytes_read  = len(my_z_chunks) * NZCHUNK * N * N * 4
     bytes_write = len(my_z_chunks) * NTHETA * NZCHUNK * N * 4
@@ -324,11 +349,14 @@ def main() -> None:
 
     _barrier()
     t_read = t_write = 0.0
+    n_iters = max(1, -(-(i_end - i_start) // NPROPCHUNK))
+    step    = max(1, n_iters // 10)
+    rprint(f"  fresnel loop  ({n_iters} batches/rank of {NPROPCHUNK} planes)…")
     with h5py.File(PROJ_H5, "r",  **_H5_KW) as fp, \
          h5py.File(DATA_H5, "r+", **_H5_KW) as fd:
         proj_dset = fp["data"]
         data_dset = fd["data"]
-        for i0 in range(i_start, i_end, NPROPCHUNK):
+        for it, i0 in enumerate(range(i_start, i_end, NPROPCHUNK), start=1):
             i1 = min(i0 + NPROPCHUNK, i_end)
 
             t = time.perf_counter()
@@ -338,6 +366,10 @@ def main() -> None:
             t = time.perf_counter()
             data_dset[i0:i1, :, :] = batch
             t_write += time.perf_counter() - t
+
+            if it % step == 0 or it == n_iters:
+                print(f"    [rank {RANK}] fresnel {it}/{n_iters}  "
+                      f"(read={t_read:.1f}s write={t_write:.1f}s)", flush=True)
     _barrier()
     n_planes = i_end - i_start
     bytes_side = n_planes * OUT_NZ * N * 4
