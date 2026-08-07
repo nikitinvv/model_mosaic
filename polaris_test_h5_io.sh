@@ -1,10 +1,10 @@
 #!/bin/bash
-#PBS -A 14347
-#PBS -l select=8:system=polaris
+#PBS -A 14238
+#PBS -l select=2:system=polaris
 #PBS -l place=scatter
 #PBS -l filesystems=home:grand:eagle
-#PBS -l walltime=1:00:00
-#PBS -q debug-scaling
+#PBS -l walltime=0:20:00
+#PBS -q debug
 #PBS -N mosaic_io
 #PBS -j oe
 #
@@ -12,7 +12,7 @@
 # Edit the variables in the "USER KNOBS" block below, then:  qsub polaris_test_h5_io.sh
 
 # ================== USER KNOBS ==================
-UPS=2
+UPS=1
 PATH_DATA=/eagle/APS_IRI/vnikitin/iotest_ups${UPS}
 
 # Fresnel batch size (planes per Fresnel call)
@@ -21,7 +21,7 @@ NPROPCHUNK=1
 # h5 chunk shapes — three ints each:  (c0, c1, c2)
 INIT_CHUNKS="1 2744 2744"                # (nz, ny, nx)   for init.h5
 BIG_CHUNKS="1 $((2744*UPS)) $((2744*UPS))"   # (nz, ny, nx)   for big{UPS}x.h5
-PROJ_CHUNKS="1 32 $((2744*UPS))"          # (nθ, nz, nx)   for proj.h5
+PROJ_CHUNKS="128 1 $((2744*UPS))"          # (nθ, nz, nx)   for proj.h5
 DATA_CHUNKS="1 $((2560*UPS)) $((2744*UPS))"  # (nθ, nz, nx)   for data.h5
 # ================================================
 
