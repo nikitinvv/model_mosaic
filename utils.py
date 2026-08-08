@@ -40,6 +40,17 @@ _warnings.filterwarnings(
 _IS_WORKER = _mp.parent_process() is not None
 
 if not _IS_WORKER:
+    # Skip mpi4py's auto MPI.Finalize atexit.  On Cray MPICH / OpenMPI
+    # + multiprocessing spawn + shared memory, Finalize hangs at
+    # interpreter shutdown trying to reconcile with SHM/semaphore
+    # resources that the multiprocessing resource_tracker still holds.
+    # Skipping Finalize is safe: our last collective (report_stage's
+    # allreduce) has already synced all ranks, and mpiexec/PALS reaps
+    # per-rank MPI state when the process exits.  Cost: OpenMPI's
+    # mpirun prints an "abnormal termination" warning; Cray PALS is
+    # silent.  Exit code is 0 either way.
+    import mpi4py as _mpi4py
+    _mpi4py.rc.finalize = False
     from mpi4py import MPI
     COMM = MPI.COMM_WORLD
     RANK = COMM.Get_rank()

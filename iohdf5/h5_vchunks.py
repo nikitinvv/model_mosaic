@@ -72,20 +72,26 @@ def free_shm(shm) -> None:
 
 def initx_and_bcast(path, shape, dtype, vchunks, stype="proj",
                     nbanks=8, meta=None, rank=0, comm=None):
-    """Rank 0 clears any prior master + bank dir, then ALL ranks call
-    tomo_initx which shards bank-file pre-allocation round-robin across
-    ranks (parallelises the ALLOC_TIME_EARLY cost that used to be
-    single-threaded on rank 0).  Rank 0 additionally creates the VDS
-    master.  ctx is deterministic (same banking plan on every rank), so
-    no bcast is needed."""
+    """Rank 0 clears any prior master + creates VDS + all bank files.
+    Other ranks compute the banking plan locally (deterministic in the
+    params, so no bcast is needed).  Barrier at the end ensures the
+    master + all bank files exist on the FS before any rank returns."""
     if rank == 0:
         cleanup_h5(path)
-    if comm is not None:
-        comm.Barrier()
-    size = comm.Get_size() if comm is not None else 1
-    ctx = _initx(filename=path, shape=shape, dtype=dtype,
-                 vchunks=vchunks, stype=stype, nbanks=nbanks,
-                 meta=meta or {}, rank=rank, size=size)
+        ctx = _initx(filename=path, shape=shape, dtype=dtype,
+                     vchunks=vchunks, stype=stype, nbanks=nbanks,
+                     meta=meta or {})
+    else:
+        # Deterministic plan — recompute the paths+sizes without
+        # touching the filesystem.
+        from iohdf5.dxchange_hdf5_chunks import _create_banking_plan
+        sitems_idx = 0 if stype.lower().startswith("proj") else 1
+        banks_filename_path, banks_size, _ = _create_banking_plan(
+            filename=path, shape=shape, vchunks=vchunks,
+            nbanks_per_svchunk=nbanks, sitems_idx=sitems_idx,
+            meta=meta or {})
+        ctx = {'banks_filename_path': banks_filename_path,
+               'banks_size': banks_size}
     if comm is not None:
         comm.Barrier()
     return ctx

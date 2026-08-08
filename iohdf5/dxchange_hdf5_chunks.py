@@ -55,46 +55,29 @@ def _get_pool(nbanks: int):
     return p
 
 
-def shutdown_pools():
-    """SIGKILL every cached spawn Pool worker and drop references.
-
-    Call this explicitly at the end of each step's main() — after the
-    last tomo_writex/tomo_readx, before the final MPI barrier + return.
-    Relying on the @atexit fallback below is unreliable under MPI on
-    some systems (tomo5): atexit hook order is LIFO, and if mpi4py's
-    MPI.Finalize atexit hook was registered before ours (which it
-    usually is, since mpi4py is imported first), it runs AFTER ours —
-    and if for any reason ours doesn't fire (uncaught signal, exit via
-    os._exit, worker teardown deadlock), MPI never finalizes and every
-    rank hangs at interpreter shutdown.  Explicit call at end of main
-    sidesteps all of that.
-
-    We SIGKILL the worker PIDs directly rather than call Pool.terminate()
-    or Pool.close()+join(): those wind through multiprocessing's own
-    supervisor threads and can themselves deadlock on tomo5.  All our
-    tasks have completed by shutdown time so workers are idle on the
-    task queue; SIGKILL is safe and instant.  Idempotent.
-    """
-    import signal
+@atexit.register
+def _shutdown_pools():
+    # Runs at interpreter shutdown, BEFORE mpi4py's MPI.Finalize
+    # (imported later → registered earlier → runs later; atexit is LIFO).
+    #
+    # close() + join() lets each worker finish idling on the empty task
+    # queue and exit cleanly — which is what releases the pool's
+    # semaphores and internal queues.  If we SIGTERM'd via terminate()
+    # instead, workers wouldn't run their own cleanup, resource_tracker
+    # would keep the semaphores around, and MPI.Finalize would then
+    # hang trying to reconcile with those orphaned SysV/POSIX SHM
+    # resources on Cray MPICH.
+    #
+    # Safe because by atexit time all our compute is done — workers are
+    # idle-waiting on the queue and close() just tells them "no more
+    # tasks", they return cleanly, join() collects the exit statuses.
     for p in _POOLS.values():
         try:
-            for w in getattr(p, '_pool', []):
-                pid = getattr(w, 'pid', None)
-                if pid:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass  # already gone
-                    except Exception:
-                        pass
+            p.close()
+            p.join()
         except Exception:
             pass
     _POOLS.clear()
-
-
-# Belt-and-suspenders: still register the atexit fallback for scripts
-# that forget to call shutdown_pools() explicitly.
-atexit.register(shutdown_pools)
 
 # Cache for tomo_info() — master VDS attrs are immutable after tomo_initx,
 # so we open the master + first bank once per (process, filename) and
@@ -109,7 +92,6 @@ def tomo_info(filename):
     cached = _INFO_CACHE.get(filename)
     if cached is not None:
         return cached
-    fullpath_vs = None
     info = {}
     with h5py.File(filename, 'r') as hf:
         dset = hf['/exchange/data']
@@ -121,22 +103,26 @@ def tomo_info(filename):
         info["dtype"] = dtype
         info["is_virtual"] = dset.is_virtual
         info["nbanks_per_svchunk"] = dset.attrs['nbanks_per_svchunk']
-        info["vchunks"] = (dset.attrs['vchunks_0'],dset.attrs['vchunks_1'],dset.attrs['vchunks_2'])
+        vchunks = (int(dset.attrs['vchunks_0']),
+                   int(dset.attrs['vchunks_1']),
+                   int(dset.attrs['vchunks_2']))
+        info["vchunks"] = vchunks
         info["shape"] = (nproj, ny, nx)
         info["meta"] = json.loads(dset.attrs['meta'])
-        info["stype"] = dset.attrs['stype']
-        
-        if dset.is_virtual:
-            fname_vs = dset.virtual_sources()[0].file_name
-            fullpath_vs = os.path.join(os.path.dirname(filename), fname_vs)
+        stype = dset.attrs['stype']
+        info["stype"] = stype
+        # Derive chunks from vchunks + stype — matches what tomo_initx
+        # used when creating the bank files.  Deriving here avoids
+        # opening a bank file (which caused BlockingIOError under
+        # concurrent tomo_info calls from multiple ranks/workers).
+        if (isinstance(stype, str) and stype.lower().startswith("proj")) \
+           or stype == b"proj" or stype == "proj":
+            info["chunks"] = (1,) + vchunks[1:]
         else:
-            # read chunks dim directly
-            chunks = dset.chunks
-    if fullpath_vs is not None:
-        with h5py.File(fullpath_vs, 'r') as hf:
-            dset = hf['/exchange/data']
-            chunks = dset.chunks
-    info["chunks"] = chunks
+            info["chunks"] = (vchunks[0], 1, vchunks[2])
+        if not dset.is_virtual:
+            # Contiguous / non-VDS case: read actual chunks off the dset.
+            info["chunks"] = dset.chunks
     _INFO_CACHE[filename] = info
     return info
 

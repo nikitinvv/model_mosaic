@@ -16,7 +16,7 @@ set -euo pipefail
 # ================== USER KNOBS ==================
 UPS=${UPS:-1}
 PATH_DATA=${PATH_DATA:-/data2/vnikitin/iotest_buf_ups${UPS}}
-N_GPUS=${N_GPUS:-3}                          # total ranks
+N_GPUS=${N_GPUS:-4}                          # total ranks
 
 # NBANKS = bank files per super-chunk (also = multiprocessing pool size).
 # Total writers on the machine = N_GPUS × NBANKS.
