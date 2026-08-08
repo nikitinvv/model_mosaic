@@ -34,7 +34,8 @@ from step0_schematic import (
     compute_x_layout, compute_z_stack,
 )
 
-from utils import RANK, SIZE, barrier as _barrier, rprint
+import time
+from utils import RANK, SIZE, barrier as _barrier, rprint, report_stage
 
 
 def _parse_args() -> argparse.Namespace:
@@ -103,6 +104,9 @@ def main() -> None:
     tiles = [(zi, xi) for zi in range(n_z) for xi in range(n_x)]
     my_tiles = tiles[RANK::SIZE]
 
+    t_read = t_write = 0.0
+    b_read = b_write = 0
+
     with h5py.File(src_h5, "r") as fsrc:
         data_dset = fsrc["exchange/data"]
 
@@ -117,10 +121,13 @@ def main() -> None:
             rz_hi = min(NZ, r0 + DET_H)
             cc_lo = max(0, c0)
             cc_hi = min(N,  c0 + DET_W)
+            t0 = time.perf_counter()
             if rz_lo < rz_hi and cc_lo < cc_hi:
                 strip = data_dset[:, rz_lo:rz_hi, cc_lo:cc_hi]     # (NTHETA, h', w')
+                b_read += strip.nbytes
             else:
                 strip = None
+            t_read += time.perf_counter() - t0
 
             out_r_lo = max(0, -r0)
             out_c_lo = max(0, -c0)
@@ -131,6 +138,7 @@ def main() -> None:
                         out_c_lo:out_c_lo + strip.shape[2]] = strip
 
             path = os.path.join(dst_dir, f"{zi}_{xi}.h5")
+            t0 = time.perf_counter()
             with h5py.File(path, "w") as fout:
                 g = fout.create_group("exchange")
                 d = g.create_dataset("data", data=tile,
@@ -153,12 +161,18 @@ def main() -> None:
                 d.attrs["x_start"] = c0
                 d.attrs["det_h"]   = DET_H
                 d.attrs["det_w"]   = DET_W
+            t_write += time.perf_counter() - t0
+            b_write += tile.nbytes
             print(f"  [rank {RANK}] {path}  z_start={r0}  x_start={c0}",
                   flush=True)
 
     _barrier()
+    report_stage("step4 read (data)",   b_read,  t_read)
+    report_stage("step4 write (tiles)", b_write, t_write)
     rprint(f"done. wrote {n_z*n_x} h5 files.")
 
 
 if __name__ == "__main__":
     main()
+    from utils import hard_exit
+    hard_exit()

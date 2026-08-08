@@ -36,7 +36,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks,
 )
-from utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce
+from utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
 def _parse_args() -> argparse.Namespace:
@@ -168,6 +168,7 @@ def main() -> None:
         with h5py.File(SRC_H5, "r") as fsrc:
             src_dset = fsrc["exchange/data"]
             t_read = t_radon = t_write = 0.0
+            b_read = b_write = 0
             for k_i, ivc in enumerate(my_ivchunks, start=1):
                 z0_vc = ivc[1] * PROJ_VCHUNKS[1]
                 z1_vc = min(z0_vc + PROJ_VCHUNKS[1], NZ)
@@ -184,6 +185,7 @@ def main() -> None:
                         pad[:kz] = chunk_h
                         chunk_h = pad
                     t_read += time.perf_counter() - t0
+                    b_read += kz * N * N * 4    # source is float32 on disk
 
                     t0 = time.perf_counter()
                     res_h = cl_tomo.R(chunk_h, chunks_arg)
@@ -201,6 +203,7 @@ def main() -> None:
                 t0 = time.perf_counter()
                 tomo_writex(PROJ_H5, data=buf, shm=shm, ivchunk=ivc, ctx=ctx)
                 t_write += time.perf_counter() - t0
+                b_write += NTHETA * (z1_vc - z0_vc) * N * 4
 
                 print(f"  [rank {RANK}] vchunk {k_i}/{len(my_ivchunks)}  "
                       f"z=[{z0_vc},{z1_vc})  "
@@ -216,6 +219,9 @@ def main() -> None:
     proj_max = allreduce(proj_max, MPI.MAX)
     barrier()
 
+    report_stage("step2 read (big)",   b_read,  t_read)
+    report_stage("step2 write (proj)", b_write, t_write)
+
     norm_const = float(np.sqrt(N / NTHETA))
     rprint(f"proj = R(delta) stats: min={proj_min:.4g} max={proj_max:.4g}  "
            f"(after scaling by 1/NORM_CONST={1.0/norm_const:.4g}: "
@@ -225,3 +231,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    from utils import hard_exit
+    hard_exit()

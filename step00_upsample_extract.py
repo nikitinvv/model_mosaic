@@ -33,7 +33,10 @@ from iohdf5.h5_vchunks import (
 import cupy as cp
 from cupyx.scipy.ndimage import gaussian_filter as _cp_gaussian_filter
 
-from utils import COMM as _COMM, RANK as _RANK, SIZE as _SIZE, barrier as _barrier
+from utils import (
+    COMM as _COMM, RANK as _RANK, SIZE as _SIZE,
+    barrier as _barrier, report_stage,
+)
 
 
 # ---------- CLI ----------------------------------------------------------
@@ -242,23 +245,28 @@ def main() -> None:
     shm, buf = alloc_shm(INIT_VCHUNKS, np.float32)
     try:
         with ThreadPoolExecutor(max_workers=N_THREADS) as tpool:
-            t_total = 0.0
+            t_total = t_write = 0.0
+            b_write = 0
             for i, ivc in enumerate(my_ivchunks):
                 # This vchunk covers absolute z-range [z0, z1).
                 z0 = ivc[0] * INIT_VCHUNKS[0]
                 z1 = min(z0 + INIT_VCHUNKS[0], OUT_NZ)
                 buf.fill(0)  # pad tail (last vchunk may be short)
 
+                t_iter = time.perf_counter()
                 # Fill buffer one compute chunk (--chunk-z) at a time.
-                t0 = time.perf_counter()
                 for zc0 in range(z0, z1, CHUNK_Z):
                     zc1 = min(zc0 + CHUNK_Z, z1)
                     piece = compute_chunk(zc0, zc1, mask, tpool)
                     buf[zc0 - z0 : zc1 - z0] = piece
                 # One tomo_writex per vchunk: fans across NBANKS bank files.
+                t_w = time.perf_counter()
                 tomo_writex(DST_H5, data=buf, shm=shm,
                             ivchunk=ivc, ctx=ctx)
-                dt = time.perf_counter() - t0
+                t_write += time.perf_counter() - t_w
+                b_write += (z1 - z0) * OUT_NYX * OUT_NYX * 4
+
+                dt = time.perf_counter() - t_iter
                 t_total += dt
                 print(f"[rank {_RANK}] {i+1}/{len(my_ivchunks)}  "
                       f"z=[{z0},{z1})  {dt:.1f}s", flush=True)
@@ -269,9 +277,12 @@ def main() -> None:
 
     if _COMM is not None:
         _COMM.Barrier()
+    report_stage("step00 write (init)", b_write, t_write)
     if _RANK == 0:
         print("init.h5 done.", flush=True)
 
 
 if __name__ == "__main__":
     main()
+    from utils import hard_exit
+    hard_exit()

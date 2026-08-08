@@ -33,15 +33,19 @@ PROJ_VCHUNKS=${PROJ_VCHUNKS:-}
 DATA_VCHUNKS=${DATA_VCHUNKS:-}
 # ================================================
 
-# UCX transport tuning — avoid the benign teardown races that flood
-# stderr at MPI_Finalize on Rocky/RHEL 8:
-#   - `mm_sysv.c ... shmat failed`     ← SysV shared-memory cleanup race
-#   - `mm_posix.c ... open failed`     ← POSIX shm cleanup race (peer's /proc/*/fd/*)
-# Single leading ^ applies to the whole comma list (this is the tricky
-# UCX syntax — `^sysv,^posix` is wrong, `^sysv,posix` excludes BOTH).
-# Intra-node MPI then falls back to self+cma+tcp.  Reductions are tiny
-# so the tcp fallback cost is negligible on this pipeline.
-export UCX_TLS="^sysv,posix"
+# On a single node (tomo5) there's no reason to use UCX/InfiniBand for
+# MPI — all comm is intra-node.  UCX's shutdown is racy under our
+# workload (SHM cleanup between peers, `mm_posix`/`mm_sysv`; IB
+# transport-retry-exceeded when a peer exits early during Finalize).
+#
+# Force OpenMPI onto its older ob1 PML with self+tcp+vader BTLs.  vader
+# is OpenMPI's own shm transport (separate cleanup path from UCX), self
+# handles loopback, tcp is the safe intra-node fallback.  Small message
+# sizes so no throughput cost.
+export OMPI_MCA_pml=ob1
+export OMPI_MCA_btl=self,tcp,vader
+# Belt & suspenders: also silence any residual UCX warnings if the
+# system MPI wrapper still initialises it.
 export UCX_LOG_LEVEL=error
 
 echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$N_GPUS  NBANKS=$NBANKS ==="

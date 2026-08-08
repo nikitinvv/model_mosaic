@@ -31,7 +31,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks,
 )
-from utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce
+from utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
 def _parse_args() -> argparse.Namespace:
@@ -180,6 +180,7 @@ def main() -> None:
     inv_beta_ratio = np.float32(1.0 / BETA_RATIO)
 
     t_read = t_prop = t_write = 0.0
+    b_read = b_write = 0
 
     ivchunks = list(iter_vchunks((NTHETA, NZ, N), DATA_VCHUNKS))
     my_ivchunks = ivchunks[RANK::SIZE]
@@ -197,6 +198,7 @@ def main() -> None:
                 t0 = time.perf_counter()
                 proj_slab_h = proj_dset[t0_vc:t1_vc, :, :]  # (K, NZ, N)
                 t_read += time.perf_counter() - t0
+                b_read += (t1_vc - t0_vc) * NZ * N * 4
 
                 for tb0 in range(t0_vc, t1_vc, NPROPCHUNK):
                     tb1 = min(tb0 + NPROPCHUNK, t1_vc)
@@ -231,6 +233,7 @@ def main() -> None:
                 t0 = time.perf_counter()
                 tomo_writex(DATA_H5, data=buf, shm=shm, ivchunk=ivc, ctx=ctx)
                 t_write += time.perf_counter() - t0
+                b_write += (t1_vc - t0_vc) * NZ * N * 4
 
                 print(f"  [rank {RANK}] vchunk {k}/{len(my_ivchunks)}  "
                       f"θ=[{t0_vc},{t1_vc})  "
@@ -246,6 +249,9 @@ def main() -> None:
     d_has_nan = allreduce(d_has_nan, MPI.LOR)
     barrier()
 
+    report_stage("step3 read (proj)",  b_read,  t_read)
+    report_stage("step3 write (data)", b_write, t_write)
+
     rprint(f"data stats: min={d_min:.4g} max={d_max:.4g} "
            f"mean={d_sum/max(d_cnt,1):.4g} nan={d_has_nan}")
     rprint(f"wrote {NTHETA} angles to {DATA_H5}")
@@ -253,3 +259,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    from utils import hard_exit
+    hard_exit()

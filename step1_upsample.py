@@ -38,7 +38,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks,
 )
-from utils import COMM, RANK, SIZE, barrier, rprint
+from utils import COMM, RANK, SIZE, barrier, rprint, report_stage
 
 
 # --------------------- CLI -----------------------------------------------
@@ -157,6 +157,7 @@ def main() -> None:
                     f"Root groups: {list(fsrc.keys())}")
 
             t_read = t_upsample = t_write = 0.0
+            b_read = b_write = 0
             for k, ivc in enumerate(my_ivchunks, start=1):
                 # Output z-range for this vchunk.
                 z0_out = ivc[0] * BIG_VCHUNKS[0]
@@ -173,6 +174,7 @@ def main() -> None:
                 fut_next  = (read_pool.submit(_read_plane, src_dset, z0_in + 1)
                              if z0_in + 1 < IN_NZ else None)
                 t_read += time.perf_counter() - t0
+                b_read += IN_NYX * IN_NYX * 4    # one input plane
 
                 for zi in range(z0_in, z1_in):
                     if fut_next is not None:
@@ -181,6 +183,7 @@ def main() -> None:
                         fut_next = (read_pool.submit(_read_plane, src_dset, zi + 2)
                                     if zi + 2 < IN_NZ else None)
                         t_read += time.perf_counter() - t0
+                        b_read += IN_NYX * IN_NYX * 4
                         t0 = time.perf_counter()
                         up_next_d = _upsample_xy(next_np)
                         del next_np
@@ -203,6 +206,7 @@ def main() -> None:
                 t0 = time.perf_counter()
                 tomo_writex(DST_H5, data=buf, shm=shm, ivchunk=ivc, ctx=ctx)
                 t_write += time.perf_counter() - t0
+                b_write += (z1_out - z0_out) * OUT_NYX * OUT_NYX * 4
 
                 print(f"  [rank {RANK}] vchunk {k}/{len(my_ivchunks)}  "
                       f"z_out=[{z0_out},{z1_out})  "
@@ -212,8 +216,12 @@ def main() -> None:
         free_shm(shm)
 
     barrier()
+    report_stage("step1 read (init)",  b_read,  t_read)
+    report_stage("step1 write (big)",  b_write, t_write)
     rprint("upsample done.")
 
 
 if __name__ == "__main__":
     main()
+    from utils import hard_exit
+    hard_exit()
