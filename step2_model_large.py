@@ -12,9 +12,11 @@ Pipeline (identical to step2_model_big.py):
     psi  = exp(1j·(x22 + 1j·beta))   = exp(-beta)·(cos + 1j·sin)
     data = |D_prop(psi)|²
 
-I/O uses single HDF5 files with parallel writes (h5py MPI-IO):
-    {path}/big{UPS}x.h5         input volume
-    {path}/model_big{UPS}x/proj.h5, data.h5    outputs
+I/O uses per-rank bank files behind a top-level VDS master (see h5_banks.py):
+    {path}/big{UPS}x.h5                         VDS master (input)
+    {path}/model_big{UPS}x/proj.h5, data.h5     VDS masters (outputs)
+    {path}/model_big{UPS}x/proj/proj_data_*.h5  proj banks (z-banked)
+    {path}/model_big{UPS}x/data/data_data_*.h5  data banks (θ-banked)
 
 Chunk sizes passed to TomoLarge.R must divide the sizes they slice into:
   --chunk-n     divides N and 2N       (stripes across the xy axis)
@@ -41,12 +43,8 @@ import cupy as cp
 
 from tomo_large  import TomoLarge
 from propagation import Propagation
-from h5_mpi_slab import (
-    check_chunk_bytes,
-    mpiio_read_axis0,
-    mpiio_write_axis0,
-    mpiio_write_slab,
-)
+from h5_mpi_slab import check_chunk_bytes
+from h5_banks import BankedH5, Accumulator
 
 
 # ---------- MPI (optional) -----------------------------------------------
@@ -118,6 +116,14 @@ def _parse_args() -> argparse.Namespace:
                    help="θ-chunk size for proj.h5 (larger = fewer h5 chunks per "
                         "stage-1 write; too large amplifies stage-2 read of "
                         "NPROPCHUNK angles.  Chunk bytes = θchunk · NZCHUNK · N · 4)")
+    p.add_argument("--accum-r", type=int, default=1,
+                   help="radon z-chunks to accumulate before flushing to the "
+                        "proj bank file (1 = flush every chunk).  Buffer/rank "
+                        "= accum-r · NTHETA · NZCHUNK · N · 4 bytes.")
+    p.add_argument("--accum-f", type=int, default=1,
+                   help="fresnel batches to accumulate before flushing to the "
+                        "data bank file (1 = flush every batch).  Buffer/rank "
+                        "= accum-f · NPROPCHUNK · NZ · N · 4 bytes.")
     return p.parse_args()
 
 
@@ -152,6 +158,8 @@ CHUNK_N     = _A.chunk_n
 CHUNK_THETA = _A.chunk_theta
 CHUNK_XY    = _A.chunk_xy
 NTHETACHUNK  = max(1, min(_A.nthetachunk, NTHETA))
+ACCUM_R       = max(1, _A.accum_r)
+ACCUM_F       = max(1, _A.accum_f)
 
 THETA_BATCH = _A.theta_batch
 if THETA_BATCH <= 0 or THETA_BATCH >= NTHETA:
@@ -178,6 +186,24 @@ def load_chunk(src_dset, z_start: int, z_end: int) -> np.ndarray:
     buf.real = src_dset[z_start:z_end, :, :]
     buf.imag = 0
     return buf
+
+
+def _radon_bank_ranges():
+    n_chunks_total = (NZ + NZCHUNK - 1) // NZCHUNK
+    per_rank = (n_chunks_total + SIZE - 1) // SIZE
+    ranges = []
+    for r in range(SIZE):
+        lo = min(r * per_rank, n_chunks_total) * NZCHUNK
+        hi = min(min(r * per_rank, n_chunks_total) + per_rank,
+                 n_chunks_total) * NZCHUNK
+        ranges.append((lo, min(hi, NZ)))
+    return ranges
+
+
+def _theta_bank_ranges():
+    per_rank = (NTHETA + SIZE - 1) // SIZE
+    return [(min(r * per_rank, NTHETA), min((r + 1) * per_rank, NTHETA))
+            for r in range(SIZE)]
 
 
 def main() -> None:
@@ -223,38 +249,31 @@ def main() -> None:
 
 
 def _run_radon(theta_rad: np.ndarray, theta_deg: np.ndarray) -> None:
-    # Bootstrap proj.h5.
-    if RANK == 0 and os.path.exists(PROJ_H5):
-        os.remove(PROJ_H5)
-    _barrier()
-
     proj_chunks = (NTHETACHUNK, NZCHUNK, N)
     check_chunk_bytes(proj_chunks, 4, label="proj.h5")
-    with h5py.File(PROJ_H5, "w", **_H5_MPI_KW) as f:
-        g = f.create_group("exchange")
-        g.create_dataset("data", shape=(NTHETA, NZ, N), dtype="float32",
-                         chunks=proj_chunks)
-        g.create_dataset("theta", data=theta_deg)
-    _barrier()
-    rprint(f"proj.h5 created  (chunks={proj_chunks}, "
+
+    z_ranges = _radon_bank_ranges()
+    proj = BankedH5(PROJ_H5, shape=(NTHETA, NZ, N), dtype="float32",
+                    axis=1, chunks=proj_chunks,
+                    rank=RANK, size=SIZE, comm=_COMM,
+                    bank_ranges=z_ranges)
+    proj.create(extra_datasets={"theta": theta_deg})
+
+    my_zlo, my_zhi = z_ranges[RANK]
+    my_chunks = list(range(my_zlo // NZCHUNK,
+                           (my_zhi + NZCHUNK - 1) // NZCHUNK))
+
+    rprint(f"proj.h5 VDS + {SIZE} bank files  (chunks={proj_chunks}, "
            f"{np.prod(proj_chunks)*4/1e6:.1f} MB/chunk; "
-           f"{NTHETA * NZ * N * 4 / 1e12:.2f} TB total)")
+           f"{NTHETA * NZ * N * 4 / 1e12:.2f} TB total)   "
+           f"accum-r={ACCUM_R}  buffer/rank≈{ACCUM_R * NTHETA * NZCHUNK * N * 4 / 1e9:.2f} GB")
 
     proj_min, proj_max = np.inf, -np.inf
-
-    # Contiguous z-chunk assignment so each h5 chunk is written by one rank.
-    n_chunks_total = (NZ + NZCHUNK - 1) // NZCHUNK
-    per_rank = (n_chunks_total + SIZE - 1) // SIZE
-    my_chunk_lo = RANK * per_rank
-    my_chunk_hi = min(my_chunk_lo + per_rank, n_chunks_total)
-    my_chunks = list(range(my_chunk_lo, my_chunk_hi))
-
     chunks_arg = [CHUNK_N, CHUNK_THETA, CHUNK_XY]
 
-    with h5py.File(SRC_H5,  "r",  **_H5_MPI_KW) as fsrc, \
-         h5py.File(PROJ_H5, "r+", **_H5_MPI_KW) as fdst:
-        src_dset  = fsrc["exchange/data"]
-        proj_dset = fdst["exchange/data"]
+    with h5py.File(SRC_H5, "r") as fsrc, \
+         proj.open_writer() as proj_w:
+        src_dset = fsrc["exchange/data"]
 
         for tb in range(N_THETA_BATCHES):
             tb0 = tb * THETA_BATCH
@@ -265,6 +284,10 @@ def _run_radon(theta_rad: np.ndarray, theta_deg: np.ndarray) -> None:
             rprint("building TomoLarge...")
             cl_tomo = TomoLarge(N, b_theta, ROTATION_AXIS)
             rprint("TomoLarge ready.")
+
+            acc = Accumulator(proj_w, axis=1,
+                              capacity=ACCUM_R * NZCHUNK,
+                              dtype=np.float32)
 
             t_read = t_radon = t_write = 0.0
 
@@ -289,11 +312,10 @@ def _run_radon(theta_rad: np.ndarray, theta_deg: np.ndarray) -> None:
                 del res_h
                 t_radon += time.perf_counter() - t0
 
-                # Independent parallel write to disjoint z-chunk, slab-safe.
+                # Accumulate into RAM buffer; flush on capacity fill.
                 t0 = time.perf_counter()
-                mpiio_write_slab(proj_dset,
-                                 (slice(tb0, tb1), slice(z0, z1), slice(None)),
-                                 proj_chunk_h)
+                acc.append((slice(tb0, tb1), slice(z0, z1), slice(None)),
+                           proj_chunk_h)
                 t_write += time.perf_counter() - t0
 
                 proj_min = min(proj_min, float(proj_chunk_h.min()))
@@ -303,6 +325,10 @@ def _run_radon(theta_rad: np.ndarray, theta_deg: np.ndarray) -> None:
                 if (ci + 1) % 4 == 0 or (ci + 1) == len(my_chunks):
                     print(f"  [rank {RANK}] tb{tb+1}/{N_THETA_BATCHES}  "
                           f"chunk {ci+1}/{len(my_chunks)}  z={z1}", flush=True)
+
+            t0 = time.perf_counter()
+            acc.close()
+            t_write += time.perf_counter() - t0
 
             print(f"  [rank {RANK}] radon timing tb{tb+1}: "
                   f"read={t_read:.1f}s radon={t_radon:.1f}s write={t_write:.1f}s",
@@ -354,30 +380,24 @@ def _run_propagation(theta_deg: np.ndarray) -> None:
            f"{(NPROPCHUNK + 1) * (2*NZ) * (2*N) * 8 / 1e9:.3f} GB  "
            f"(NPROPCHUNK={NPROPCHUNK})")
 
-    if RANK == 0 and os.path.exists(DATA_H5):
-        os.remove(DATA_H5)
-    _barrier()
-
-    # One full (NZ, N) plane per chunk — matches the per-angle Fresnel
-    # write pattern exactly (each write touches one chunk).
     data_chunks = (1, NZ, N)
     check_chunk_bytes(data_chunks, 4, label="data.h5")
-    with h5py.File(DATA_H5, "w", **_H5_MPI_KW) as f:
-        g = f.create_group("exchange")
-        g.create_dataset("data", shape=(NTHETA, NZ, N), dtype="float32",
-                         chunks=data_chunks)
-        g.create_dataset("theta", data=theta_deg)
-    _barrier()
-    rprint(f"data.h5 created  (chunks={data_chunks}, "
+
+    theta_ranges = _theta_bank_ranges()
+    data = BankedH5(DATA_H5, shape=(NTHETA, NZ, N), dtype="float32",
+                    axis=0, chunks=data_chunks,
+                    rank=RANK, size=SIZE, comm=_COMM,
+                    bank_ranges=theta_ranges)
+    data.create(extra_datasets={"theta": theta_deg})
+    i_start, i_end = theta_ranges[RANK]
+
+    rprint(f"data.h5 VDS + {SIZE} bank files  (chunks={data_chunks}, "
            f"{np.prod(data_chunks)*4/1e6:.1f} MB/chunk; "
-           f"{NTHETA * NZ * N * 4 / 1e12:.2f} TB total)")
+           f"{NTHETA * NZ * N * 4 / 1e12:.2f} TB total)   "
+           f"accum-f={ACCUM_F}  buffer/rank≈{ACCUM_F * NPROPCHUNK * NZ * N * 4 / 1e9:.2f} GB")
 
     cl_prop = Propagation(N, NZ, NPROPCHUNK, 1,
                           wavelength, VOXELSIZE, [DISTANCE])
-
-    per_rank = (NTHETA + SIZE - 1) // SIZE
-    i_start  = min(RANK * per_rank, NTHETA)
-    i_end    = min(i_start + per_rank, NTHETA)
 
     d_min, d_max = np.inf, -np.inf
     d_sum, d_cnt = 0.0, 0
@@ -388,17 +408,23 @@ def _run_propagation(theta_deg: np.ndarray) -> None:
 
     t_read = t_prop = t_write = 0.0
 
-    with h5py.File(PROJ_H5, "r",  **_H5_MPI_KW) as fp, \
-         h5py.File(DATA_H5, "r+", **_H5_MPI_KW) as fd:
-        proj_dset = fp["exchange/data"]
-        data_dset = fd["exchange/data"]
+    proj_ro = BankedH5(PROJ_H5, shape=(NTHETA, NZ, N), dtype="float32",
+                       axis=1, chunks=(NTHETACHUNK, NZCHUNK, N),
+                       rank=RANK, size=SIZE, comm=_COMM,
+                       bank_ranges=_radon_bank_ranges())
+
+    with proj_ro.open_reader() as proj_r, \
+         data.open_writer() as data_w:
+        acc = Accumulator(data_w, axis=0,
+                          capacity=ACCUM_F * NPROPCHUNK,
+                          dtype=np.float32)
 
         for i0 in range(i_start, i_end, NPROPCHUNK):
             i1 = min(i0 + NPROPCHUNK, i_end)
             b  = i1 - i0
 
             t0 = time.perf_counter()
-            proj_batch_h = mpiio_read_axis0(proj_dset, i0, i1)
+            proj_batch_h = proj_r.read((slice(i0, i1), slice(None), slice(None)))
             t_read += time.perf_counter() - t0
 
             t0 = time.perf_counter()
@@ -425,11 +451,16 @@ def _run_propagation(theta_deg: np.ndarray) -> None:
                 d_has_nan = True
 
             t0 = time.perf_counter()
-            mpiio_write_axis0(data_dset, i0, i1, data_batch_h)
+            acc.append((slice(i0, i1), slice(None), slice(None)),
+                       data_batch_h)
             t_write += time.perf_counter() - t0
             del data_batch_h
 
             print(f"  [rank {RANK}] prop  angles {i0}..{i1-1}", flush=True)
+
+        t0 = time.perf_counter()
+        acc.close()
+        t_write += time.perf_counter() - t0
 
     print(f"  [rank {RANK}] prop timing: "
           f"read={t_read:.1f}s prop={t_prop:.1f}s write={t_write:.1f}s",

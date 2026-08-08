@@ -6,7 +6,7 @@ shared-memory buffer per stage (a "super-chunk", or vchunk) that holds
 many h5 chunks at once, plus a small pool of worker processes fanning
 that buffer into per-bank .h5 files behind a top-level VDS.
 
-Differs from test_h5_io.py in three ways:
+Design choices:
   1. No MPI-IO.  Each rank / worker opens its own bank file via POSIX,
      so nothing bounces off a single collective-write coordinator.
   2. Many h5 files per dataset.  init.h5 becomes a VDS that references

@@ -34,8 +34,36 @@ module use /soft/modulefiles
 module load conda
 conda activate base
 CONDA_NAME=$(echo ${CONDA_PREFIX} | tr '\/' '\t' | sed -E 's/mconda3|\/base//g' | awk '{print $NF}')
-VENV_DIR="/home/vvnikitin/venvs/${CONDA_NAME}"
-source "${VENV_DIR}/bin/activate"
+
+CONDA_ENV_CANDIDATES=(holotomocupy)
+VENV_CANDIDATES=(
+    "${HOME}/venvs/vvnikitin/bin/activate"
+    "${HOME}/venvs/${CONDA_NAME}/bin/activate"
+    "/home/vvnikitin/venvs/vvnikitin/bin/activate"
+    "/home/vvnikitin/venvs/${CONDA_NAME}/bin/activate"
+)
+_env_activated=0
+for e in "${CONDA_ENV_CANDIDATES[@]}"; do
+    if [[ -d "${HOME}/.conda/envs/${e}" ]]; then
+        echo "activating conda env: ${e}"
+        conda activate "${e}"
+        _env_activated=1
+        break
+    fi
+done
+if (( ! _env_activated )); then
+    for v in "${VENV_CANDIDATES[@]}"; do
+        if [[ -f "$v" ]]; then
+            echo "activating venv: $v"
+            source "$v"
+            _env_activated=1
+            break
+        fi
+    done
+fi
+if (( ! _env_activated )); then
+    echo "WARNING: no project env activated; using base conda at ${CONDA_PREFIX}" >&2
+fi
 
 cd "${SCRIPT_DIR}"
 
@@ -59,9 +87,15 @@ for f in "${PATH_DATA}/init.h5" "${PATH_DATA}/big${UPS}x.h5"; do
     fi
 done
 
+# Disable HDF5 POSIX lock probes on Lustre — same rationale as in the
+# I/O test scripts: N ranks all opening the same master/bank files for
+# metadata reads race on file locks and get BlockingIOError.
+export HDF5_USE_FILE_LOCKING=FALSE
+
 MPIEXEC=(mpiexec -n "${NTOTRANKS}" --ppn "${NRANKS}"
          --depth="${NDEPTH}" --cpu-bind depth
          --env OMP_NUM_THREADS="${NTHREADS}"
+         --env HDF5_USE_FILE_LOCKING=FALSE
          "${SCRIPT_DIR}/set_affinity_gpu_polaris.sh")
 
 # ---------- 0. plan mosaic layout ----------------------------------------

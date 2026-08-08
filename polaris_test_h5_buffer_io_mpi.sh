@@ -23,8 +23,11 @@
 UPS=1
 PATH_DATA=/eagle/APS_IRI/vnikitin/iotest_buf_ups${UPS}_mpi
 
-NBANKS=8            # bank files per super-chunk (per rank's multiprocessing pool)
-NTASKS=8            # reader worker processes per rank
+# NBANKS = bank files per super-chunk (also = multiprocessing pool size).
+# With NRANKS=4 per node, total writers/node = NRANKS × NBANKS = 16.
+# Keep it modest to avoid NIC/OST contention within one node.
+NBANKS=4
+NTASKS=4
 
 INIT_VCHUNKS="32 2744 2744"
 BIG_VCHUNKS="$((32*UPS)) $((2744*UPS)) $((2744*UPS))"
@@ -33,7 +36,7 @@ DATA_VCHUNKS="128 $((2560*UPS)) $((2744*UPS))"
 # ================================================
 
 NNODES=$(wc -l < "$PBS_NODEFILE")
-NRANKS=1            # one Python process per node; multiprocessing inside fans across cores
+NRANKS=4            # matches 4 GPUs/node on Polaris (mirrors polaris_run.sh)
 NTOTRANKS=$(( NNODES * NRANKS ))
 
 SCRIPT_DIR="${PBS_O_WORKDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -80,20 +83,29 @@ fi
 
 cd "${SCRIPT_DIR}"
 
-# Raise FD limit — one rank can open hundreds of bank files with VDS.
-ulimit -n 65536 || true
+# Raise FD limit if possible (Polaris compute nodes usually forbid this;
+# default 1024 is plenty for ~640 bank files so the failure is harmless).
+ulimit -n 65536 2>/dev/null || true
+
+# Disable HDF5 POSIX-lock probes on Lustre.  With NRANKS×NBANKS ~= 16-64
+# processes per node opening the same master VDS + bank files to read
+# metadata inside tomo_info(), the default lock probes race and some
+# ranks get BlockingIOError.  Standard fix for h5py on parallel FS.
+export HDF5_USE_FILE_LOCKING=FALSE
 
 mkdir -p "${PATH_DATA}"
 lfs setstripe -c -1 -S 4M "${PATH_DATA}" 2>/dev/null || true
 
-echo "=== UPS=${UPS}  PATH_DATA=${PATH_DATA}  NBANKS=${NBANKS}  NTASKS=${NTASKS}  NODES=${NNODES} ==="
+echo "=== UPS=${UPS}  PATH_DATA=${PATH_DATA}  NBANKS=${NBANKS}  NTASKS=${NTASKS}  NODES=${NNODES}  NRANKS/node=${NRANKS} ==="
 echo "    init-vchunks = ${INIT_VCHUNKS}"
 echo "    big-vchunks  = ${BIG_VCHUNKS}"
 echo "    proj-vchunks = ${PROJ_VCHUNKS}"
 echo "    data-vchunks = ${DATA_VCHUNKS}"
 
-# --cpu-bind none: rank's multiprocessing pool needs access to all cores.
+# --cpu-bind none: each rank's multiprocessing pool needs access to all
+# cores on the node.  --env propagates the HDF5 lock setting to every rank.
 mpiexec -n "${NTOTRANKS}" --ppn "${NRANKS}" --cpu-bind none \
+    --env HDF5_USE_FILE_LOCKING=FALSE \
     python "${SCRIPT_DIR}/test_h5_buffer_io.py" \
         --path "${PATH_DATA}" --ups "${UPS}" \
         --nbanks "${NBANKS}" --ntasks "${NTASKS}" \

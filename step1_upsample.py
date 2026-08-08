@@ -1,13 +1,19 @@
 #!/usr/bin/env python
 """Upsample a (2560, 2744, 2744) init volume by UPS× in each axis, saving
-the result as a single HDF5 file at {path}/big{UPS}x.h5.
+the result as a bank-file HDF5 store at {path}/big{UPS}x.h5 (VDS master +
+per-rank bank files under {path}/big{UPS}x/).  See h5_banks.py.
 
     /exchange/data   (2560·UPS, 2744·UPS, 2744·UPS) float32
                      chunks (1, 2744·UPS, 2744·UPS) — per-slice reads hit one chunk
+                     z-banked: rank R owns a contiguous z-slab (matches its
+                                 own compute partition).
 
 Method: bilinear xy + linear z blend (trilinear, separable).  For each
 input z, a background thread prefetches the next input plane while the
 GPU upsamples in xy and blends UPS output planes between the current pair.
+
+Writes go to per-rank bank files via POSIX (no MPI-IO).  The `--accum-u`
+option batches N output planes in a RAM buffer before flushing to disk.
 
 Multi-GPU via MPI (mpi4py optional).  GPU affinity is delegated to the
 launcher: wrap with set_affinity_gpu.sh so each rank sees one GPU via
@@ -25,7 +31,8 @@ from concurrent.futures import ThreadPoolExecutor
 import h5py
 import numpy as np
 
-from h5_mpi_slab import check_chunk_bytes, mpiio_write_axis0
+from h5_mpi_slab import check_chunk_bytes
+from h5_banks import BankedH5, Accumulator
 
 
 # --------------------- MPI (optional) ------------------------------------
@@ -68,6 +75,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--in-nyx", type=int, default=2744, help="input ny=nx")
     p.add_argument("--n-read",  type=int, default=2,
                    help="background input prefetchers per rank")
+    p.add_argument("--accum-u", type=int, default=1,
+                   help="output planes to accumulate in RAM before flushing "
+                        "to the bank file (1 = flush every plane; UPS = one "
+                        "input plane's worth; larger = fewer h5 writes at "
+                        "the cost of RAM).  Buffer = accum-u · N² · 4 bytes.")
     return p.parse_args()
 
 
@@ -83,6 +95,7 @@ IN_NYX  = _A.in_nyx
 OUT_NZ  = IN_NZ  * UPS
 OUT_NYX = IN_NYX * UPS
 N_READ  = _A.n_read
+ACCUM_U = max(1, _A.accum_u)
 
 
 # --------------------- GPU backend ---------------------------------------
@@ -135,34 +148,39 @@ else:
 
 # --------------------- main -----------------------------------------------
 def main() -> None:
-    # Collective create of big{UPS}x.h5 on all ranks (rank 0 also removes stale file first).
-    if RANK == 0:
-        if os.path.exists(DST_H5):
-            os.remove(DST_H5)
-    _barrier()
-
-    dst_chunks = (1, OUT_NYX, OUT_NYX)
-    check_chunk_bytes(dst_chunks, 4, label=f"{DST_H5}")
-    with h5py.File(DST_H5, "w", **_H5_MPI_KW) as f:
-        g = f.create_group("exchange")
-        g.create_dataset("data", shape=(OUT_NZ, OUT_NYX, OUT_NYX),
-                         dtype="float32",
-                         chunks=dst_chunks)
-    _barrier()
-
-    # Partition input z-slices contiguously across ranks.
+    # Partition input z-slices contiguously across ranks.  Same partition
+    # drives the per-rank output-z bank so writes never cross ranks.
     per_rank = (IN_NZ + SIZE - 1) // SIZE
     i_start  = min(RANK * per_rank, IN_NZ)
     i_end    = min(i_start + per_rank, IN_NZ)
     local_n  = i_end - i_start
 
+    # Output z-range = input z-range * UPS.
+    out_ranges = []
+    for r in range(SIZE):
+        s = min(r * per_rank, IN_NZ) * UPS
+        e = min(min(r * per_rank, IN_NZ) + per_rank, IN_NZ) * UPS
+        out_ranges.append((s, e))
+    my_out_start, my_out_end = out_ranges[RANK]
+    local_out_n = my_out_end - my_out_start
+
+    dst_chunks = (1, OUT_NYX, OUT_NYX)
+    check_chunk_bytes(dst_chunks, 4, label=f"{DST_H5}")
+    big = BankedH5(DST_H5, shape=(OUT_NZ, OUT_NYX, OUT_NYX),
+                   dtype="float32", axis=0, chunks=dst_chunks,
+                   rank=RANK, size=SIZE, comm=_COMM,
+                   bank_ranges=out_ranges)
+    big.create()
+
     rprint(f"input : {IN_NZ}×{IN_NYX}×{IN_NYX}   src={SRC_H5}")
-    rprint(f"output: {OUT_NZ}×{OUT_NYX}×{OUT_NYX}  dst={DST_H5}")
+    rprint(f"output: {OUT_NZ}×{OUT_NYX}×{OUT_NYX}  dst={DST_H5}  "
+           f"(VDS + {SIZE} bank files, z-banked)")
     rprint(f"upsample: {UPS}×  method=trilinear (bilinear xy + linear z)  "
            f"backend={'GPU' if _HAS_GPU else 'CPU'}  "
-           f"read={N_READ}  h5 mpi={_H5_HAS_MPI}  MPI ranks={SIZE}")
+           f"read={N_READ}  MPI ranks={SIZE}  accum-u={ACCUM_U}")
     rprint(f"estimated storage: "
-           f"{OUT_NZ * OUT_NYX * OUT_NYX * 4 / 1e12:.2f} TB")
+           f"{OUT_NZ * OUT_NYX * OUT_NYX * 4 / 1e12:.2f} TB   "
+           f"accum buffer/rank ≈ {ACCUM_U * OUT_NYX * OUT_NYX * 4 / 1e9:.2f} GB")
 
     dev_name, dev_id = "", ""
     if _HAS_GPU:
@@ -181,11 +199,11 @@ def main() -> None:
         return
 
     with h5py.File(SRC_H5, "r", **_H5_MPI_KW) as fsrc, \
-         h5py.File(DST_H5, "r+", **_H5_MPI_KW) as fdst, \
+         big.open_writer() as dst_w, \
+         Accumulator(dst_w, axis=0, capacity=ACCUM_U, dtype=np.float32) as acc, \
          ThreadPoolExecutor(max_workers=N_READ,
                             thread_name_prefix=f"r{RANK}-read") as read_pool:
         src_dset = fsrc["exchange/data"]
-        dst_dset = fdst["exchange/data"]
 
         # 2-plane rolling buffer.  Prefetch next input plane in a background thread.
         up_curr_d   = _upsample_xy(_read_plane(src_dset, i_start))
@@ -215,10 +233,12 @@ def main() -> None:
                 plane = _blend_and_pull(up_curr_d, up_next_d, r)
                 t_upsample += time.perf_counter() - t0
 
-                # Single-plane write — slab helper is a no-op here (already <2 GiB
-                # unless OUT_NYX > ~23000), but reuses the same code path.
+                # Accumulate this plane; the Accumulator flushes to the
+                # rank's bank file when its capacity fills.
                 t0 = time.perf_counter()
-                mpiio_write_axis0(dst_dset, out_z, out_z + 1, plane[None, ...])
+                acc.append((slice(out_z, out_z + 1),
+                            slice(None), slice(None)),
+                           plane[None, ...])
                 t_write += time.perf_counter() - t0
 
             up_curr_d = up_next_d

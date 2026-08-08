@@ -3,7 +3,7 @@
 #
 # Edit UPS / PATH_DATA / N_GPUS below, then:  bash run.sh
 # For the large variant (UPS ≥ 8) swap step2_model_big → step2_model_large
-# and drop --nchunk to 1.  On Polaris use set_affinity_gpu_polaris.sh
+# and drop --nzchunk to 1.  On Polaris use set_affinity_gpu_polaris.sh
 # and mpiexec --ppn 4 --depth=8 --cpu-bind depth instead of mpirun.
 
 set -euo pipefail
@@ -25,7 +25,7 @@ mpirun -n "$N_GPUS" set_affinity_gpu.sh \
 #    (GPU-only Tomo variant; swap for step2_model_large.py if UPS ≥ 8).
 mpirun -n "$N_GPUS" set_affinity_gpu.sh \
     python step2_model_big.py --ups "$UPS" --path "$PATH_DATA" \
-                              --nchunk 32 --nprop-batch 8
+                              --nzchunk 32 --npropchunk 8
 
 # 3. data.h5 → mosaic_h5/{z}_{x}.h5   (MPI-parallel over tiles; CPU only).
 mpirun -n "$N_GPUS" \
