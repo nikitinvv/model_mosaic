@@ -63,15 +63,22 @@ vcarg() { local name="$1"; local val="$2"; [[ -n "$val" ]] && echo "--${name}-vc
 python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
 
 # 1. init.h5 → big{UPS}x.h5  (bilinear xy + linear z upsample; VDS+banks).
-mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
-    python step1_upsample.py --ups "$UPS" --path "$PATH_DATA" \
-        --nbanks "$NBANKS" $(vcarg big "$BIG_VCHUNKS")
+# mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
+#     python step1_upsample.py --ups "$UPS" --path "$PATH_DATA" \
+#         --nbanks "$NBANKS" $(vcarg big "$BIG_VCHUNKS")
 
 # 2. big{UPS}x.h5 → model_big{UPS}x/proj.h5   (Radon; VDS+banks).
 #    For UPS ≥ 8 swap for step2_radon_large.py with --chunk-n/-theta/-xy.
+# mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
+#     python step2_radon.py --ups "$UPS" --path "$PATH_DATA" \
+#         --nzchunk "$NZCHUNK" --nbanks "$NBANKS" \
+#         $(vcarg proj "$PROJ_VCHUNKS")
+
+# UPS ≥ 8 (host-chunked TomoLarge; tune chunk-n/-theta/-xy to fit host RAM):
 mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
-    python step2_radon.py --ups "$UPS" --path "$PATH_DATA" \
+    python step2_radon_large.py --ups "$UPS" --path "$PATH_DATA" \
         --nzchunk "$NZCHUNK" --nbanks "$NBANKS" \
+        --chunk-n 686 --chunk-theta 343 --chunk-xy 686 \
         $(vcarg proj "$PROJ_VCHUNKS")
 
 # 3. proj.h5 → data.h5   (Fresnel propagation to detector intensities).

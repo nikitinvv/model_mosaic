@@ -88,15 +88,16 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
         --nbanks "$NBANKS" $(vcarg big "$BIG_VCHUNKS")
 
 # ---------- 2. Radon → proj.h5 -------------------------------------------
-# For UPS ≥ 8, swap to step2_radon_large.py:
-#   "${MPIEXEC[@]}" python step2_radon_large.py --ups "$UPS" --path "$PATH_DATA" \
-#       --nzchunk 1 --nbanks "$NBANKS" \
-#       --chunk-n 686 --chunk-theta 343 --chunk-xy 686 \
-#       $(vcarg proj "$PROJ_VCHUNKS")
 "${MPIEXEC[@]}" \
     python step2_radon.py --ups "$UPS" --path "$PATH_DATA" \
         --nzchunk "$NZCHUNK" --nbanks "$NBANKS" \
         $(vcarg proj "$PROJ_VCHUNKS")
+# UPS ≥ 8 (host-chunked TomoLarge; tune chunk-n/-theta/-xy to fit host RAM):
+# "${MPIEXEC[@]}" \
+#     python step2_radon_large.py --ups "$UPS" --path "$PATH_DATA" \
+#         --nzchunk 1 --nbanks "$NBANKS" \
+#         --chunk-n 686 --chunk-theta 343 --chunk-xy 686 \
+#         $(vcarg proj "$PROJ_VCHUNKS")
 
 # ---------- 3. Fresnel → data.h5 -----------------------------------------
 "${MPIEXEC[@]}" \
