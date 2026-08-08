@@ -33,12 +33,14 @@ PROJ_VCHUNKS=${PROJ_VCHUNKS:-}
 DATA_VCHUNKS=${DATA_VCHUNKS:-}
 # ================================================
 
-# UCX transport tuning:
-#   - `^sysv` skips System V shared memory (falls back to POSIX shm + CMA).
-#     Avoids the benign `mm_sysv.c ... shmat failed` errors at MPI_Finalize
-#     on Rocky/RHEL 8 that can escape as a non-zero mpirun exit.
-#   - Set UCX_LOG_LEVEL=error to also silence lower-severity notices.
-export UCX_TLS="^sysv"
+# UCX transport tuning — avoid the benign teardown races that flood
+# stderr at MPI_Finalize on Rocky/RHEL 8:
+#   - `mm_sysv.c ... shmat failed`     ← SysV shared-memory cleanup race
+#   - `mm_posix.c ... open failed`     ← POSIX shm cleanup race (peer's /proc/*/fd/*)
+# Disabling BOTH shared-memory transports pushes intra-node MPI onto
+# self+cma+tcp.  Reductions are tiny (a few scalars per stage) so the
+# tcp fallback cost is negligible on this pipeline.
+export UCX_TLS="^sysv,^posix"
 export UCX_LOG_LEVEL=error
 
 echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$N_GPUS  NBANKS=$NBANKS ==="

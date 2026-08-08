@@ -222,8 +222,8 @@ def main() -> None:
     else:
         ctx_init = None
     barrier()
-    if _COMM is not None:
-        ctx_init = _COMM.bcast(ctx_init, root=0)
+    
+    ctx_init = COMM.bcast(ctx_init, root=0)
 
     shm_i, buf_i = _alloc_shm(init_vc, dtype)
     rprint(f"  buffer for init: {_hb(buf_i.nbytes)}   ({init_vc})   "
@@ -261,8 +261,8 @@ def main() -> None:
     else:
         ctx_big = None
     barrier()
-    if _COMM is not None:
-        ctx_big = _COMM.bcast(ctx_big, root=0)
+    
+    ctx_big = COMM.bcast(ctx_big, root=0)
 
     shm_b, buf_b = _alloc_shm(big_vc, dtype)
     rprint(f"  buffer for big:  {_hb(buf_b.nbytes)}   ({big_vc})")
@@ -321,8 +321,8 @@ def main() -> None:
     else:
         ctx_proj = None
     barrier()
-    if _COMM is not None:
-        ctx_proj = _COMM.bcast(ctx_proj, root=0)
+    
+    ctx_proj = COMM.bcast(ctx_proj, root=0)
 
     shm_p, buf_p = _alloc_shm(proj_vc, dtype)
     rprint(f"  buffer for proj: {_hb(buf_p.nbytes)}   ({proj_vc})")
@@ -373,8 +373,8 @@ def main() -> None:
     else:
         ctx_data = None
     barrier()
-    if _COMM is not None:
-        ctx_data = _COMM.bcast(ctx_data, root=0)
+    
+    ctx_data = COMM.bcast(ctx_data, root=0)
 
     shm_d, buf_d = _alloc_shm(data_vc, dtype)
     rprint(f"  buffer for data: {_hb(buf_d.nbytes)}   ({data_vc})")
