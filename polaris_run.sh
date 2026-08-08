@@ -67,15 +67,16 @@ for d in "${PATH_DATA}" \
     lfs setstripe -c -1 -S 4M "$d" 2>/dev/null || true
 done
 
-# Disable HDF5 POSIX lock probes on Lustre.
-export HDF5_USE_FILE_LOCKING=FALSE
-
 vcarg() { local name="$1"; local val="$2"; [[ -n "$val" ]] && echo "--${name}-vchunks $val"; }
 
+# HDF5 file locking is left at the default (enabled).  With the
+# tomo_info() cache + ALLOC_TIME_EARLY preallocation in
+# iohdf5/dxchange_hdf5_chunks.py, there is no metadata-read storm and
+# no concurrent chunk-allocation race, so per-file POSIX locks are
+# uncontended and safe on Lustre.
 MPIEXEC=(mpiexec -n "${NTOTRANKS}" --ppn "${NRANKS}"
          --depth="${NDEPTH}" --cpu-bind depth
          --env OMP_NUM_THREADS="${NTHREADS}"
-         --env HDF5_USE_FILE_LOCKING=FALSE
          "${SCRIPT_DIR}/set_affinity_gpu_polaris.sh")
 
 # ---------- 0. plan mosaic layout ----------------------------------------

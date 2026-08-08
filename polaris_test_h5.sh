@@ -54,12 +54,6 @@ cd "${SCRIPT_DIR}"
 # default 1024 is plenty for ~640 bank files so the failure is harmless).
 ulimit -n 65536 2>/dev/null || true
 
-# Disable HDF5 POSIX-lock probes on Lustre.  With NRANKS×NBANKS ~= 16-64
-# processes per node opening the same master VDS + bank files to read
-# metadata inside tomo_info(), the default lock probes race and some
-# ranks get BlockingIOError.  Standard fix for h5py on parallel FS.
-export HDF5_USE_FILE_LOCKING=FALSE
-
 mkdir -p "${PATH_DATA}"
 lfs setstripe -c -1 -S 4M "${PATH_DATA}" 2>/dev/null || true
 
@@ -69,10 +63,12 @@ echo "    big-vchunks  = ${BIG_VCHUNKS}"
 echo "    proj-vchunks = ${PROJ_VCHUNKS}"
 echo "    data-vchunks = ${DATA_VCHUNKS}"
 
-# --cpu-bind none: each rank's multiprocessing pool needs access to all
-# cores on the node.  --env propagates the HDF5 lock setting to every rank.
+# HDF5 file locking left at the default (enabled).  The tomo_info()
+# cache in iohdf5/dxchange_hdf5_chunks.py eliminates the metadata-read
+# storm that otherwise caused BlockingIOError under NRANKS×NBANKS
+# concurrent metadata opens.
+# --cpu-bind none: each rank's multiprocessing pool needs all cores.
 mpiexec -n "${NTOTRANKS}" --ppn "${NRANKS}" --cpu-bind none \
-    --env HDF5_USE_FILE_LOCKING=FALSE \
     python "${SCRIPT_DIR}/test_h5_buffer_io.py" \
         --path "${PATH_DATA}" --ups "${UPS}" \
         --nbanks "${NBANKS}" --ntasks "${NTASKS}" \

@@ -143,9 +143,21 @@ def hard_exit(code: int = 0, watchdog_s: int = 60) -> None:
         os.kill(os.getpid(), signal.SIGKILL)
     threading.Thread(target=_watchdog, daemon=True).start()
 
+    # Kill any lingering spawn Pool workers BEFORE the final Barrier.
+    # If workers are still alive at MPI.Finalize time, atexit ordering
+    # on some systems (tomo5) can wedge — the pool's own supervisor
+    # thread holds resources MPI wants.  Lazy import to avoid a
+    # circular dep (iohdf5 imports utils indirectly via step scripts).
+    try:
+        from iohdf5.dxchange_hdf5_chunks import shutdown_pools
+        shutdown_pools()
+    except Exception:
+        pass
+
     if COMM is not None:
         try:
             COMM.Barrier()
         except Exception:
             pass
-    # Return normally — Python's atexit runs Pool.terminate + MPI.Finalize.
+    # Return normally — Python's atexit runs MPI.Finalize.
+    # (shutdown_pools atexit fallback is a no-op now — pools already killed.)

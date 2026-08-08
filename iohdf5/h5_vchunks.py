@@ -72,19 +72,22 @@ def free_shm(shm) -> None:
 
 def initx_and_bcast(path, shape, dtype, vchunks, stype="proj",
                     nbanks=8, meta=None, rank=0, comm=None):
-    """Rank 0 clears + creates the VDS master + empty bank files; other
-    ranks wait on a barrier and receive the ctx via bcast.  Meta lets you
-    pipe infra hints (see dxchange_hdf5_chunks._create_banking_plan)."""
+    """Rank 0 clears any prior master + bank dir, then ALL ranks call
+    tomo_initx which shards bank-file pre-allocation round-robin across
+    ranks (parallelises the ALLOC_TIME_EARLY cost that used to be
+    single-threaded on rank 0).  Rank 0 additionally creates the VDS
+    master.  ctx is deterministic (same banking plan on every rank), so
+    no bcast is needed."""
     if rank == 0:
         cleanup_h5(path)
-        ctx = _initx(filename=path, shape=shape, dtype=dtype,
-                     vchunks=vchunks, stype=stype, nbanks=nbanks,
-                     meta=meta or {})
-    else:
-        ctx = None
     if comm is not None:
         comm.Barrier()
-        ctx = comm.bcast(ctx, root=0)
+    size = comm.Get_size() if comm is not None else 1
+    ctx = _initx(filename=path, shape=shape, dtype=dtype,
+                 vchunks=vchunks, stype=stype, nbanks=nbanks,
+                 meta=meta or {}, rank=rank, size=size)
+    if comm is not None:
+        comm.Barrier()
     return ctx
 
 
