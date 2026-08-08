@@ -92,11 +92,11 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
     python step2_radon.py --ups "$UPS" --path "$PATH_DATA" \
         --nzchunk "$NZCHUNK" --nbanks "$NBANKS" \
         $(vcarg proj "$PROJ_VCHUNKS")
-# UPS ≥ 8 (host-chunked TomoLarge; tune chunk-n/-theta/-xy to fit host RAM):
+# UPS ≥ 8 (host-chunked TomoLarge; chunk-n/-theta/-xy auto-picked from N/NTHETA
+# — override with --chunk-n/-theta/-xy if you need to fit tighter host RAM).
 # "${MPIEXEC[@]}" \
 #     python step2_radon_large.py --ups "$UPS" --path "$PATH_DATA" \
 #         --nzchunk 1 --nbanks "$NBANKS" \
-#         --chunk-n 686 --chunk-theta 343 --chunk-xy 686 \
 #         $(vcarg proj "$PROJ_VCHUNKS")
 
 # ---------- 3. Fresnel → data.h5 -----------------------------------------

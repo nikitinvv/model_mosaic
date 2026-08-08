@@ -50,9 +50,12 @@ def _parse_args() -> argparse.Namespace:
                    help="angles over 360°; default = 3·N/4")
     p.add_argument("--nzchunk", type=int, default=1,
                    help="z-slices per Radon call")
-    p.add_argument("--chunk-n",     type=int, default=686)
-    p.add_argument("--chunk-theta", type=int, default=343)
-    p.add_argument("--chunk-xy",    type=int, default=686)
+    p.add_argument("--chunk-n",     type=int, default=0,
+                   help="x/y FFT strip width;  0 = auto (largest divisor of N   ≤ CHUNK_CAP_N)")
+    p.add_argument("--chunk-theta", type=int, default=0,
+                   help="angle batch for r-IFFT; 0 = auto (largest divisor of NTHETA ≤ CHUNK_CAP_THETA)")
+    p.add_argument("--chunk-xy",    type=int, default=0,
+                   help="NUFFT gather bin edge; 0 = auto (largest divisor of 2N   ≤ CHUNK_CAP_N)")
     p.add_argument("--nbanks", type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
     p.add_argument("--proj-vchunks", type=int, nargs=3, default=None,
@@ -76,9 +79,28 @@ ANG_MAX = 2 * np.pi
 ROTATION_AXIS = N / 2
 
 NZCHUNK     = _A.nzchunk
-CHUNK_N     = _A.chunk_n
-CHUNK_THETA = _A.chunk_theta
-CHUNK_XY    = _A.chunk_xy
+
+# Auto-chunk caps.  Tuned so that at UPS=8 (N=21952, NTHETA=16464) the
+# picks are 686 / 343 / 686 (the values originally hand-tuned for a
+# 40 GB A100); for smaller N/NTHETA the picker returns the largest
+# divisor of the axis that stays under the cap, so the GPU stages
+# never overshoot the memory budget and the FFT/gather loops never
+# silently drop a tail.
+CHUNK_CAP_N     = 700
+CHUNK_CAP_THETA = 350
+
+
+def _largest_divisor_le(n: int, cap: int) -> int:
+    """Largest positive divisor of n that is ≤ cap.  Falls back to 1."""
+    d = int(min(cap, n))
+    while d > 1 and n % d:
+        d -= 1
+    return d
+
+
+CHUNK_N     = _A.chunk_n     or _largest_divisor_le(N,     CHUNK_CAP_N)
+CHUNK_XY    = _A.chunk_xy    or _largest_divisor_le(2 * N, CHUNK_CAP_N)
+CHUNK_THETA = _A.chunk_theta or _largest_divisor_le(NTHETA, CHUNK_CAP_THETA)
 NBANKS      = _A.nbanks
 PROJ_VCHUNKS = tuple(_A.proj_vchunks) if _A.proj_vchunks else (NTHETA, 8 * NZCHUNK, N)
 
