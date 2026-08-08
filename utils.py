@@ -1,26 +1,62 @@
 """Shared helpers used across the mosaic pipeline scripts.
 
-MPI wiring: mpi4py is a hard dependency (every step + test script runs
-under mpirun/mpiexec).  No optional fallback — a missing import should
-error loudly rather than silently degrading to serial.
+MPI wiring: mpi4py is a hard dependency in the MAIN process (every step
+runs under mpirun/mpiexec).  BUT — spawn-context Pool workers (used by
+iohdf5.dxchange_hdf5_chunks for parallel bank writes) re-execute the
+parent script's module-level code via multiprocessing.spawn's
+`_fixup_main_from_path` mechanism.  If we unconditionally import mpi4py
+here, the worker also imports it, which calls MPI_Init_thread in a
+process that was NOT launched by mpirun — OpenMPI's SM BTL then
+segfaults in `mca_btl_sm_poll_handle_frag`.
 
-Everything the step scripts need for MPI + rank-aware printing lives
-here, so a step script's boilerplate stays down to:
+Detection: `multiprocessing.parent_process()` returns None only in the
+top-level Python process.  In a spawn worker it returns a Process
+object.  We use that to skip mpi4py import in workers.  Workers don't
+call barrier/allreduce/rprint anyway — those helpers exist only for
+step scripts running in the main process.
+
+Everything the step scripts need lives here, so a step's boilerplate
+stays down to:
 
     from utils import COMM, RANK, SIZE, barrier, rprint, allreduce
 """
 from __future__ import annotations
 
-from mpi4py import MPI
+import multiprocessing as _mp
+import warnings as _warnings
+
+# multiprocessing.resource_tracker prints a UserWarning at interpreter
+# shutdown for every SharedMemory segment whose refcount didn't drop
+# cleanly — which is normal in our workflow because spawn Pool workers
+# are SIGTERM'd before they can release their shm handles.  The kernel
+# unlinks the segments on process exit regardless; the warnings are
+# just noise.  Suppress before any shm allocation happens.
+_warnings.filterwarnings(
+    "ignore",
+    message=r"resource_tracker: There appear to be .* leaked semaphore",
+)
 
 
-COMM = MPI.COMM_WORLD
-RANK = COMM.Get_rank()
-SIZE = COMM.Get_size()
+_IS_WORKER = _mp.parent_process() is not None
+
+if not _IS_WORKER:
+    from mpi4py import MPI
+    COMM = MPI.COMM_WORLD
+    RANK = COMM.Get_rank()
+    SIZE = COMM.Get_size()
+else:
+    # Spawn worker: leave MPI un-initialised so importing this module
+    # (which happens transitively via _fixup_main_from_path) doesn't
+    # call MPI_Init in a non-MPI process.
+    MPI = None
+    COMM = None
+    RANK = 0
+    SIZE = 1
 
 
 def barrier() -> None:
-    COMM.Barrier()
+    if COMM is not None:
+        COMM.Barrier()
 
 
 def rprint(*a, **k) -> None:
@@ -31,9 +67,11 @@ def rprint(*a, **k) -> None:
 
 
 def allreduce(val, op):
-    """Wrapper for COMM.allreduce (kept as a helper so step scripts don't
-    need to import MPI just to name the reduction op — MPI.MIN etc. are
-    available as `utils.MPI.MIN` if needed)."""
+    """Wrapper for COMM.allreduce.  In a worker (COMM is None) returns
+    the local value unchanged — workers should never call this, but
+    behaving sensibly is cheap."""
+    if COMM is None:
+        return val
     return COMM.allreduce(val, op=op)
 
 
@@ -55,6 +93,8 @@ def report_stage(label: str, bytes_local: float, time_local: float) -> None:
     aggregate = sum(bytes) / max(rank elapsed) — how fast the whole run
     moved data through this stage.
     """
+    if COMM is None:
+        return  # worker context — nothing to report
     total_bytes = allreduce(float(bytes_local), MPI.SUM)
     max_time    = allreduce(float(time_local),  MPI.MAX)
     min_time    = allreduce(float(time_local),  MPI.MIN)
@@ -68,41 +108,44 @@ def report_stage(label: str, bytes_local: float, time_local: float) -> None:
            f"total={hb(total_bytes)}")
 
 
-def hard_exit(code: int = 0, finalize_timeout_s: int = 5) -> None:
-    """Barrier + flush + best-effort MPI_Finalize with hard timeout + os._exit.
+def hard_exit(code: int = 0, watchdog_s: int = 60) -> None:
+    """Flush + Barrier, then return to let Python shut down naturally.
 
     Call as the last line of `main()` in every step script.
 
-    Why this exists: on tomo5 (Rocky 8 + OpenMPI + UCX) `MPI_Finalize`
-    can hang collectively at interpreter shutdown, likely a UCX teardown
-    race with lingering shared_memory / multiprocessing spawn workers.
-    All ranks have passed the final barrier and every h5 write has
-    flushed to disk by this point, so the tail of Python's shutdown is
-    all noise from our perspective.
+    Normal flow: main() returns → atexit handlers run (Pool shutdown,
+    then mpi4py's MPI.Finalize) → process exits cleanly with code 0 →
+    mpirun sees clean shutdown and returns 0.
 
-    We first try to call MPI_Finalize explicitly so mpirun sees a clean
-    shutdown (avoiding OpenMPI's "process ... exiting improperly"
-    warning + non-zero mpirun exit).  If Finalize doesn't return within
-    `finalize_timeout_s`, SIGALRM fires and we os._exit anyway — mpirun
-    still returns non-zero in that case, so the launcher scripts wrap
-    each mpirun in `|| true` as belt-and-suspenders.
+    If natural shutdown hangs > `watchdog_s` (a MPI teardown race that
+    we've seen on some hosts), a daemon watchdog thread SIGKILLs the
+    process so the launcher script can move on.  Normally you'll never
+    see the watchdog fire — if you do, its stderr marker tells you.
     """
     import os
     import signal
     import sys
+    import threading
+    import time
 
     sys.stdout.flush()
     sys.stderr.flush()
-    COMM.Barrier()
 
-    def _timeout_bail(signum, frame):
-        os._exit(int(code))
+    def _watchdog():
+        time.sleep(watchdog_s)
+        try:
+            sys.stderr.write(
+                f"[hard_exit] watchdog fired after {watchdog_s}s — "
+                f"MPI shutdown hung; SIGKILL\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os.kill(os.getpid(), signal.SIGKILL)
+    threading.Thread(target=_watchdog, daemon=True).start()
 
-    signal.signal(signal.SIGALRM, _timeout_bail)
-    signal.alarm(int(finalize_timeout_s))
-    try:
-        MPI.Finalize()
-    except Exception:
-        pass
-    signal.alarm(0)
-    os._exit(int(code))
+    if COMM is not None:
+        try:
+            COMM.Barrier()
+        except Exception:
+            pass
+    # Return normally — Python's atexit runs Pool.terminate + MPI.Finalize.

@@ -38,12 +38,13 @@ DATA_VCHUNKS=${DATA_VCHUNKS:-}
 # workload (SHM cleanup between peers, `mm_posix`/`mm_sysv`; IB
 # transport-retry-exceeded when a peer exits early during Finalize).
 #
-# Force OpenMPI onto its older ob1 PML with self+tcp+vader BTLs.  vader
-# is OpenMPI's own shm transport (separate cleanup path from UCX), self
-# handles loopback, tcp is the safe intra-node fallback.  Small message
-# sizes so no throughput cost.
+# Force OpenMPI onto its older ob1 PML with only self+tcp BTLs.
+# vader (SM BTL) segfaults during MPI_Finalize on tomo5 — same class of
+# race as UCX SM.  With self+tcp only: MPI barriers/reductions go over
+# TCP loopback (fine for our tiny scalar reductions); no shm involved,
+# no shm teardown to race.
 export OMPI_MCA_pml=ob1
-export OMPI_MCA_btl=self,tcp,vader
+export OMPI_MCA_btl=self,tcp
 # Belt & suspenders: also silence any residual UCX warnings if the
 # system MPI wrapper still initialises it.
 export UCX_LOG_LEVEL=error
