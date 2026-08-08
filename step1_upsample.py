@@ -223,5 +223,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    from utils import hard_exit
-    hard_exit()

@@ -49,6 +49,16 @@ export OMPI_MCA_btl=self,tcp
 # system MPI wrapper still initialises it.
 export UCX_LOG_LEVEL=error
 
+# Disable HDF5 POSIX-lock probes.  On tomo5's local ext4 the spawn Pool
+# workers open bank files for r+ back-to-back; even though workers own
+# disjoint files, h5py's internal file cache + fast reuse can trip
+# EAGAIN ("unable to lock file, Resource temporarily unavailable").
+# Single-node local disk has no cross-client coherency issues that
+# would make disabling locks corrupt data — the alloc_time=EARLY +
+# tomo_info cache guardrails still prevent write races.
+# (On Lustre this is unsafe; keep it OFF in polaris_run.sh.)
+export HDF5_USE_FILE_LOCKING=FALSE
+
 echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$N_GPUS  NBANKS=$NBANKS ==="
 
 # helper: turn optional VCHUNKS env into "--<name>-vchunks C0 C1 C2" args

@@ -105,32 +105,6 @@ atexit.register(shutdown_pools)
 _INFO_CACHE = {}
 
 
-def _create_chunked_early(group, name: str, shape, dtype, chunks):
-    """Create a chunked dataset with ALLOC_TIME_EARLY.
-
-    HDF5's default alloc_time for chunked datasets is LATE — each chunk's
-    space is allocated on first write to it.  Under concurrent writers +
-    disabled file locking (Lustre workaround), two writers can both
-    allocate the "next" chunk region and one loses the race, producing
-    'wrong B-tree signature' or 'addr overflow' at write time.
-
-    EARLY allocation reserves all chunk storage inside tomo_initx (rank
-    0 only), before any writer touches the file.  Later writes never
-    allocate — they only fill.  Eliminates the alloc race entirely.
-
-    h5py's high-level Group.create_dataset does not expose alloc_time,
-    so we drop to the low-level DCPL API here.
-    """
-    plist = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
-    plist.set_chunk(tuple(chunks))
-    plist.set_alloc_time(h5py.h5d.ALLOC_TIME_EARLY)
-    space = h5py.h5s.create_simple(tuple(shape))
-    type_id = h5py.h5t.py_create(np.dtype(dtype), logical=True)
-    dset_id = h5py.h5d.create(group.id, name.encode('ascii'),
-                              type_id, space, dcpl=plist)
-    return h5py.Dataset(dset_id)
-
-
 def tomo_info(filename):
     cached = _INFO_CACHE.get(filename)
     if cached is not None:
@@ -280,19 +254,14 @@ def _create_banking_plan(filename, shape, vchunks=None, nbanks_per_svchunk=1, si
     return banks_filename_path, banks_size, banks_filename_vsrc
             
 def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
-               nbanks=1, meta={}, rank=0, size=1):
-    """Create a VDS master file + per-rank subset of bank files.
+               nbanks=1, meta={}):
+    """Create a VDS master file + all bank files (single-rank).
 
-    Bank files are pre-allocated with ALLOC_TIME_EARLY, which reserves
-    on-disk space (posix_fallocate) upfront to avoid alloc races between
-    concurrent writers with disabled Lustre file locking.  On a 72 GB
-    dataset that's ~1000+ files each reserving tens of MB — expensive
-    when done sequentially by rank 0.
-
-    Parallel-init: pass `rank` and `size` (all ranks call in lockstep).
-    Bank files are sharded round-robin across ranks (bank_idx % size ==
-    rank).  Rank 0 additionally creates the VDS master.  The banking
-    plan is deterministic, so all ranks agree without coordination.
+    Fast because each bank file's h5py.File 'w' + create_dataset just
+    writes an empty superblock + metadata; HDF5's default LATE
+    allocation means no per-chunk storage is reserved until writes.
+    Call from rank 0; broadcast or recompute ctx on other ranks (the
+    banking plan is deterministic in the params).
     """
     nproj, ny, nx = shape
     stype = 'proj' if stype.lower() == 'proj' or stype.lower() == 'projs' else 'slice'
@@ -308,50 +277,28 @@ def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
                                                                                 sitems_idx = sitems_idx,
                                                                                 meta=meta)
 
-    # test if VDS present already (rank 0 only — filesystem check).
-    if rank == 0:
-        _test = True
-        if os.path.isfile(filename):
-            with h5py.File(filename, mode, libver='latest') as fid:
-                try:
-                    dset = fid['/exchange/data']
-                    _test = False
-                except:
-                    pass
-        if not _test:
-            raise Exception("Virtual dataset exists already.")
+    # test if VDS present already
+    _test = True
+    if os.path.isfile(filename):
+        with h5py.File(filename, mode, libver='latest') as fid:
+            try:
+                dset = fid['/exchange/data']
+                _test = False
+            except:
+                pass
+    if not _test:
+        raise Exception("Virtual dataset exists already.")
 
-    # Create the bank subdirectory on EVERY rank (idempotent via
-    # exist_ok=True — the FS resolves any races atomically).  Must be
-    # here (not in the `if rank == 0` block above) because we then
-    # shard bank-file creation across ranks: rank 1 must not race to
-    # create files inside a directory rank 0 hasn't mkdir'd yet.
+    # create directory(ies)
     for filepath in banks_filename_path:
         fdirname = os.path.dirname(filepath)
         if fdirname:
             os.makedirs(fdirname, exist_ok=True)
 
     try:
-        # Build the layout on all ranks (deterministic; only rank 0
-        # actually uses it for the VDS master, but computing it
-        # everywhere is cheap and avoids coordination).
         layout = h5py.VirtualLayout(shape=(nproj,ny,nx), dtype=dtype)
         sitems_per_bank = (vchunks[sitems_idx] + nbanks - 1) // nbanks
         nchunks = (shape[sitems_idx] + vchunks[sitems_idx] - 1) // vchunks[sitems_idx]
-
-        total_bytes = int(np.prod(shape)) * dtp.itemsize
-        n_bank_files = nchunks * nbanks
-        # How many bank files THIS rank actually creates
-        my_n_files = sum(1 for k in range(n_bank_files) if k % size == rank)
-        my_bytes = int(total_bytes * my_n_files / max(n_bank_files, 1))
-        _t_init0 = time.time()
-        _t_last = _t_init0
-        if rank == 0:
-            print(f"[tomo_initx] {filename}: reserving {total_bytes/1e9:.2f} GB "
-                  f"across {n_bank_files} bank files (ALLOC_TIME_EARLY, "
-                  f"nchunks={nchunks} × nbanks={nbanks}, sharded across "
-                  f"{size} ranks → ~{my_n_files} files/rank, "
-                  f"~{my_bytes/1e9:.2f} GB/rank)", flush=True)
 
         for _ivchunk in range(nchunks):
             for ibank in range(nbanks):
@@ -364,57 +311,35 @@ def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
                 sitems_end = sitems_end if (sitems_end - sitems_offset) < vchunks[sitems_idx] else sitems_offset + vchunks[sitems_idx]
                 sitems_end = sitems_end if sitems_end < shape[sitems_idx] else shape[sitems_idx]
                 if sitems_end > sitems_start:
-                    # Build virtual source (deterministic — all ranks agree).
                     if stype == 'proj':
                         vsource = h5py.VirtualSource(filename_data_vsrc, "/exchange/data", shape=(sitems_end-sitems_start,ny,nx))
                         layout[sitems_start:sitems_end,:,:] = vsource
                     else:
                         vsource = h5py.VirtualSource(filename_data_vsrc, "/exchange/data", shape=(nproj,sitems_end-sitems_start,nx))
                         layout[:,sitems_start:sitems_end,:] = vsource
-                    # Only THIS rank's assigned bank files get created here
-                    # (round-robin across ranks).  Parallelises the
-                    # ALLOC_TIME_EARLY pre-allocation cost.
-                    if bank_idx % size == rank:
-                        with h5py.File(filename_data_file, 'w') as hf_out:
-                            g = hf_out.create_group('/exchange')
-                            if stype == 'proj':
-                                dset = _create_chunked_early(
-                                    g, 'data',
-                                    shape=(sitems_end-sitems_start, ny, nx),
-                                    dtype=dtype,
-                                    chunks=(1,) + vchunks[1:])
-                            else:
-                                dset = _create_chunked_early(
-                                    g, 'data',
-                                    shape=(nproj, sitems_end-sitems_start, nx),
-                                    dtype=dtype,
-                                    chunks=(vchunks[0], 1, vchunks[2]))
-            # Progress log — rank 0 only, at most every 5 s.
-            _now = time.time()
-            _pct = (_ivchunk + 1) / nchunks
-            if rank == 0 and (_now - _t_last > 5.0 or _pct >= 1.0):
-                _elapsed = _now - _t_init0
-                _bytes_so_far = int(total_bytes * _pct)
-                _rate = _bytes_so_far / max(_elapsed, 1e-9)
-                print(f"[tomo_initx]   {_ivchunk+1}/{nchunks} super-chunks  "
-                      f"({100*_pct:.0f}%)  {_elapsed:.1f}s elapsed  "
-                      f"({_rate/1e9:.2f} GB/s reserved aggregate)", flush=True)
-                _t_last = _now
-        # Rank 0 creates the VDS master file (other ranks skip).
-        if rank == 0:
-            with h5py.File(filename, 'w', libver='latest') as hf:
-                dset = hf.create_virtual_dataset('/exchange/data', layout, fillvalue=-5)
-                dset.attrs['nbanks_per_svchunk'] = nbanks
-                dset.attrs['stype'] = stype
-                dset.attrs['vchunks_0'] = vchunks[0]
-                dset.attrs['vchunks_1'] = vchunks[1]
-                dset.attrs['vchunks_2'] = vchunks[2]
-                dset.attrs['meta'] = json.dumps(meta)
-            _t_end = time.time() - _t_init0
-            print(f"[tomo_initx] {filename}: done  "
-                  f"({total_bytes/1e9:.2f} GB / {_t_end:.1f}s = "
-                  f"{total_bytes/_t_end/1e9:.2f} GB/s aggregate; "
-                  f"parallel-init across {size} ranks)", flush=True)
+                    with h5py.File(filename_data_file, 'w') as hf_out:
+                        g = hf_out.create_group('/exchange')
+                        if stype == 'proj':
+                            dset = g.create_dataset(
+                                'data',
+                                shape=(sitems_end-sitems_start, ny, nx),
+                                chunks=(1,) + vchunks[1:],
+                                dtype=dtype, fillvalue=None)
+                        else:
+                            dset = g.create_dataset(
+                                'data',
+                                shape=(nproj, sitems_end-sitems_start, nx),
+                                chunks=(vchunks[0], 1, vchunks[2]),
+                                dtype=dtype, fillvalue=None)
+        # create master file
+        with h5py.File(filename, 'w', libver='latest') as hf:
+            dset = hf.create_virtual_dataset('/exchange/data', layout, fillvalue=-5)
+            dset.attrs['nbanks_per_svchunk'] = nbanks
+            dset.attrs['stype'] = stype
+            dset.attrs['vchunks_0'] = vchunks[0]
+            dset.attrs['vchunks_1'] = vchunks[1]
+            dset.attrs['vchunks_2'] = vchunks[2]
+            dset.attrs['meta'] = json.dumps(meta)
     finally:
         pass
 
