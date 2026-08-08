@@ -16,8 +16,7 @@ Design choices:
      by shared_memory.SharedMemory sized to the super-chunk, and the
      worker pool writes slices of that buffer.
 
-Optional MPI (mpi4py).  When launched with mpiexec/mpirun and mpi4py is
-importable, ranks shard the vchunk iteration:
+MPI (mpi4py, hard dependency).  Ranks shard the vchunk iteration:
     my_ivchunks = ivchunks[RANK::SIZE]
 Rank 0 alone calls tomo_initx (VDS + empty bank files); other ranks wait
 on MPI.Barrier and then write into the disjoint subset of bank files
@@ -29,10 +28,8 @@ Recommended launch on Polaris:
 (one Python process per node; multiprocessing inside each rank fans
 across that node's CPUs).
 
-Falls back to SIZE=1 when mpi4py is unavailable, matching the original
-single-node behaviour.
-
-Uses helpers from ./dxchange_hdf5_chunks.py (vendored from doe-maxiv).
+Uses helpers from ./dxchange_hdf5_chunks.py (vendored from doe-maxiv)
+and ./utils.py (MPI wiring).
 
 Example:
     mpiexec -n 10 --ppn 1 python test_h5_buffer_io.py \\
@@ -54,53 +51,17 @@ import numpy as np
 from multiprocessing import shared_memory
 
 from iohdf5.dxchange_hdf5_chunks import tomo_initx, tomo_readx, tomo_writex
-
-
-# ---------- MPI (optional; no-op single-rank fallback) ----------------------
-try:
-    from mpi4py import MPI
-    _COMM = MPI.COMM_WORLD
-    RANK  = _COMM.Get_rank()
-    SIZE  = _COMM.Get_size()
-except ImportError:
-    MPI   = None
-    _COMM = None
-    RANK  = 0
-    SIZE  = 1
-
-
-def _barrier() -> None:
-    if _COMM is not None:
-        _COMM.Barrier()
-
-
-def rprint(*a, **k) -> None:
-    if RANK == 0:
-        k.setdefault("flush", True)
-        print(*a, **k)
-
-
-def _reduce_max(x: float) -> float:
-    if _COMM is None:
-        return x
-    return _COMM.allreduce(x, op=MPI.MAX)
-
-
-def _reduce_sum(x: float) -> float:
-    if _COMM is None:
-        return x
-    return _COMM.allreduce(x, op=MPI.SUM)
+from utils import MPI, COMM, RANK, SIZE, barrier, rprint, allreduce
 
 
 def _report_stage(label: str, bytes_local: float, time_local: float) -> None:
     """Print aggregate + per-rank spread for a stage.  Called by ALL ranks."""
-    total_bytes = _reduce_sum(bytes_local)
-    max_time    = _reduce_max(time_local)
-    min_time    = _reduce_max(-time_local); min_time = -min_time
+    total_bytes  = allreduce(bytes_local, MPI.SUM)
+    max_time     = allreduce(time_local,  MPI.MAX)
+    min_time     = allreduce(time_local,  MPI.MIN)
     per_rank_bps = bytes_local / max(time_local, 1e-9)
-    max_bps = _reduce_max(per_rank_bps)
-    # min via -max trick to avoid needing MIN op
-    min_bps = -_reduce_max(-per_rank_bps)
+    max_bps      = allreduce(per_rank_bps, MPI.MAX)
+    min_bps      = allreduce(per_rank_bps, MPI.MIN)
     aggregate_bps = total_bytes / max(max_time, 1e-9)
     rprint(f"  {label:22s}  aggregate={_hb(aggregate_bps)}/s   "
            f"per-rank[min..max]=[{_hb(min_bps)}/s..{_hb(max_bps)}/s]   "
@@ -232,8 +193,7 @@ def main() -> None:
     DATA = os.path.join(args.path, "data.h5")
 
     rprint(f"[test_h5_buffer_io]  UPS={UPS}   nbanks={args.nbanks}   "
-           f"ntasks={args.ntasks}   MPI ranks={SIZE}  "
-           f"({'mpi4py present' if MPI is not None else 'no MPI; single-rank fallback'})")
+           f"ntasks={args.ntasks}   MPI ranks={SIZE}")
     rprint("")
     rprint("File layout (each dataset = master VDS + nvchunks·nbanks bank files):")
     if RANK == 0:
@@ -261,7 +221,7 @@ def main() -> None:
                               vchunks=init_vc, stype="proj", nbanks=args.nbanks)
     else:
         ctx_init = None
-    _barrier()
+    barrier()
     if _COMM is not None:
         ctx_init = _COMM.bcast(ctx_init, root=0)
 
@@ -291,7 +251,7 @@ def main() -> None:
             print(f"    [rank 0] init  vchunk {k}/{my_total} "
                   f"(of {total} global)  (write={t_seed:.1f}s)", flush=True)
     bytes_seed = n_vc_init * int(np.prod(init_vc)) * dtp.itemsize
-    _barrier()
+    barrier()
     _report_stage("init.h5 seed", bytes_seed, t_seed)
 
     if RANK == 0:
@@ -300,7 +260,7 @@ def main() -> None:
                              vchunks=big_vc, stype="proj", nbanks=args.nbanks)
     else:
         ctx_big = None
-    _barrier()
+    barrier()
     if _COMM is not None:
         ctx_big = _COMM.bcast(ctx_big, root=0)
 
@@ -343,7 +303,7 @@ def main() -> None:
             print(f"    [rank 0] upsample {k}/{my_total} (of {total} global)  "
                   f"(read={t_read:.1f}s write={t_write:.1f}s)", flush=True)
 
-    _barrier()
+    barrier()
     _report_stage("stage 1  read",  bytes_read,  t_read)
     _report_stage("stage 1  write", bytes_write, t_write)
     _free_shm(shm_i)
@@ -360,7 +320,7 @@ def main() -> None:
                               vchunks=proj_vc, stype="proj", nbanks=args.nbanks)
     else:
         ctx_proj = None
-    _barrier()
+    barrier()
     if _COMM is not None:
         ctx_proj = _COMM.bcast(ctx_proj, root=0)
 
@@ -395,7 +355,7 @@ def main() -> None:
             print(f"    [rank 0] radon {k}/{my_total} (of {total} global)  "
                   f"(read={t_read:.1f}s write={t_write:.1f}s)", flush=True)
 
-    _barrier()
+    barrier()
     _report_stage("radon    read",  bytes_read,  t_read)
     _report_stage("radon    write", bytes_write, t_write)
     _free_shm(shm_b)
@@ -412,7 +372,7 @@ def main() -> None:
                               vchunks=data_vc, stype="proj", nbanks=args.nbanks)
     else:
         ctx_data = None
-    _barrier()
+    barrier()
     if _COMM is not None:
         ctx_data = _COMM.bcast(ctx_data, root=0)
 
@@ -445,7 +405,7 @@ def main() -> None:
             print(f"    [rank 0] fresnel {k}/{my_total} (of {total} global)  "
                   f"(read={t_read:.1f}s write={t_write:.1f}s)", flush=True)
 
-    _barrier()
+    barrier()
     _report_stage("fresnel  read",  bytes_read,  t_read)
     _report_stage("fresnel  write", bytes_write, t_write)
     _free_shm(shm_p)
