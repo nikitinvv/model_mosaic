@@ -53,7 +53,7 @@ import time
 import numpy as np
 from multiprocessing import shared_memory
 
-from dxchange_hdf5_chunks import tomo_initx, tomo_readx, tomo_writex
+from iohdf5.dxchange_hdf5_chunks import tomo_initx, tomo_readx, tomo_writex
 
 
 # ---------- MPI (optional; no-op single-rank fallback) ----------------------

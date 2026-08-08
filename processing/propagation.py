@@ -9,7 +9,7 @@ import math
 import cupy as cp
 import cupyx.scipy.fft as cufft
 
-from kernels import pad_fwd_kernel, pad_adj_kernel
+from processing.kernels import pad_fwd_kernel, pad_adj_kernel
 
 
 class Propagation:

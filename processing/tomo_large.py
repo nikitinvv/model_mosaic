@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import cupy as cp
 
-from kernels import gather_kernel1
+from processing.kernels import gather_kernel1
 
 
 class TomoLarge:

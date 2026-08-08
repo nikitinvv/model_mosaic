@@ -1,19 +1,21 @@
 #!/usr/bin/env python
 """Upsample a (2560, 2744, 2744) init volume by UPS× in each axis, saving
-the result as a bank-file HDF5 store at {path}/big{UPS}x.h5 (VDS master +
-per-rank bank files under {path}/big{UPS}x/).  See h5_banks.py.
+the result as a VDS+banks HDF5 store at {path}/big{UPS}x.h5.
 
-    /exchange/data   (2560·UPS, 2744·UPS, 2744·UPS) float32
-                     chunks (1, 2744·UPS, 2744·UPS) — per-slice reads hit one chunk
-                     z-banked: rank R owns a contiguous z-slab (matches its
-                                 own compute partition).
+    {path}/big{UPS}x.h5              VDS master
+    {path}/big{UPS}x/big{UPS}x_data_*.h5   bank files
+        /exchange/data   (2560·UPS, 2744·UPS, 2744·UPS) float32
+                         chunks (1, 2744·UPS, 2744·UPS)
 
 Method: bilinear xy + linear z blend (trilinear, separable).  For each
 input z, a background thread prefetches the next input plane while the
 GPU upsamples in xy and blends UPS output planes between the current pair.
 
-Writes go to per-rank bank files via POSIX (no MPI-IO).  The `--accum-u`
-option batches N output planes in a RAM buffer before flushing to disk.
+Each rank owns a subset of super-chunks (--big-vchunks) round-robin
+across ranks, fills a shared-memory buffer of that shape by looping
+compute over its input z-range, then tomo_writex fans the buffer across
+--nbanks bank files.  Reads of init.h5 go through its VDS master via
+plain h5py (transparent).
 
 Multi-GPU via MPI (mpi4py optional).  GPU affinity is delegated to the
 launcher: wrap with set_affinity_gpu.sh so each rank sees one GPU via
@@ -31,37 +33,12 @@ from concurrent.futures import ThreadPoolExecutor
 import h5py
 import numpy as np
 
-from h5_mpi_slab import check_chunk_bytes
-from h5_banks import BankedH5, Accumulator
-
-
-# --------------------- MPI (optional) ------------------------------------
-try:
-    from mpi4py import MPI
-    _COMM = MPI.COMM_WORLD
-    RANK  = _COMM.Get_rank()
-    SIZE  = _COMM.Get_size()
-except ImportError:
-    MPI   = None
-    _COMM = None
-    RANK  = 0
-    SIZE  = 1
-
-
-def _barrier() -> None:
-    if _COMM is not None:
-        _COMM.Barrier()
-
-
-def rprint(*a, **k) -> None:
-    if RANK == 0:
-        k.setdefault("flush", True)
-        print(*a, **k)
-
-
-_H5_HAS_MPI = h5py.get_config().mpi
-_H5_MPI_KW  = ({"driver": "mpio", "comm": _COMM}
-               if _COMM is not None and _H5_HAS_MPI else {})
+from iohdf5.dxchange_hdf5_chunks import tomo_writex
+from iohdf5.h5_vchunks import (
+    initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
+    vchunk_bytes, n_vchunks,
+)
+from utils import COMM, RANK, SIZE, barrier, rprint
 
 
 # --------------------- CLI -----------------------------------------------
@@ -71,15 +48,17 @@ def _parse_args() -> argparse.Namespace:
                    help="upsample factor (in every axis)")
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
                    help="base directory; reads {path}/init.h5, writes {path}/big{UPS}x.h5")
-    p.add_argument("--in-nz",  type=int, default=2560, help="input nz")
-    p.add_argument("--in-nyx", type=int, default=2744, help="input ny=nx")
+    p.add_argument("--in-nz", type=int, default=2560, help="input nz")
+    p.add_argument("--in-n",  type=int, default=2744,
+                   help="input ny=nx (same name as step2/3 --in-n)")
     p.add_argument("--n-read",  type=int, default=2,
                    help="background input prefetchers per rank")
-    p.add_argument("--accum-u", type=int, default=1,
-                   help="output planes to accumulate in RAM before flushing "
-                        "to the bank file (1 = flush every plane; UPS = one "
-                        "input plane's worth; larger = fewer h5 writes at "
-                        "the cost of RAM).  Buffer = accum-u · N² · 4 bytes.")
+    p.add_argument("--nbanks",  type=int, default=8,
+                   help="bank files per super-chunk (parallel POSIX writers)")
+    p.add_argument("--big-vchunks", type=int, nargs=3, default=None,
+                   metavar=("C0", "C1", "C2"),
+                   help="super-chunk shape for big{UPS}x.h5 (default: "
+                        "8·UPS, OUT_NYX, OUT_NYX; RAM buffer = C0·C1·C2·4 bytes)")
     return p.parse_args()
 
 
@@ -91,25 +70,19 @@ SRC_H5  = f"{BASE}/init.h5"
 DST_H5  = f"{BASE}/big{UPS}x.h5"
 
 IN_NZ   = _A.in_nz
-IN_NYX  = _A.in_nyx
+IN_NYX  = _A.in_n
 OUT_NZ  = IN_NZ  * UPS
 OUT_NYX = IN_NYX * UPS
 N_READ  = _A.n_read
-ACCUM_U = max(1, _A.accum_u)
+NBANKS  = _A.nbanks
+BIG_VCHUNKS = tuple(_A.big_vchunks) if _A.big_vchunks else (8 * UPS, OUT_NYX, OUT_NYX)
 
 
 # --------------------- GPU backend ---------------------------------------
-try:
-    import cupy as cp
-    from cupyx.scipy.ndimage import zoom as _gpu_zoom
-    _HAS_GPU = True
-except Exception as _e:                                       # noqa: BLE001
-    from PIL import Image
-    _HAS_GPU = False
-    rprint(f"[upsample] GPU disabled ({_e}); using CPU PIL BILINEAR")
+import cupy as cp
+from cupyx.scipy.ndimage import zoom as _gpu_zoom
 
 
-# --------------------- I/O helpers ---------------------------------------
 def _read_plane(src_dset, zi: int) -> np.ndarray:
     im = src_dset[zi, :, :]
     if im.shape != (IN_NYX, IN_NYX):
@@ -119,140 +92,115 @@ def _read_plane(src_dset, zi: int) -> np.ndarray:
     return im.astype(np.float32, copy=False)
 
 
-# --------------------- upsample + linear-z blend --------------------------
-if _HAS_GPU:
-    def _upsample_xy(im_np: np.ndarray):
-        im_d = cp.asarray(im_np)
-        return _gpu_zoom(im_d, zoom=UPS, order=1, mode="nearest")
+def _upsample_xy(im_np: np.ndarray):
+    im_d = cp.asarray(im_np)
+    return _gpu_zoom(im_d, zoom=UPS, order=1, mode="nearest")
 
-    def _blend_and_pull(up_curr_d, up_next_d, r: int) -> np.ndarray:
-        if r == 0:
-            out_d = up_curr_d
-        else:
-            t = cp.float32(r / UPS)
-            out_d = (cp.float32(1.0) - t) * up_curr_d + t * up_next_d
-        return cp.asnumpy(out_d)
-else:
-    def _upsample_xy(im_np: np.ndarray) -> np.ndarray:
-        pil = Image.fromarray(im_np, mode="F")
-        return np.asarray(pil.resize((IN_NYX * UPS, IN_NYX * UPS),
-                                     Image.Resampling.BILINEAR))
 
-    def _blend_and_pull(up_curr, up_next, r: int) -> np.ndarray:
-        if r == 0:
-            return up_curr
-        t = np.float32(r / UPS)
-        return ((np.float32(1.0) - t) * up_curr +
-                t * up_next).astype(np.float32, copy=False)
+def _blend_and_pull(up_curr_d, up_next_d, r: int) -> np.ndarray:
+    if r == 0:
+        out_d = up_curr_d
+    else:
+        t = cp.float32(r / UPS)
+        out_d = (cp.float32(1.0) - t) * up_curr_d + t * up_next_d
+    return cp.asnumpy(out_d)
 
 
 # --------------------- main -----------------------------------------------
 def main() -> None:
-    # Partition input z-slices contiguously across ranks.  Same partition
-    # drives the per-rank output-z bank so writes never cross ranks.
-    per_rank = (IN_NZ + SIZE - 1) // SIZE
-    i_start  = min(RANK * per_rank, IN_NZ)
-    i_end    = min(i_start + per_rank, IN_NZ)
-    local_n  = i_end - i_start
+    if BIG_VCHUNKS[0] % UPS != 0:
+        raise SystemExit(
+            f"--big-vchunks C0={BIG_VCHUNKS[0]} must be a multiple of "
+            f"UPS={UPS} so vchunk boundaries align with input planes.")
 
-    # Output z-range = input z-range * UPS.
-    out_ranges = []
-    for r in range(SIZE):
-        s = min(r * per_rank, IN_NZ) * UPS
-        e = min(min(r * per_rank, IN_NZ) + per_rank, IN_NZ) * UPS
-        out_ranges.append((s, e))
-    my_out_start, my_out_end = out_ranges[RANK]
-    local_out_n = my_out_end - my_out_start
-
-    dst_chunks = (1, OUT_NYX, OUT_NYX)
-    check_chunk_bytes(dst_chunks, 4, label=f"{DST_H5}")
-    big = BankedH5(DST_H5, shape=(OUT_NZ, OUT_NYX, OUT_NYX),
-                   dtype="float32", axis=0, chunks=dst_chunks,
-                   rank=RANK, size=SIZE, comm=_COMM,
-                   bank_ranges=out_ranges)
-    big.create()
+    ctx = initx_and_bcast(DST_H5, shape=(OUT_NZ, OUT_NYX, OUT_NYX),
+                          dtype=np.float32, vchunks=BIG_VCHUNKS,
+                          stype="proj", nbanks=NBANKS,
+                          rank=RANK, comm=COMM)
 
     rprint(f"input : {IN_NZ}×{IN_NYX}×{IN_NYX}   src={SRC_H5}")
-    rprint(f"output: {OUT_NZ}×{OUT_NYX}×{OUT_NYX}  dst={DST_H5}  "
-           f"(VDS + {SIZE} bank files, z-banked)")
+    rprint(f"output: {OUT_NZ}×{OUT_NYX}×{OUT_NYX}  dst={DST_H5}  (VDS + banks)")
     rprint(f"upsample: {UPS}×  method=trilinear (bilinear xy + linear z)  "
-           f"backend={'GPU' if _HAS_GPU else 'CPU'}  "
-           f"read={N_READ}  MPI ranks={SIZE}  accum-u={ACCUM_U}")
-    rprint(f"estimated storage: "
-           f"{OUT_NZ * OUT_NYX * OUT_NYX * 4 / 1e12:.2f} TB   "
-           f"accum buffer/rank ≈ {ACCUM_U * OUT_NYX * OUT_NYX * 4 / 1e9:.2f} GB")
+           f"read={N_READ}  MPI ranks={SIZE}  nbanks={NBANKS}  "
+           f"big-vchunks={BIG_VCHUNKS}")
+    buf_gb = vchunk_bytes(BIG_VCHUNKS, np.float32) / 1e9
+    rprint(f"per-rank shm buffer: {buf_gb:.2f} GB   nvchunks="
+           f"{n_vchunks((OUT_NZ, OUT_NYX, OUT_NYX), BIG_VCHUNKS)}")
 
-    dev_name, dev_id = "", ""
-    if _HAS_GPU:
-        try:
-            dev_id   = cp.cuda.runtime.getDevice()
-            dev_name = cp.cuda.runtime.getDeviceProperties(dev_id)["name"].decode()
-        except Exception:
-            pass
+    dev_id   = cp.cuda.runtime.getDevice()
+    dev_name = cp.cuda.runtime.getDeviceProperties(dev_id)["name"].decode()
     print(f"  rank {RANK}/{SIZE}: gpu={dev_id} ({dev_name}) "
-          f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','')}  "
-          f"input z=[{i_start}, {i_end})  ({local_n} slices)", flush=True)
-    _barrier()
+          f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','')}",
+          flush=True)
+    barrier()
 
-    if local_n == 0:
-        rprint("nothing to do for this rank")
-        return
+    # Round-robin vchunk sharding — matches test_h5_buffer_io.py.
+    ivchunks = list(iter_vchunks((OUT_NZ, OUT_NYX, OUT_NYX), BIG_VCHUNKS))
+    my_ivchunks = ivchunks[RANK::SIZE]
 
-    with h5py.File(SRC_H5, "r", **_H5_MPI_KW) as fsrc, \
-         big.open_writer() as dst_w, \
-         Accumulator(dst_w, axis=0, capacity=ACCUM_U, dtype=np.float32) as acc, \
-         ThreadPoolExecutor(max_workers=N_READ,
-                            thread_name_prefix=f"r{RANK}-read") as read_pool:
-        src_dset = fsrc["exchange/data"]
+    shm, buf = alloc_shm(BIG_VCHUNKS, np.float32)
+    try:
+        with h5py.File(SRC_H5, "r") as fsrc, \
+             ThreadPoolExecutor(max_workers=N_READ,
+                                thread_name_prefix=f"r{RANK}-read") as read_pool:
+            src_dset = fsrc["exchange/data"]
 
-        # 2-plane rolling buffer.  Prefetch next input plane in a background thread.
-        up_curr_d   = _upsample_xy(_read_plane(src_dset, i_start))
-        fut_next_np = (read_pool.submit(_read_plane, src_dset, i_start + 1)
-                       if i_start + 1 < IN_NZ else None)
+            t_read = t_upsample = t_write = 0.0
+            for k, ivc in enumerate(my_ivchunks, start=1):
+                # Output z-range for this vchunk.
+                z0_out = ivc[0] * BIG_VCHUNKS[0]
+                z1_out = min(z0_out + BIG_VCHUNKS[0], OUT_NZ)
+                # Input planes needed to fill it (integer division; C0%UPS==0).
+                z0_in  = z0_out // UPS
+                z1_in  = (z1_out + UPS - 1) // UPS
 
-        t_read = t_upsample = t_write = 0.0
+                buf.fill(0)  # zero any tail padding
 
-        for zi in range(i_start, i_end):
-            t0 = time.perf_counter()
-            if fut_next_np is not None:
-                next_np     = fut_next_np.result()
-                fut_next_np = (read_pool.submit(_read_plane, src_dset, zi + 2)
-                               if zi + 2 < IN_NZ else None)
+                # 2-plane rolling upsample, local to this vchunk.
+                t0 = time.perf_counter()
+                up_curr_d = _upsample_xy(_read_plane(src_dset, z0_in))
+                fut_next  = (read_pool.submit(_read_plane, src_dset, z0_in + 1)
+                             if z0_in + 1 < IN_NZ else None)
                 t_read += time.perf_counter() - t0
 
-                t0 = time.perf_counter()
-                up_next_d = _upsample_xy(next_np)
-                del next_np
-                t_upsample += time.perf_counter() - t0
-            else:
-                up_next_d = up_curr_d          # end of volume: hold
+                for zi in range(z0_in, z1_in):
+                    if fut_next is not None:
+                        t0 = time.perf_counter()
+                        next_np  = fut_next.result()
+                        fut_next = (read_pool.submit(_read_plane, src_dset, zi + 2)
+                                    if zi + 2 < IN_NZ else None)
+                        t_read += time.perf_counter() - t0
+                        t0 = time.perf_counter()
+                        up_next_d = _upsample_xy(next_np)
+                        del next_np
+                        t_upsample += time.perf_counter() - t0
+                    else:
+                        up_next_d = up_curr_d      # end of volume
 
-            for r in range(UPS):
-                out_z = zi * UPS + r
-                t0 = time.perf_counter()
-                plane = _blend_and_pull(up_curr_d, up_next_d, r)
-                t_upsample += time.perf_counter() - t0
+                    for r in range(UPS):
+                        out_z = zi * UPS + r
+                        if not (z0_out <= out_z < z1_out):
+                            continue
+                        t0 = time.perf_counter()
+                        plane = _blend_and_pull(up_curr_d, up_next_d, r)
+                        t_upsample += time.perf_counter() - t0
+                        buf[out_z - z0_out] = plane
 
-                # Accumulate this plane; the Accumulator flushes to the
-                # rank's bank file when its capacity fills.
+                    up_curr_d = up_next_d
+
+                # Fan the buffer across nbanks bank files.
                 t0 = time.perf_counter()
-                acc.append((slice(out_z, out_z + 1),
-                            slice(None), slice(None)),
-                           plane[None, ...])
+                tomo_writex(DST_H5, data=buf, shm=shm, ivchunk=ivc, ctx=ctx)
                 t_write += time.perf_counter() - t0
 
-            up_curr_d = up_next_d
+                print(f"  [rank {RANK}] vchunk {k}/{len(my_ivchunks)}  "
+                      f"z_out=[{z0_out},{z1_out})  "
+                      f"(read={t_read:.1f}s upsample={t_upsample:.1f}s "
+                      f"write={t_write:.1f}s)", flush=True)
+    finally:
+        free_shm(shm)
 
-            done = zi - i_start + 1
-            if done % 8 == 0 or done == local_n:
-                print(f"  [rank {RANK}] input {done}/{local_n}  "
-                      f"(wrote up to output slice {zi*UPS + UPS - 1})",
-                      flush=True)
-
-        print(f"  [rank {RANK}] timing: read={t_read:.1f}s "
-              f"upsample={t_upsample:.1f}s write={t_write:.1f}s", flush=True)
-
-    _barrier()
+    barrier()
     rprint("upsample done.")
 
 

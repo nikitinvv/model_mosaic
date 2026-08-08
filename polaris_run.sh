@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -A 14347
+#PBS -A 14238
 #PBS -l select=2:system=polaris
 #PBS -l place=scatter
 #PBS -l filesystems=home:grand:eagle
@@ -11,11 +11,10 @@
 # End-to-end mosaic-modelling pipeline on Polaris (ALCF).
 # Submit:  qsub polaris_run.sh
 #
-# The pipeline writes h5 files under $PATH_DATA:
+# Writes VDS+banks h5 stores under $PATH_DATA:
 #   init.h5, big{UPS}x.h5, model_big{UPS}x/{proj.h5, data.h5}, mosaic_h5/*
 #
-# For UPS ≥ 8 swap step2_model_big.py → step2_model_large.py (host-chunked
-# TomoLarge; keep --nzchunk 1 and set --chunk-n/--chunk-theta/--chunk-xy).
+# For UPS ≥ 8 swap step2_radon.py → step2_radon_large.py.
 
 NNODES=$(wc -l < $PBS_NODEFILE)
 NRANKS=4              # ranks per node (= GPUs per node on Polaris)
@@ -33,64 +32,45 @@ echo "NUM_OF_NODES=${NNODES}  TOTAL_NUM_RANKS=${NTOTRANKS}  RANKS_PER_NODE=${NRA
 module use /soft/modulefiles
 module load conda
 conda activate base
-CONDA_NAME=$(echo ${CONDA_PREFIX} | tr '\/' '\t' | sed -E 's/mconda3|\/base//g' | awk '{print $NF}')
-
-CONDA_ENV_CANDIDATES=(holotomocupy)
-VENV_CANDIDATES=(
-    "${HOME}/venvs/vvnikitin/bin/activate"
-    "${HOME}/venvs/${CONDA_NAME}/bin/activate"
-    "/home/vvnikitin/venvs/vvnikitin/bin/activate"
-    "/home/vvnikitin/venvs/${CONDA_NAME}/bin/activate"
-)
-_env_activated=0
-for e in "${CONDA_ENV_CANDIDATES[@]}"; do
-    if [[ -d "${HOME}/.conda/envs/${e}" ]]; then
-        echo "activating conda env: ${e}"
-        conda activate "${e}"
-        _env_activated=1
-        break
-    fi
-done
-if (( ! _env_activated )); then
-    for v in "${VENV_CANDIDATES[@]}"; do
-        if [[ -f "$v" ]]; then
-            echo "activating venv: $v"
-            source "$v"
-            _env_activated=1
-            break
-        fi
-    done
-fi
-if (( ! _env_activated )); then
-    echo "WARNING: no project env activated; using base conda at ${CONDA_PREFIX}" >&2
-fi
 
 cd "${SCRIPT_DIR}"
 
-# ---------- job config ---------------------------------------------------
+# ================== USER KNOBS ==================
 UPS=${UPS:-1}
 PATH_DATA=${PATH_DATA:-/eagle/APS_IRI/vnikitin/mosaic_brain}
 
-echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$NTOTRANKS ==="
+NZCHUNK=${NZCHUNK:-32}                       # z-slices per Radon call
+NPROPCHUNK=${NPROPCHUNK:-8}                  # angles per Fresnel batch
 
-# Set Lustre striping on every dir that will hold a big h5 file.  All new
-# files in these dirs inherit the setting.  We also `lfs migrate` any
-# already-existing big h5 files in case they were created with the default
-# stripe_count=1 (which serialises many-rank reads onto one OST).
-mkdir -p "${PATH_DATA}" "${PATH_DATA}/model_big${UPS}x"
-lfs setstripe -c -1 -S 4M "${PATH_DATA}"                    2>/dev/null || true
-lfs setstripe -c -1 -S 4M "${PATH_DATA}/model_big${UPS}x"   2>/dev/null || true
-for f in "${PATH_DATA}/init.h5" "${PATH_DATA}/big${UPS}x.h5"; do
-    if [[ -f "$f" ]] && [[ "$(lfs getstripe -c "$f" 2>/dev/null | tail -1)" == "1" ]]; then
-        echo "  migrating $f to full-stripe layout..."
-        lfs migrate -c -1 -S 4M "$f"
-    fi
+NBANKS=${NBANKS:-8}                          # bank files per super-chunk
+BIG_VCHUNKS=${BIG_VCHUNKS:-}
+PROJ_VCHUNKS=${PROJ_VCHUNKS:-}
+DATA_VCHUNKS=${DATA_VCHUNKS:-}
+# ================================================
+
+echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$NTOTRANKS  NBANKS=$NBANKS ==="
+
+# Lustre striping (all OSTs, 4 MB stripes) on every dir that will hold
+# bank files.  New files inherit this.
+mkdir -p "${PATH_DATA}" \
+         "${PATH_DATA}/init"                    \
+         "${PATH_DATA}/big${UPS}x"              \
+         "${PATH_DATA}/model_big${UPS}x"        \
+         "${PATH_DATA}/model_big${UPS}x/proj"   \
+         "${PATH_DATA}/model_big${UPS}x/data"
+for d in "${PATH_DATA}" \
+         "${PATH_DATA}/init" \
+         "${PATH_DATA}/big${UPS}x" \
+         "${PATH_DATA}/model_big${UPS}x" \
+         "${PATH_DATA}/model_big${UPS}x/proj" \
+         "${PATH_DATA}/model_big${UPS}x/data"; do
+    lfs setstripe -c -1 -S 4M "$d" 2>/dev/null || true
 done
 
-# Disable HDF5 POSIX lock probes on Lustre — same rationale as in the
-# I/O test scripts: N ranks all opening the same master/bank files for
-# metadata reads race on file locks and get BlockingIOError.
+# Disable HDF5 POSIX lock probes on Lustre.
 export HDF5_USE_FILE_LOCKING=FALSE
+
+vcarg() { local name="$1"; local val="$2"; [[ -n "$val" ]] && echo "--${name}-vchunks $val"; }
 
 MPIEXEC=(mpiexec -n "${NTOTRANKS}" --ppn "${NRANKS}"
          --depth="${NDEPTH}" --cpu-bind depth
@@ -103,21 +83,28 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
 
 # ---------- 1. init.h5 → big{UPS}x.h5 ------------------------------------
 "${MPIEXEC[@]}" \
-    python step1_upsample.py --ups "$UPS" --path "$PATH_DATA"
+    python step1_upsample.py --ups "$UPS" --path "$PATH_DATA" \
+        --nbanks "$NBANKS" $(vcarg big "$BIG_VCHUNKS")
 
-# ---------- 2. Radon + Fresnel → proj.h5, data.h5 -------------------------
-# For UPS ≥ 8, swap to step2_model_large.py:
-#   python step2_model_large.py --ups "$UPS" --path "$PATH_DATA" \
-#       --nzchunk 1 --npropchunk 1 \
-#       --chunk-n 686 --chunk-theta 343 --chunk-xy 686
+# ---------- 2. Radon → proj.h5 -------------------------------------------
+# For UPS ≥ 8, swap to step2_radon_large.py:
+#   "${MPIEXEC[@]}" python step2_radon_large.py --ups "$UPS" --path "$PATH_DATA" \
+#       --nzchunk 1 --nbanks "$NBANKS" \
+#       --chunk-n 686 --chunk-theta 343 --chunk-xy 686 \
+#       $(vcarg proj "$PROJ_VCHUNKS")
 "${MPIEXEC[@]}" \
-    python step2_model_big.py --ups "$UPS" --path "$PATH_DATA" \
-                              --nzchunk 32 --npropchunk 8
+    python step2_radon.py --ups "$UPS" --path "$PATH_DATA" \
+        --nzchunk "$NZCHUNK" --nbanks "$NBANKS" \
+        $(vcarg proj "$PROJ_VCHUNKS")
 
-# ---------- 3. data.h5 → mosaic_h5/{z}_{x}.h5 -----------------------------
-# CPU-only but MPI-shards tiles across ranks.  set_affinity_gpu_polaris.sh
-# is harmless here (just sets CUDA_VISIBLE_DEVICES that Python ignores).
+# ---------- 3. Fresnel → data.h5 -----------------------------------------
 "${MPIEXEC[@]}" \
-    python step3_extract.py --ups "$UPS" --path "$PATH_DATA"
+    python step3_fresnel.py --ups "$UPS" --path "$PATH_DATA" \
+        --npropchunk "$NPROPCHUNK" --nbanks "$NBANKS" \
+        $(vcarg data "$DATA_VCHUNKS")
+
+# ---------- 4. data.h5 → mosaic_h5/{z}_{x}.h5 -----------------------------
+"${MPIEXEC[@]}" \
+    python step4_extract.py --ups "$UPS" --path "$PATH_DATA"
 
 echo "=== pipeline done ==="

@@ -34,27 +34,7 @@ from step0_schematic import (
     compute_x_layout, compute_z_stack,
 )
 
-try:
-    from mpi4py import MPI
-    _COMM = MPI.COMM_WORLD
-    RANK  = _COMM.Get_rank()
-    SIZE  = _COMM.Get_size()
-except ImportError:
-    MPI   = None
-    _COMM = None
-    RANK  = 0
-    SIZE  = 1
-
-
-def _barrier() -> None:
-    if _COMM is not None:
-        _COMM.Barrier()
-
-
-def rprint(*a, **k) -> None:
-    if RANK == 0:
-        k.setdefault("flush", True)
-        print(*a, **k)
+from utils import RANK, SIZE, barrier as _barrier, rprint
 
 
 def _parse_args() -> argparse.Namespace:

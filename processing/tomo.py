@@ -11,7 +11,7 @@ import numpy as np
 import cupy as cp
 import cupyx.scipy.fft as cufft
 
-from kernels import gather_kernel
+from processing.kernels import gather_kernel
 
 
 class Tomo:

@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import atexit
 import h5py
 import numpy as np
 
@@ -11,6 +12,41 @@ import time
 
 import json
 import os
+
+
+# ---------------------------------------------------------------------------
+# Persistent spawn-context worker pools.
+#
+# tomo_readx/tomo_writex fan I/O across a Pool.  The default fork start
+# method inherits an already-initialised CUDA context (from callers like
+# the mosaic step scripts) and breaks — cupy raises on any op in the
+# child.  We use spawn instead, and cache pools by size so we don't pay
+# the ~500 ms spawn-startup cost on every I/O call.
+#
+# Pool workers only need h5py + numpy, not cupy, so their module import
+# is cheap.  Pools are shut down at process exit via atexit.
+# ---------------------------------------------------------------------------
+_SPAWN_CTX = multiprocessing.get_context("spawn")
+_POOLS = {}   # nbanks -> Pool
+
+
+def _get_pool(nbanks: int):
+    p = _POOLS.get(nbanks)
+    if p is None:
+        p = _SPAWN_CTX.Pool(processes=int(nbanks))
+        _POOLS[nbanks] = p
+    return p
+
+
+@atexit.register
+def _shutdown_pools():
+    for p in _POOLS.values():
+        try:
+            p.close()
+            p.join()
+        except Exception:
+            pass
+    _POOLS.clear()
 
 def tomo_info(filename):
     fullpath_vs = None
@@ -71,9 +107,9 @@ def tomo_readx(filename, ntasks=1, shm=None, ivchunk=(0,0,0), vchunks=None):
     else:
         raise Exception("Storage type is neither projection or slice.")
     try:
-        with multiprocessing.Pool(processes=ntasks) as pool:
-            results = pool.map(partial(_process, ntasks=ntasks, filename=filename, direct_chunk=~info['is_virtual'],
-                                      vchunks=vchunks, ivchunk=ivchunk, shm=shm), list(np.arange(ntasks)))
+        pool = _get_pool(ntasks)
+        results = pool.map(partial(_process, ntasks=ntasks, filename=filename, direct_chunk=~info['is_virtual'],
+                                  vchunks=vchunks, ivchunk=ivchunk, shm=shm), list(np.arange(ntasks)))
         if shm_selfmanaged:
             data_out = data.copy()
     finally:
@@ -286,9 +322,9 @@ def tomo_writex(filename, data, shm=None, ivchunk=(0,0,0), ctx=None):
     else:
         raise Exception("Storage type is neither projection or slice.")
     try:
-        with multiprocessing.Pool(processes=nbanks_per_svchunk) as pool:
-            results = pool.map(partial(_process, ntasks=nbanks_per_svchunk, filename=filename, shape=shape, dtype=dtp,
-                                       vchunks=vchunks, ivchunk=ivchunk, shm=shm, ctx=ctx), list(np.arange(nbanks_per_svchunk)))
+        pool = _get_pool(nbanks_per_svchunk)
+        results = pool.map(partial(_process, ntasks=nbanks_per_svchunk, filename=filename, shape=shape, dtype=dtp,
+                                   vchunks=vchunks, ivchunk=ivchunk, shm=shm, ctx=ctx), list(np.arange(nbanks_per_svchunk)))
     finally:
         if shm_selfmanaged:
             shm.close()

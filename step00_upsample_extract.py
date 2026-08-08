@@ -1,13 +1,16 @@
 #!/usr/bin/env python
 """Extract a centred sub-volume from a 3-D reconstruction TIFF, apply a
 soft-edged circular mask (and optional 3-D sharpen + smoothing), and save
-as a single HDF5 file at {path}/init.h5.
+as a VDS+banks HDF5 store at {path}/init.h5 (see test_h5_buffer_io.py for
+the layout).
 
-    /exchange/data   (OUT_NZ, OUT_NYX, OUT_NYX) float32
-    /exchange/theta  (0,) float32   (placeholder; angles filled by step2)
+    {path}/init.h5              VDS master
+    {path}/init/init_data_*.h5  nvchunks·nbanks bank files
+        /exchange/data   (OUT_NZ, OUT_NYX, OUT_NYX) float32
+                         chunks (1, OUT_NYX, OUT_NYX)
 
-Chunked (1, OUT_NYX, OUT_NYX) so downstream per-slice reads hit one chunk.
-Threaded I/O, optional MPI + GPU.
+Vchunk (super-chunk) shape --init-vchunks controls the RAM buffer per
+rank; nbanks-per-vchunk parallel POSIX writers fan the buffer to disk.
 """
 from __future__ import annotations
 
@@ -20,30 +23,17 @@ from concurrent.futures import ThreadPoolExecutor
 import h5py
 import numpy as np
 import tifffile
-from scipy.ndimage import gaussian_filter1d
 
-from h5_mpi_slab import check_chunk_bytes, mpiio_write_axis0
+from iohdf5.dxchange_hdf5_chunks import tomo_writex
+from iohdf5.h5_vchunks import (
+    initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
+    vchunk_bytes, n_vchunks,
+)
 
-try:
-    import cupy as cp
-    from cupyx.scipy.ndimage import gaussian_filter as _cp_gaussian_filter
-    _HAVE_GPU = cp.cuda.runtime.getDeviceCount() > 0
-except Exception:
-    _HAVE_GPU = False
+import cupy as cp
+from cupyx.scipy.ndimage import gaussian_filter as _cp_gaussian_filter
 
-try:
-    from mpi4py import MPI
-    _COMM = MPI.COMM_WORLD
-    _RANK = _COMM.Get_rank()
-    _SIZE = _COMM.Get_size()
-except Exception:
-    _COMM = None
-    _RANK = 0
-    _SIZE = 1
-
-_H5_HAS_MPI = h5py.get_config().mpi
-_H5_MPI_KW  = ({"driver": "mpio", "comm": _COMM}
-               if _COMM is not None and _H5_HAS_MPI else {})
+from utils import COMM as _COMM, RANK as _RANK, SIZE as _SIZE, barrier as _barrier
 
 
 # ---------- CLI ----------------------------------------------------------
@@ -76,7 +66,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--n-threads", type=int, default=32,
                    help="threads per rank for I/O + separable filter")
     p.add_argument("--chunk-z", type=int, default=64,
-                   help="z-slices processed per chunk")
+                   help="z-slices processed per compute chunk")
+    p.add_argument("--nbanks", type=int, default=8,
+                   help="bank files per super-chunk (parallel POSIX writers)")
+    p.add_argument("--init-vchunks", type=int, nargs=3, default=None,
+                   metavar=("C0", "C1", "C2"),
+                   help="super-chunk shape for init.h5 (default: "
+                        "--chunk-z, OUT_NYX, OUT_NYX = one compute chunk per vchunk)")
     return p.parse_args()
 
 
@@ -97,6 +93,8 @@ SHARPEN_SIGMA  = _A.sharpen_sigma
 SMOOTH_SIGMA   = _A.smooth_sigma
 N_THREADS     = _A.n_threads
 CHUNK_Z       = _A.chunk_z
+NBANKS        = _A.nbanks
+INIT_VCHUNKS  = tuple(_A.init_vchunks) if _A.init_vchunks else (CHUNK_Z, _A.out_nyx, _A.out_nyx)
 
 SAMPLE_NZ = OUT_NZ - 2 * Z_PAD
 if SAMPLE_NZ <= 0:
@@ -106,8 +104,7 @@ Z0 = (SRC_NZ - SAMPLE_NZ) // 2
 Y0 = (SRC_NY - OUT_NYX) // 2
 X0 = (SRC_NX - OUT_NYX) // 2
 
-if _HAVE_GPU:
-    cp.cuda.Device(_RANK % cp.cuda.runtime.getDeviceCount()).use()
+cp.cuda.Device(_RANK % cp.cuda.runtime.getDeviceCount()).use()
 
 # Zero-copy memmap of the source TIFF (uncompressed contiguous pages).
 try:
@@ -177,28 +174,10 @@ def _apply_filters_gpu(vol: np.ndarray) -> np.ndarray:
     return vol
 
 
-def _gaussian_3d_threaded(vol: np.ndarray, sigma: float,
-                          pool: ThreadPoolExecutor) -> None:
-    if sigma <= 0:
-        return
-    nz, ny, _ = vol.shape
-    kw = dict(sigma=sigma, mode="constant", cval=0.0)
-
-    def _xy(z: int) -> None:
-        gaussian_filter1d(vol[z], axis=1, output=vol[z], **kw)
-        gaussian_filter1d(vol[z], axis=0, output=vol[z], **kw)
-    list(pool.map(_xy, range(nz)))
-
-    y_chunk = max(1, ny // (N_THREADS * 4))
-    def _z(y0: int) -> None:
-        y1 = min(y0 + y_chunk, ny)
-        strip = vol[:, y0:y1, :]
-        gaussian_filter1d(strip, axis=0, output=strip, **kw)
-    list(pool.map(_z, range(0, ny, y_chunk)))
-
-
-def process_chunk(z_start: int, z_end: int, mask: np.ndarray, dset,
-                  pool: ThreadPoolExecutor) -> None:
+def compute_chunk(z_start: int, z_end: int, mask: np.ndarray,
+                  pool: ThreadPoolExecutor) -> np.ndarray:
+    """Read + mask + optional 3-D filter for one compute chunk.  Returns
+    a (z_end-z_start, OUT_NYX, OUT_NYX) float32 array."""
     _sig_max = max(SHARPEN_SIGMA if SHARPEN_AMOUNT != 0.0 else 0.0,
                    SMOOTH_SIGMA)
     halo = int(np.ceil(3 * _sig_max)) if _sig_max > 0 else 0
@@ -212,43 +191,31 @@ def process_chunk(z_start: int, z_end: int, mask: np.ndarray, dset,
         vol[i] = _read_masked(z_lo + i, mask)
     list(pool.map(_read, range(n)))
 
-    if _HAVE_GPU:
-        _apply_filters_gpu(vol)
-    else:
-        if SHARPEN_AMOUNT != 0.0:
-            blur = vol.copy()
-            _gaussian_3d_threaded(blur, SHARPEN_SIGMA, pool)
-            vol = vol + np.float32(SHARPEN_AMOUNT) * (vol - blur)
-            del blur
-        _gaussian_3d_threaded(vol, SMOOTH_SIGMA, pool)
+    _apply_filters_gpu(vol)
 
     offset = z_start - z_lo
-    # Bulk write of the interior [z_start, z_end) to the h5 dataset,
-    # slab-safe (kept under MPI-IO 2 GiB per-collective-transfer limit).
-    mpiio_write_axis0(dset, z_start, z_end,
-                      vol[offset:offset + (z_end - z_start)])
+    return vol[offset:offset + (z_end - z_start)]
 
 
 def main() -> None:
-    # Delete any pre-existing init.h5 on rank 0, then create + write theta placeholder.
     if _RANK == 0:
         os.makedirs(os.path.dirname(DST_H5) or ".", exist_ok=True)
-        if os.path.exists(DST_H5):
-            os.remove(DST_H5)
-    if _COMM is not None:
-        _COMM.Barrier()
 
     mask = make_mask()
     _sig_max = max(SHARPEN_SIGMA if SHARPEN_AMOUNT != 0.0 else 0.0,
                    SMOOTH_SIGMA)
     _halo = int(np.ceil(3 * _sig_max)) if _sig_max > 0 else 0
     if _RANK == 0:
-        backend = f"gpu×{_SIZE}" if _HAVE_GPU else f"cpu×{_SIZE}"
+        backend = f"gpu×{_SIZE}"
         print(f"src : {SRC_TIFF}", flush=True)
-        print(f"dst : {DST_H5}", flush=True)
+        print(f"dst : {DST_H5}  (VDS + banks)", flush=True)
         print(f"backend={backend}  threads/rank={N_THREADS}  "
               f"chunk_z={CHUNK_Z}  nz={OUT_NZ}  nyx={OUT_NYX}  "
-              f"h5 mpi={_H5_HAS_MPI}", flush=True)
+              f"nbanks={NBANKS}  init-vchunks={INIT_VCHUNKS}", flush=True)
+        buf_gb = vchunk_bytes(INIT_VCHUNKS, np.float32) / 1e9
+        print(f"per-rank shm buffer: {buf_gb:.2f} GB   nvchunks="
+              f"{n_vchunks((OUT_NZ, OUT_NYX, OUT_NYX), INIT_VCHUNKS)}",
+              flush=True)
         print(f"z: sample slices [{Z_PAD},{Z_PAD+SAMPLE_NZ})={SAMPLE_NZ}px "
               f"from src z=[{Z0},{Z0+SAMPLE_NZ}); "
               f"padded 0 in [0,{Z_PAD}) and [{Z_PAD+SAMPLE_NZ},{OUT_NZ}); "
@@ -262,36 +229,43 @@ def main() -> None:
         print(f"3-D smoothing: sigma={SMOOTH_SIGMA}   halo={_halo} slices",
               flush=True)
 
-    # Collective create of init.h5.
-    dst_chunks = (1, OUT_NYX, OUT_NYX)
-    check_chunk_bytes(dst_chunks, 4, label=DST_H5)
-    with h5py.File(DST_H5, "w", **_H5_MPI_KW) as f:
-        g = f.create_group("exchange")
-        g.create_dataset("data", shape=(OUT_NZ, OUT_NYX, OUT_NYX),
-                         dtype="float32",
-                         chunks=dst_chunks)
+    # Create VDS + empty bank files; broadcast ctx to non-zero ranks.
+    ctx = initx_and_bcast(DST_H5, shape=(OUT_NZ, OUT_NYX, OUT_NYX),
+                          dtype=np.float32, vchunks=INIT_VCHUNKS,
+                          stype="proj", nbanks=NBANKS,
+                          rank=_RANK, comm=_COMM)
 
-    if _COMM is not None:
-        _COMM.Barrier()
+    # Round-robin vchunk sharding across ranks (matches test_h5_buffer_io).
+    ivchunks = list(iter_vchunks((OUT_NZ, OUT_NYX, OUT_NYX), INIT_VCHUNKS))
+    my_ivchunks = ivchunks[_RANK::_SIZE]
 
-    # Reopen for parallel writes and process this rank's chunks.
-    chunks = [(z, min(z + CHUNK_Z, OUT_NZ))
-              for z in range(0, OUT_NZ, CHUNK_Z)]
-    my_chunks = chunks[_RANK::_SIZE]
+    shm, buf = alloc_shm(INIT_VCHUNKS, np.float32)
+    try:
+        with ThreadPoolExecutor(max_workers=N_THREADS) as tpool:
+            t_total = 0.0
+            for i, ivc in enumerate(my_ivchunks):
+                # This vchunk covers absolute z-range [z0, z1).
+                z0 = ivc[0] * INIT_VCHUNKS[0]
+                z1 = min(z0 + INIT_VCHUNKS[0], OUT_NZ)
+                buf.fill(0)  # pad tail (last vchunk may be short)
 
-    with h5py.File(DST_H5, "r+", **_H5_MPI_KW) as f, \
-         ThreadPoolExecutor(max_workers=N_THREADS) as pool:
-        dset = f["exchange/data"]
-        t_chunk_total = 0.0
-        for i, (z_start, z_end) in enumerate(my_chunks):
-            t0 = time.perf_counter()
-            process_chunk(z_start, z_end, mask, dset, pool)
-            dt = time.perf_counter() - t0
-            t_chunk_total += dt
-            print(f"[rank {_RANK}] {i+1}/{len(my_chunks)}  "
-                  f"z=[{z_start},{z_end})  {dt:.1f}s", flush=True)
-        print(f"[rank {_RANK}] total per-rank chunk time: "
-              f"{t_chunk_total:.1f}s ({len(my_chunks)} chunks)", flush=True)
+                # Fill buffer one compute chunk (--chunk-z) at a time.
+                t0 = time.perf_counter()
+                for zc0 in range(z0, z1, CHUNK_Z):
+                    zc1 = min(zc0 + CHUNK_Z, z1)
+                    piece = compute_chunk(zc0, zc1, mask, tpool)
+                    buf[zc0 - z0 : zc1 - z0] = piece
+                # One tomo_writex per vchunk: fans across NBANKS bank files.
+                tomo_writex(DST_H5, data=buf, shm=shm,
+                            ivchunk=ivc, ctx=ctx)
+                dt = time.perf_counter() - t0
+                t_total += dt
+                print(f"[rank {_RANK}] {i+1}/{len(my_ivchunks)}  "
+                      f"z=[{z0},{z1})  {dt:.1f}s", flush=True)
+            print(f"[rank {_RANK}] total per-rank time: "
+                  f"{t_total:.1f}s ({len(my_ivchunks)} vchunks)", flush=True)
+    finally:
+        free_shm(shm)
 
     if _COMM is not None:
         _COMM.Barrier()

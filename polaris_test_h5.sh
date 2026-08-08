@@ -47,39 +47,6 @@ cat "$PBS_NODEFILE"
 module use /soft/modulefiles
 module load conda
 conda activate base
-CONDA_NAME=$(echo "${CONDA_PREFIX}" | tr '\/' '\t' | sed -E 's/mconda3|\/base//g' | awk '{print $NF}')
-
-# Prefer a project conda env (has mpi4py, h5py-mpi, cupy).  Fall back to
-# a venv, then to bare base conda.  Add your name to the lists as needed.
-CONDA_ENV_CANDIDATES=(holotomocupy)
-VENV_CANDIDATES=(
-    "${HOME}/venvs/vvnikitin/bin/activate"
-    "${HOME}/venvs/${CONDA_NAME}/bin/activate"
-    "/home/vvnikitin/venvs/vvnikitin/bin/activate"
-    "/home/vvnikitin/venvs/${CONDA_NAME}/bin/activate"
-)
-_env_activated=0
-for e in "${CONDA_ENV_CANDIDATES[@]}"; do
-    if [[ -d "${HOME}/.conda/envs/${e}" ]]; then
-        echo "activating conda env: ${e}"
-        conda activate "${e}"
-        _env_activated=1
-        break
-    fi
-done
-if (( ! _env_activated )); then
-    for v in "${VENV_CANDIDATES[@]}"; do
-        if [[ -f "$v" ]]; then
-            echo "activating venv: $v"
-            source "$v"
-            _env_activated=1
-            break
-        fi
-    done
-fi
-if (( ! _env_activated )); then
-    echo "WARNING: no project env activated; using base conda at ${CONDA_PREFIX}" >&2
-fi
 
 cd "${SCRIPT_DIR}"
 
