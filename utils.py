@@ -40,17 +40,23 @@ _warnings.filterwarnings(
 _IS_WORKER = _mp.parent_process() is not None
 
 if not _IS_WORKER:
-    # Skip mpi4py's auto MPI.Finalize atexit.  On Cray MPICH / OpenMPI
-    # + multiprocessing spawn + shared memory, Finalize hangs at
-    # interpreter shutdown trying to reconcile with SHM/semaphore
-    # resources that the multiprocessing resource_tracker still holds.
-    # Skipping Finalize is safe: our last collective (report_stage's
-    # allreduce) has already synced all ranks, and mpiexec/PALS reaps
-    # per-rank MPI state when the process exits.  Cost: OpenMPI's
-    # mpirun prints an "abnormal termination" warning; Cray PALS is
-    # silent.  Exit code is 0 either way.
-    import mpi4py as _mpi4py
-    _mpi4py.rc.finalize = False
+    # By default, let mpi4py's auto MPI.Finalize atexit run at
+    # interpreter shutdown.  For it to complete cleanly under
+    # multiprocessing spawn, the pool workers must exit CLEANLY before
+    # Finalize (releasing their multiprocessing semaphores + SHM
+    # segments); that's what iohdf5.dxchange_hdf5_chunks._shutdown_pools
+    # does with close()+join() at atexit — registered after mpi4py, so
+    # it runs FIRST (atexit is LIFO), draining workers before Finalize.
+    #
+    # Opt-out: setting MOSAIC_SKIP_MPI_FINALIZE=1 skips Finalize
+    # entirely.  Use this only for launchers where Finalize is known
+    # to misbehave (e.g. tomo_run.sh, when MPI's SM/UCX teardown races
+    # can't be avoided some other way).  Cost: OpenMPI's mpirun then
+    # prints an "abnormal termination" warning per run.
+    import os as _os
+    if _os.environ.get("MOSAIC_SKIP_MPI_FINALIZE", "0") in ("1", "true", "True"):
+        import mpi4py as _mpi4py
+        _mpi4py.rc.finalize = False
     from mpi4py import MPI
     COMM = MPI.COMM_WORLD
     RANK = COMM.Get_rank()
@@ -84,6 +90,55 @@ def allreduce(val, op):
     if COMM is None:
         return val
     return COMM.allreduce(val, op=op)
+
+
+def run_main(main_func) -> None:
+    """Wrap a step's main() with rank-aware crash reporting.
+
+    Use as the entry point in every step script:
+        if __name__ == "__main__":
+            from utils import run_main
+            run_main(main)
+
+    On clean exit: main() returns, Python exits normally.  We skip
+    MPI.Finalize (see utils.py MPI init), so mpirun/mpiexec may print
+    a generic "abnormal termination" warning — that is expected and
+    means nothing is wrong.
+
+    On a real crash: catches the exception, prints a rank-tagged
+    traceback so you can tell WHICH rank died and WHY, then calls
+    MPI.COMM_WORLD.Abort(1) — which propagates SIGTERM to peers so
+    they don't hang forever waiting on collectives from the dead rank,
+    and gives mpirun an unambiguous "abort" signal (different message
+    from the no-Finalize warning) with a non-zero job exit code.
+
+    Rule of thumb for reading a log after a run:
+      • no Python traceback  → clean exit, ignore mpirun's warning
+      • Python traceback     → real crash on rank R (see the [rank R]
+                                prefix), other ranks got SIGTERM'd
+    """
+    import sys
+    import traceback
+    try:
+        main_func()
+    except SystemExit:
+        raise
+    except BaseException:
+        try:
+            sys.stderr.write(f"[rank {RANK}] EXCEPTION — traceback follows:\n")
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+        except Exception:
+            pass
+        if COMM is not None:
+            try:
+                # Abort tells the launcher this was a real failure and
+                # signals other ranks so they don't hang waiting on
+                # collectives that will never come.  Exits non-zero.
+                COMM.Abort(1)
+            except Exception:
+                pass
+        raise
 
 
 def hb(b: float) -> str:

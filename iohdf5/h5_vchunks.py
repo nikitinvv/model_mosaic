@@ -103,3 +103,91 @@ def vchunk_bytes(vchunks, dtype) -> int:
 
 def n_vchunks(shape, vchunks) -> int:
     return int(np.prod([-(-s // c) for s, c in zip(shape, vchunks)]))
+
+
+def _hb(b: float) -> str:
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if abs(b) < 1024:
+            return f"{b:.1f} {u}"
+        b /= 1024
+    return f"{b:.1f} PB"
+
+
+def describe_input(path: str) -> None:
+    """Print shape + chunk + VDS-source-count for an existing input file.
+    For VDS masters (`d.chunks` is None), peek into the first bank file
+    to report the actual on-disk bank shape and HDF5 chunk shape.
+    Call from rank 0 only (opens the file)."""
+    import h5py
+    if not os.path.isfile(path):
+        print(f"  IN : {path}  (not present)", flush=True)
+        return
+    bank_shape = bank_chunks = None
+    n_sources = None
+    with h5py.File(path, "r") as f:
+        if "exchange/data" not in f:
+            print(f"  IN : {path}  (no /exchange/data)", flush=True)
+            return
+        d = f["exchange/data"]
+        shape, dtype, chunks = d.shape, d.dtype, d.chunks
+        is_virtual = d.is_virtual
+        if is_virtual:
+            sources = d.virtual_sources()
+            n_sources = len(sources)
+            src = sources[0]
+            bank_path = src.file_name
+            if not os.path.isabs(bank_path):
+                bank_path = os.path.join(
+                    os.path.dirname(os.path.abspath(path)), bank_path)
+            try:
+                with h5py.File(bank_path, "r") as bf:
+                    bd = bf[src.dset_name]
+                    bank_shape = bd.shape
+                    bank_chunks = bd.chunks
+            except (OSError, KeyError):
+                pass
+    total = int(np.prod(shape)) * dtype.itemsize
+    print(f"  IN : {path}", flush=True)
+    print(f"       shape={tuple(shape)} {dtype}  total={_hb(total)}", flush=True)
+    if is_virtual:
+        if bank_shape is not None:
+            print(f"       VDS master → {n_sources} bank files  "
+                  f"bank shape={bank_shape}  HDF5 chunk={bank_chunks}",
+                  flush=True)
+        else:
+            print(f"       VDS master → {n_sources} bank files  "
+                  f"(bank open failed)", flush=True)
+    else:
+        print(f"       HDF5 chunk={chunks}", flush=True)
+
+
+def describe_output(path: str, shape, dtype, vchunks, stype: str,
+                    nbanks: int) -> None:
+    """Print planned shape / vchunks / bank layout / HDF5 chunk for an
+    output file about to be created via initx_and_bcast.  Call from
+    rank 0 only.  Pure math — does not touch the filesystem."""
+    dtp = np.dtype(dtype)
+    sitems_idx = 0 if stype.lower().startswith("proj") else 1
+    sitems_per_bank = (vchunks[sitems_idx] + nbanks - 1) // nbanks
+    nsvchunks = (shape[sitems_idx] + vchunks[sitems_idx] - 1) // vchunks[sitems_idx]
+    total_banks = nsvchunks * nbanks
+
+    bank_shape = list(vchunks)
+    bank_shape[sitems_idx] = sitems_per_bank
+    bank_shape = tuple(bank_shape)
+
+    if stype.lower().startswith("proj"):
+        h5chunk = (1,) + tuple(vchunks[1:])
+    else:
+        h5chunk = (vchunks[0], 1, vchunks[2])
+
+    total = int(np.prod(shape)) * dtp.itemsize
+    bank_bytes = int(np.prod(bank_shape)) * dtp.itemsize
+    print(f"  OUT: {path}", flush=True)
+    print(f"       shape={tuple(shape)} {dtp}  total={_hb(total)}", flush=True)
+    print(f"       vchunks={tuple(vchunks)}  stype={stype}  nbanks={nbanks}",
+          flush=True)
+    print(f"       → {nsvchunks} super-chunks × {nbanks} banks = "
+          f"{total_banks} bank files", flush=True)
+    print(f"       bank shape={bank_shape} ({_hb(bank_bytes)})  "
+          f"HDF5 chunk={h5chunk}", flush=True)

@@ -36,7 +36,8 @@ import numpy as np
 from iohdf5.dxchange_hdf5_chunks import tomo_writex
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
-    vchunk_bytes, n_vchunks,
+    describe_input, describe_output,
+    vchunk_bytes,
 )
 from utils import COMM, RANK, SIZE, barrier, rprint, report_stage
 
@@ -113,19 +114,19 @@ def main() -> None:
             f"--big-vchunks C0={BIG_VCHUNKS[0]} must be a multiple of "
             f"UPS={UPS} so vchunk boundaries align with input planes.")
 
+    if RANK == 0:
+        describe_input(SRC_H5)
+        describe_output(DST_H5, (OUT_NZ, OUT_NYX, OUT_NYX), np.float32,
+                        BIG_VCHUNKS, "proj", NBANKS)
+
     ctx = initx_and_bcast(DST_H5, shape=(OUT_NZ, OUT_NYX, OUT_NYX),
                           dtype=np.float32, vchunks=BIG_VCHUNKS,
                           stype="proj", nbanks=NBANKS,
                           rank=RANK, comm=COMM)
 
-    rprint(f"input : {IN_NZ}×{IN_NYX}×{IN_NYX}   src={SRC_H5}")
-    rprint(f"output: {OUT_NZ}×{OUT_NYX}×{OUT_NYX}  dst={DST_H5}  (VDS + banks)")
-    rprint(f"upsample: {UPS}×  method=trilinear (bilinear xy + linear z)  "
-           f"read={N_READ}  MPI ranks={SIZE}  nbanks={NBANKS}  "
-           f"big-vchunks={BIG_VCHUNKS}")
     buf_gb = vchunk_bytes(BIG_VCHUNKS, np.float32) / 1e9
-    rprint(f"per-rank shm buffer: {buf_gb:.2f} GB   nvchunks="
-           f"{n_vchunks((OUT_NZ, OUT_NYX, OUT_NYX), BIG_VCHUNKS)}")
+    rprint(f"upsample: {UPS}×  method=trilinear (bilinear xy + linear z)  "
+           f"read={N_READ}  MPI ranks={SIZE}  per-rank shm buffer={buf_gb:.2f} GB")
 
     dev_id   = cp.cuda.runtime.getDevice()
     dev_name = cp.cuda.runtime.getDeviceProperties(dev_id)["name"].decode()
@@ -222,4 +223,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from utils import run_main
+    run_main(main)

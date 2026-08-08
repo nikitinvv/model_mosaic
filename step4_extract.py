@@ -36,6 +36,7 @@ from step0_schematic import (
 
 import time
 from utils import RANK, SIZE, barrier as _barrier, rprint, report_stage
+from iohdf5.h5_vchunks import describe_input
 
 
 def _parse_args() -> argparse.Namespace:
@@ -94,11 +95,16 @@ def main() -> None:
     z_starts = [int(round(z + args.z_pad)) for z in z_positions]
     x_starts = [int(round(x + N / 2))      for x in x_origins]
 
-    rprint(f"src  : {src_h5}  (NTHETA={NTHETA}, NZ={NZ}, N={N})")
-    rprint(f"dst  : {dst_dir}")
-    rprint(f"tiles: {n_z} z-positions × {n_x} x-positions  "
-           f"({n_z*n_x} h5 files)  MPI ranks={SIZE}")
-    rprint(f"det  : {DET_H} × {DET_W} px (h × w)")
+    if RANK == 0:
+        describe_input(src_h5)
+        per_tile = NTHETA * DET_H * DET_W * 4
+        print(f"  OUT: {dst_dir}/{{z}}_{{x}}.h5   (per-tile, plain HDF5)")
+        print(f"       shape=({NTHETA}, {DET_H}, {DET_W}) float32   "
+              f"HDF5 chunk=(1, {DET_H}, {DET_W})")
+        print(f"       {n_z} z-tiles × {n_x} x-tiles = {n_z*n_x} files   "
+              f"({per_tile/1e9:.2f} GB/tile, "
+              f"{per_tile*n_z*n_x/1e12:.2f} TB total)   MPI ranks={SIZE}",
+              flush=True)
 
     # Enumerate tiles and round-robin across ranks.
     tiles = [(zi, xi) for zi in range(n_z) for xi in range(n_x)]
@@ -173,4 +179,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from utils import run_main
+    run_main(main)

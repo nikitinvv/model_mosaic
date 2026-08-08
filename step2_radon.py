@@ -31,7 +31,7 @@ from processing.tomo import Tomo
 from iohdf5.dxchange_hdf5_chunks import tomo_writex
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
-    vchunk_bytes, n_vchunks,
+    vchunk_bytes, n_vchunks, describe_input, describe_output,
 )
 from utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
@@ -110,14 +110,17 @@ def main() -> None:
     barrier()
     rprint(f"UPS={UPS}  nz={NZ} n={N} ntheta={NTHETA} nzchunk={NZCHUNK}  "
            f"mask_r={MASK_R}")
-    rprint(f"src ={SRC_H5}")
-    rprint(f"proj={PROJ_H5}")
     rprint(f"GPU est. — Tomo._buf_fde: "
            f"{NZCHUNK * (2*N)**2 * 8 / 1e9:.1f} GB")
 
+    if RANK == 0:
+        describe_input(SRC_H5)
+        describe_output(PROJ_H5, (NTHETA, NZ, N), np.float32,
+                        PROJ_VCHUNKS, "slice", NBANKS)
+
     ctx = initx_and_bcast(PROJ_H5, shape=(NTHETA, NZ, N),
                           dtype=np.float32, vchunks=PROJ_VCHUNKS,
-                          stype="proj", nbanks=NBANKS,
+                          stype="slice", nbanks=NBANKS,
                           rank=RANK, comm=COMM)
     if RANK == 0:
         with h5py.File(PROJ_H5, "r+") as f:
@@ -127,10 +130,8 @@ def main() -> None:
     barrier()
 
     buf_gb = vchunk_bytes(PROJ_VCHUNKS, np.float32) / 1e9
-    rprint(f"proj.h5 VDS + banks  (vchunks={PROJ_VCHUNKS}, nbanks={NBANKS}; "
-           f"buffer/rank={buf_gb:.2f} GB; "
-           f"{NTHETA * NZ * N * 4 / 1e12:.2f} TB total, "
-           f"nvchunks={n_vchunks((NTHETA, NZ, N), PROJ_VCHUNKS)})")
+    rprint(f"per-rank shm buffer={buf_gb:.2f} GB   "
+           f"nvchunks={n_vchunks((NTHETA, NZ, N), PROJ_VCHUNKS)}")
 
     proj_min, proj_max = np.inf, -np.inf
 
@@ -216,4 +217,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from utils import run_main
+    run_main(main)

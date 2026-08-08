@@ -29,7 +29,7 @@ from processing.propagation import Propagation
 from iohdf5.dxchange_hdf5_chunks import tomo_writex
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
-    vchunk_bytes, n_vchunks,
+    vchunk_bytes, n_vchunks, describe_input, describe_output,
 )
 from utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
@@ -142,8 +142,6 @@ def main() -> None:
     barrier()
 
     rprint(f"UPS={UPS}  nz={NZ} n={N} ntheta={NTHETA}  npropchunk={NPROPCHUNK}")
-    rprint(f"proj={PROJ_H5}")
-    rprint(f"data={DATA_H5}")
     rprint(f"prop: E={ENERGY} keV  lambda={wavelength:.4e} m  "
            f"voxel={VOXELSIZE} m  distance={DISTANCE} m  "
            f"Fresnel number (per pixel)={fresnel_number:.4g}")
@@ -151,6 +149,11 @@ def main() -> None:
            f"beta_ratio={BETA_RATIO}")
     rprint(f"GPU est. — Prop._buf_big + fker: "
            f"{(NPROPCHUNK + 1) * (2*NZ) * (2*N) * 8 / 1e9:.3f} GB")
+
+    if RANK == 0:
+        describe_input(PROJ_H5)
+        describe_output(DATA_H5, (NTHETA, NZ, N), np.float32,
+                        DATA_VCHUNKS, "proj", NBANKS)
 
     ctx = initx_and_bcast(DATA_H5, shape=(NTHETA, NZ, N),
                           dtype=np.float32, vchunks=DATA_VCHUNKS,
@@ -164,10 +167,8 @@ def main() -> None:
     barrier()
 
     buf_gb = vchunk_bytes(DATA_VCHUNKS, np.float32) / 1e9
-    rprint(f"data.h5 VDS + banks  (vchunks={DATA_VCHUNKS}, nbanks={NBANKS}; "
-           f"buffer/rank={buf_gb:.2f} GB; "
-           f"{NTHETA * NZ * N * 4 / 1e12:.2f} TB total, "
-           f"nvchunks={n_vchunks((NTHETA, NZ, N), DATA_VCHUNKS)})")
+    rprint(f"per-rank shm buffer={buf_gb:.2f} GB   "
+           f"nvchunks={n_vchunks((NTHETA, NZ, N), DATA_VCHUNKS)}")
 
     cl_prop = Propagation(N, NZ, NPROPCHUNK, 1,
                           wavelength, VOXELSIZE, [DISTANCE])
@@ -258,4 +259,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from utils import run_main
+    run_main(main)
