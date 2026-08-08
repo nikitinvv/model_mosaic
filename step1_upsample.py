@@ -143,7 +143,18 @@ def main() -> None:
         with h5py.File(SRC_H5, "r") as fsrc, \
              ThreadPoolExecutor(max_workers=N_READ,
                                 thread_name_prefix=f"r{RANK}-read") as read_pool:
-            src_dset = fsrc["exchange/data"]
+            # init.h5 may follow the holotomo convention (/exchange/data,
+            # written by step00_upsample_extract.py) or the tomoscan
+            # convention (/data at root, from tomopy/dxchange).  Accept
+            # either.  The output big{UPS}x.h5 always uses /exchange/data.
+            if "exchange/data" in fsrc:
+                src_dset = fsrc["exchange/data"]
+            elif "data" in fsrc:
+                src_dset = fsrc["data"]
+            else:
+                raise SystemExit(
+                    f"{SRC_H5}: neither /exchange/data nor /data found.  "
+                    f"Root groups: {list(fsrc.keys())}")
 
             t_read = t_upsample = t_write = 0.0
             for k, ivc in enumerate(my_ivchunks, start=1):

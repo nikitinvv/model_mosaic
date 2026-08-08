@@ -57,10 +57,15 @@ def _get_pool(nbanks: int):
 
 @atexit.register
 def _shutdown_pools():
+    # SIGTERM the pool workers rather than close()+join().  By atexit time
+    # all our tasks have already completed (main() returned), so workers
+    # are idle-waiting on the task queue.  join() blocks forever if a
+    # worker's teardown pipe is broken (seen on tomo5 under MPI), which
+    # in turn prevents MPI_Finalize from running collectively — every
+    # rank hangs at interpreter shutdown.  terminate() is fire-and-forget.
     for p in _POOLS.values():
         try:
-            p.close()
-            p.join()
+            p.terminate()
         except Exception:
             pass
     _POOLS.clear()

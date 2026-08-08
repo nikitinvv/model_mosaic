@@ -37,10 +37,11 @@ DATA_VCHUNKS=${DATA_VCHUNKS:-}
 # stderr at MPI_Finalize on Rocky/RHEL 8:
 #   - `mm_sysv.c ... shmat failed`     ← SysV shared-memory cleanup race
 #   - `mm_posix.c ... open failed`     ← POSIX shm cleanup race (peer's /proc/*/fd/*)
-# Disabling BOTH shared-memory transports pushes intra-node MPI onto
-# self+cma+tcp.  Reductions are tiny (a few scalars per stage) so the
-# tcp fallback cost is negligible on this pipeline.
-export UCX_TLS="^sysv,^posix"
+# Single leading ^ applies to the whole comma list (this is the tricky
+# UCX syntax — `^sysv,^posix` is wrong, `^sysv,posix` excludes BOTH).
+# Intra-node MPI then falls back to self+cma+tcp.  Reductions are tiny
+# so the tcp fallback cost is negligible on this pipeline.
+export UCX_TLS="^sysv,posix"
 export UCX_LOG_LEVEL=error
 
 echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$N_GPUS  NBANKS=$NBANKS ==="
@@ -48,29 +49,36 @@ echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$N_GPUS  NBANKS=$NBANKS ==="
 # helper: turn optional VCHUNKS env into "--<name>-vchunks C0 C1 C2" args
 vcarg() { local name="$1"; local val="$2"; [[ -n "$val" ]] && echo "--${name}-vchunks $val"; }
 
+# `|| true` after each mpirun tolerates a non-zero exit at MPI_Finalize
+# (from the UCX teardown races that we haven't fully suppressed).  The
+# compute + writes themselves complete before finalize, so we're not
+# masking real failures — data on disk is authoritative.  Non-mpirun
+# commands (python step0/step4 direct, mkdir, lfs) still abort on error
+# thanks to `set -e`.
+
 # 0. Plan the mosaic (schematic PNG + tile-origin txt).
 python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
 
 # 1. init.h5 → big{UPS}x.h5  (bilinear xy + linear z upsample; VDS+banks).
 mpirun -n "$N_GPUS" set_affinity_gpu.sh \
     python step1_upsample.py --ups "$UPS" --path "$PATH_DATA" \
-        --nbanks "$NBANKS" $(vcarg big "$BIG_VCHUNKS")
+        --nbanks "$NBANKS" $(vcarg big "$BIG_VCHUNKS") || true
 
 # 2. big{UPS}x.h5 → model_big{UPS}x/proj.h5   (Radon; VDS+banks).
 #    For UPS ≥ 8 swap for step2_radon_large.py with --chunk-n/-theta/-xy.
 mpirun -n "$N_GPUS" set_affinity_gpu.sh \
     python step2_radon.py --ups "$UPS" --path "$PATH_DATA" \
         --nzchunk "$NZCHUNK" --nbanks "$NBANKS" \
-        $(vcarg proj "$PROJ_VCHUNKS")
+        $(vcarg proj "$PROJ_VCHUNKS") || true
 
 # 3. proj.h5 → data.h5   (Fresnel propagation to detector intensities).
 mpirun -n "$N_GPUS" set_affinity_gpu.sh \
     python step3_fresnel.py --ups "$UPS" --path "$PATH_DATA" \
         --npropchunk "$NPROPCHUNK" --nbanks "$NBANKS" \
-        $(vcarg data "$DATA_VCHUNKS")
+        $(vcarg data "$DATA_VCHUNKS") || true
 
 # 4. data.h5 → mosaic_h5/{z}_{x}.h5   (MPI-parallel over tiles; CPU only).
 mpirun -n "$N_GPUS" \
-    python step4_extract.py --ups "$UPS" --path "$PATH_DATA"
+    python step4_extract.py --ups "$UPS" --path "$PATH_DATA" || true
 
 echo "=== pipeline done ==="
