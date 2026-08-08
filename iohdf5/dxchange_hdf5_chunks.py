@@ -29,11 +29,28 @@ import os
 _SPAWN_CTX = multiprocessing.get_context("spawn")
 _POOLS = {}   # nbanks -> Pool
 
+# Env-var prefixes stripped from spawn workers.  On Cray/Polaris the parent
+# was launched by PALS/mpiexec so PMI_* / PALS_* env vars are set; those
+# propagate to spawn workers, and on worker startup Cray MPICH's library
+# init sees them and tries `PMI2_Init()` — which asserts because the worker
+# was NOT launched by PALS ("_pmi_smp_barrier failed").  Stripping these
+# just for the Pool spawn makes libmpich fall back to singleton mode.
+# Parent's own MPI is unaffected: mpi4py already called MPI_Init before
+# tomo_writex reaches this point, and Cray MPI doesn't re-read env after.
+_SCRUB_ENV_PREFIXES = ("PMI_", "PALS_")
+
 
 def _get_pool(nbanks: int):
     p = _POOLS.get(nbanks)
     if p is None:
-        p = _SPAWN_CTX.Pool(processes=int(nbanks))
+        saved = {}
+        for k in list(os.environ):
+            if k.startswith(_SCRUB_ENV_PREFIXES):
+                saved[k] = os.environ.pop(k)
+        try:
+            p = _SPAWN_CTX.Pool(processes=int(nbanks))
+        finally:
+            os.environ.update(saved)
         _POOLS[nbanks] = p
     return p
 
