@@ -112,6 +112,13 @@ mpiexec -n "${NNODES}" --ppn 1 --cpu-bind none bash -c '
 
     echo "[rank ${R} $(hostname -s)] starting → ${NODE_DIR}" >&2
 
+    # Force single-rank mode inside each Python.  This launcher runs N
+    # INDEPENDENT benchmarks (one per node, each in its own subdir), not
+    # one MPI-shared benchmark.  Without this the Python would auto-detect
+    # the mpiexec comm, treat all N processes as ranks of one job, and
+    # rank 0 would MPI-broadcast a ctx pointing at ITS subdir which the
+    # other ranks would then try to write to (crash: file not found).
+    MOSAIC_NO_MPI=1 \
     python "'"${SCRIPT_DIR}"'/test_h5_buffer_io.py" \
         --path "${NODE_DIR}" --ups '"${UPS}"' \
         --nbanks '"${NBANKS}"' --ntasks '"${NTASKS}"' \
