@@ -321,14 +321,15 @@ def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
         if not _test:
             raise Exception("Virtual dataset exists already.")
 
-        # create directory(ies)
-        for filepath in banks_filename_path:
-            fdirname = os.path.dirname(filepath)
-            try:
-                if not os.path.isdir(fdirname):
-                    os.mkdir(fdirname)
-            except:
-                pass
+    # Create the bank subdirectory on EVERY rank (idempotent via
+    # exist_ok=True — the FS resolves any races atomically).  Must be
+    # here (not in the `if rank == 0` block above) because we then
+    # shard bank-file creation across ranks: rank 1 must not race to
+    # create files inside a directory rank 0 hasn't mkdir'd yet.
+    for filepath in banks_filename_path:
+        fdirname = os.path.dirname(filepath)
+        if fdirname:
+            os.makedirs(fdirname, exist_ok=True)
 
     try:
         # Build the layout on all ranks (deterministic; only rank 0

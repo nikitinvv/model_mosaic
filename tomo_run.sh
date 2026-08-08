@@ -16,7 +16,7 @@ PATH_DATA=${PATH_DATA:-/data2/brain_sym_mosaic}
 N_GPUS=${N_GPUS:-4}                          # total ranks (= total GPUs)
 
 # Compute chunk sizes
-NZCHUNK=${NZCHUNK:-32}                       # z-slices per Radon call
+NZCHUNK=4 #${NZCHUNK:-32}                       # z-slices per Radon call
 NPROPCHUNK=${NPROPCHUNK:-8}                  # angles per Fresnel batch
 
 # Bank / vchunk knobs (see test_h5_buffer_io.py for details).

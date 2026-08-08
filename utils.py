@@ -108,19 +108,28 @@ def report_stage(label: str, bytes_local: float, time_local: float) -> None:
            f"total={hb(total_bytes)}")
 
 
-def hard_exit(code: int = 0, watchdog_s: int = 60) -> None:
-    """Flush + Barrier, then return to let Python shut down naturally.
+def hard_exit(code: int = 0, watchdog_s: int = 30) -> None:
+    """Flush + Barrier + os._exit(code) — skip MPI.Finalize.
 
     Call as the last line of `main()` in every step script.
 
-    Normal flow: main() returns → atexit handlers run (Pool shutdown,
-    then mpi4py's MPI.Finalize) → process exits cleanly with code 0 →
-    mpirun sees clean shutdown and returns 0.
+    Sequence:
+      1. Flush stdout/stderr
+      2. shutdown_pools() — SIGKILL spawn Pool workers so they don't
+         hold resources MPI's shutdown would try to reconcile.
+      3. COMM.Barrier() — collective sync; when it returns we KNOW all
+         ranks reached the end of work together.
+      4. os._exit(code) — skip Python's atexit chain (which includes
+         mpi4py's MPI.Finalize).  On Cray MPICH + spawn multiprocessing
+         + shared memory, MPI.Finalize hangs indefinitely (resource
+         tracker still knows about shm segments MPI is trying to clean
+         up).  Since the Barrier proved all ranks are synced, mpiexec
+         / PALS cleans up per-rank MPI state on process exit — no need
+         for the collective Finalize.
 
-    If natural shutdown hangs > `watchdog_s` (a MPI teardown race that
-    we've seen on some hosts), a daemon watchdog thread SIGKILLs the
-    process so the launcher script can move on.  Normally you'll never
-    see the watchdog fire — if you do, its stderr marker tells you.
+    Watchdog: if the Barrier itself hangs (a real MPI deadlock, not
+    just a slow finalize), watchdog_s seconds later a daemon thread
+    SIGKILLs.  Keep it short (30s) so a real hang is caught quickly.
     """
     import os
     import signal
@@ -144,10 +153,6 @@ def hard_exit(code: int = 0, watchdog_s: int = 60) -> None:
     threading.Thread(target=_watchdog, daemon=True).start()
 
     # Kill any lingering spawn Pool workers BEFORE the final Barrier.
-    # If workers are still alive at MPI.Finalize time, atexit ordering
-    # on some systems (tomo5) can wedge — the pool's own supervisor
-    # thread holds resources MPI wants.  Lazy import to avoid a
-    # circular dep (iohdf5 imports utils indirectly via step scripts).
     try:
         from iohdf5.dxchange_hdf5_chunks import shutdown_pools
         shutdown_pools()
@@ -159,5 +164,9 @@ def hard_exit(code: int = 0, watchdog_s: int = 60) -> None:
             COMM.Barrier()
         except Exception:
             pass
-    # Return normally — Python's atexit runs MPI.Finalize.
-    # (shutdown_pools atexit fallback is a no-op now — pools already killed.)
+
+    # Skip Python atexit (including mpi4py's MPI.Finalize).  Barrier
+    # already proved all ranks reached this point; mpiexec/PALS cleans
+    # up MPI state per-rank on process exit.  Exits with `code` so
+    # launchers see a clean 0 and the pipeline continues to the next step.
+    os._exit(code)
