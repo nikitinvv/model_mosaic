@@ -35,7 +35,7 @@ Example:
     mpiexec -n 10 --ppn 1 python test_h5_buffer_io.py \\
         --path /eagle/APS_IRI/vnikitin/iotest_buf_ups2 \\
         --ups 2 --nbanks 8 --ntasks 8 \\
-        --init-vchunks 32 2744 2744 \\
+        --init-vchunks 32 3072 3072 \\
         --big-vchunks  32 5488 5488 \\
         --proj-vchunks 128 32 5488 \\
         --data-vchunks 128 5120 5488
@@ -134,8 +134,8 @@ def _parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--path", required=True)
     p.add_argument("--ups",     type=int, default=1)
-    p.add_argument("--in-nz",   type=int, default=2560)
-    p.add_argument("--in-nyx",  type=int, default=2744)
+    p.add_argument("--in-nz",   type=int, default=3072)
+    p.add_argument("--in-nyx",  type=int, default=3072)
     p.add_argument("--ntheta",  type=int, default=None,
                    help="default = 3·N/4 where N = in-nyx·ups")
     p.add_argument("--nbanks",  type=int, default=8,

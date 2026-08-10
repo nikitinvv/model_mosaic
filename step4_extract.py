@@ -47,8 +47,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
                    help="base dir; reads {path}/model_big{UPS}x/data.h5, "
                         "writes {path}/mosaic_h5/*.h5")
-    p.add_argument("--z-pad", type=int, default=50,
-                   help="projection air-padding (matches upsample_extract --z-pad)")
+    p.add_argument("--z-pad", type=int, default=None,
+                   help="projection air-padding in PIPELINE VOXELS — offset "
+                        "from schematic z=0 (sample top) to data.h5 row 0.  "
+                        "Default: derived from step00 (init.h5 is a 45.9 mm "
+                        "cube with the 30 mm sample centered → sample top is "
+                        "at row (NZ - SAMPLE_H_PX)/2 in the pipeline grid).")
     p.add_argument("--air-fill", type=float, default=1.0,
                    help="OOB tile pixel fill (transmission intensity of air)")
     return p.parse_args()
@@ -92,7 +96,17 @@ def main() -> None:
     n_x = len(x_origins)
     n_z = len(z_positions)
 
-    z_starts = [int(round(z + args.z_pad)) for z in z_positions]
+    # Derive pipeline-voxel z_pad = (NZ - SAMPLE_H_PX)/2 when not overridden.
+    # NZ = 4096·UPS (from step1), SAMPLE_H_PX from schematic = 2720·UPS.
+    z_pad = args.z_pad
+    if z_pad is None:
+        z_pad = (NZ - SAMPLE_H_PX) // 2
+        if RANK == 0:
+            print(f"  [step4] derived z_pad = (NZ={NZ} - SAMPLE_H_PX={SAMPLE_H_PX})/2 "
+                  f"= {z_pad} pipeline voxels (pass --z-pad to override)",
+                  flush=True)
+
+    z_starts = [int(round(z + z_pad))      for z in z_positions]
     x_starts = [int(round(x + N / 2))      for x in x_origins]
 
     if RANK == 0:

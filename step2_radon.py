@@ -16,6 +16,11 @@ step2_radon_large.py which host-chunks.
 Multi-GPU via MPI + set_affinity_gpu.sh.  Launch:
     mpirun -n <NGPU> set_affinity_gpu.sh python step2_radon.py \\
         --ups 2 --path /data2/brain_sym_mosaic
+
+Uses TomoReal — rfft/float32 path.  The obj is REAL (imag=0 in the
+old complex64 pipeline was wasted memory + wasted FFT bandwidth), so
+we send float32 to the GPU and receive float32 sinograms back with
+zero conversion at either end.
 """
 from __future__ import annotations
 
@@ -27,7 +32,7 @@ import h5py
 import numpy as np
 import cupy as cp
 
-from processing.tomo import Tomo
+from processing.tomo import TomoReal
 from iohdf5.dxchange_hdf5_chunks import tomo_writex
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
@@ -43,8 +48,8 @@ def _parse_args() -> argparse.Namespace:
                    help="upsample factor (matches step1_upsample --ups)")
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
                    help="base directory; reads {path}/big{UPS}x.h5, writes {path}/model_big{UPS}x/proj.h5")
-    p.add_argument("--in-nz",  type=int, default=2560, help="init nz (before UPS)")
-    p.add_argument("--in-n",   type=int, default=2744, help="init N  (before UPS)")
+    p.add_argument("--in-nz",  type=int, default=3072, help="init nz (before UPS)")
+    p.add_argument("--in-n",   type=int, default=3072, help="init N  (before UPS)")
     p.add_argument("--ntheta", type=int, default=None,
                    help="angles over 360°; default = 3·N/4")
     p.add_argument("--mask-r", type=float, default=0.0,
@@ -110,8 +115,12 @@ def main() -> None:
     barrier()
     rprint(f"UPS={UPS}  nz={NZ} n={N} ntheta={NTHETA} nzchunk={NZCHUNK}  "
            f"mask_r={MASK_R}")
-    rprint(f"GPU est. — Tomo._buf_fde: "
-           f"{NZCHUNK * (2*N)**2 * 8 / 1e9:.1f} GB")
+    # TomoReal keeps the padded (2N × 2N) buffer as REAL float32 and the
+    # rfft output as (2N × (N+1)) complex64 — half the memory of the
+    # complex64 Tomo path.
+    rprint(f"GPU est. — TomoReal padded (f32): "
+           f"{NZCHUNK * (2*N)**2 * 4 / 1e9:.1f} GB  "
+           f"+ rfft fde (c64): {NZCHUNK * (2*N) * (N+1) * 8 / 1e9:.1f} GB")
 
     if RANK == 0:
         describe_input(SRC_H5)
@@ -135,9 +144,9 @@ def main() -> None:
 
     proj_min, proj_max = np.inf, -np.inf
 
-    rprint("building Tomo (allocating buffers + cuFFT plans)...")
-    cl_tomo = Tomo(N, NZCHUNK, theta_rad, mask_r=MASK_R)
-    rprint("Tomo ready.")
+    rprint("building TomoReal (allocating buffers + cuFFT plans)...")
+    cl_tomo = TomoReal(N, NZCHUNK, theta_rad, mask_r=MASK_R)
+    rprint("TomoReal ready.")
 
     ivchunks = list(iter_vchunks((NTHETA, NZ, N), PROJ_VCHUNKS))
     my_ivchunks = ivchunks[RANK::SIZE]
@@ -167,18 +176,15 @@ def main() -> None:
                     b_read += kz * N * N * 4
 
                     t0 = time.perf_counter()
-                    delta_d = cp.asarray(chunk_h)
-                    vol_d   = cp.empty(delta_d.shape, dtype=cp.complex64)
-                    vol_d.real = delta_d
-                    vol_d.imag = cp.float32(0)
-                    del delta_d
-
-                    proj_d_c = cl_tomo.R(vol_d)   # (NTHETA, NZCHUNK, N)
+                    # TomoReal takes float32 obj directly (no complex64
+                    # wrapping) and returns float32 sino (no .real / astype
+                    # dance).
+                    vol_d = cp.asarray(chunk_h)
+                    proj_d = cl_tomo.R(vol_d)      # (NTHETA, NZCHUNK, N) f32
                     del vol_d
 
-                    proj_chunk_h = cp.asnumpy(proj_d_c[:, :kz].real).astype(
-                        np.float32, copy=False)
-                    del proj_d_c
+                    proj_chunk_h = cp.asnumpy(proj_d[:, :kz])
+                    del proj_d
                     cp.get_default_memory_pool().free_all_blocks()
                     t_radon += time.perf_counter() - t0
 

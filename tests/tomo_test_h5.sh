@@ -23,10 +23,10 @@ N_GPUS=${N_GPUS:-4}                          # total ranks
 NBANKS=${NBANKS:-4}
 NTASKS=${NTASKS:-4}
 
-INIT_VCHUNKS=${INIT_VCHUNKS:-"32 2744 2744"}
-BIG_VCHUNKS=${BIG_VCHUNKS:-"$((32*UPS)) $((2744*UPS)) $((2744*UPS))"}
-PROJ_VCHUNKS=${PROJ_VCHUNKS:-"128 $((2560*UPS)) $((2744*UPS))"}
-DATA_VCHUNKS=${DATA_VCHUNKS:-"128 $((2560*UPS)) $((2744*UPS))"}
+INIT_VCHUNKS=${INIT_VCHUNKS:-"32 4096 4096"}
+BIG_VCHUNKS=${BIG_VCHUNKS:-"$((32*UPS)) $((4096*UPS)) $((4096*UPS))"}
+PROJ_VCHUNKS=${PROJ_VCHUNKS:-"128 $((4096*UPS)) $((4096*UPS))"}
+DATA_VCHUNKS=${DATA_VCHUNKS:-"128 $((4096*UPS)) $((4096*UPS))"}
 # ================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

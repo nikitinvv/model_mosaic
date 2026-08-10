@@ -3,9 +3,9 @@
 
 Physical dimensions stay constant across --ups; only the voxel-count
 representation of the pipeline changes.  At UPS=1 (init/prototype) the
-schematic reports coarse voxel counts (detector 404×303, sample 2560×2460)
-at 11.2 µm/voxel.  At UPS=8 (full real experiment) it reports the real
-counts (detector 3232×2426, sample 20480×19680) at 1.4 µm/voxel.
+schematic reports coarse voxel counts (detector 404×303, sample 2720×2720)
+at 11.04 µm/voxel.  At UPS=8 (full real experiment) it reports the real
+counts (detector 3232×2426, sample 21760×21760) at 1.38 µm/voxel.
 
 Sample cylinder ~28.67 × 27.55 mm tall (real physical size), rotating
 about the vertical axis.  Reconstruction voxel = detector pixel.
@@ -51,33 +51,50 @@ _A = _parse_args()
 UPS  = _A.ups
 BASE = _A.path
 
-# Detector at real physical size (3232 × 2426 px @ 1.4 µm/px, overlaps 200 px)
-# expressed in pipeline-voxel units.  Voxel size scales inversely with UPS
-# to keep physical dimensions constant: at UPS=1 voxel=11.2 µm, at UPS=8
-# voxel=1.4 µm (matches step2_model's default VOXELSIZE).
-DET_W        = 3232 * UPS // 8
-DET_H        = 2426 * UPS // 8
-PIXEL_UM     = 1.4 * 8 / UPS
+# --- physical geometry (source of truth) --------------------------------
+# The detector is 3232 × 2426 physical pixels at 1.38 µm/px.  At the
+# REFERENCE UPS=8 the pipeline voxel matches the detector pixel: 1.38 µm.
+# step00 crops the source TIFF to 2560^3 and upsamples to init.h5 (3072^3);
+# step1 further upsamples voxel-wise by UPS to big{UPS}x = (3072·UPS)^3.
+#     pipeline voxel(UPS) = 1.38·8/UPS  µm
+#     pipeline dataset    = (3072·UPS)^3 voxels, physical extent
+#                         = 3072·UPS · 1.38·8/UPS µm = 33.92 mm  (constant)
+# Sample = cylinder of ≈0.95·N diameter with ~50 air voxels at each end
+# of z (both boundaries have a cosine taper for smooth transition to air):
+#     SAMPLE_D_PX = 2918·UPS  (0.95·3072 = 2918.4, ≈ 32.2 mm at UPS=1)
+#     SAMPLE_H_PX = 2972·UPS  (3072 − 2·50 = 2972, ≈ 32.8 mm at UPS=1)
+DETECTOR_W_PX          = 3232            # physical detector, px
+DETECTOR_H_PX          = 2426
+DETECTOR_PIXEL_UM_REF  = 1.38            # detector pixel size at REF_UPS
+REF_UPS                = 8               # UPS at which voxel == detector pixel
+OVERLAP_PX_REF         = 200             # x-tile overlap at REF_UPS
+AXIS_INSET_PX_REF      = 200             # rotation axis inset at REF_UPS
+Z_OVERLAP_PX_REF       = 200             # z-tile overlap at REF_UPS
+
+PIXEL_UM     = DETECTOR_PIXEL_UM_REF * REF_UPS / UPS   # pipeline voxel µm
 VOXEL_UM     = PIXEL_UM
-OVERLAP      = 200 * UPS // 8
-AXIS_INSET   = 200 * UPS // 8
-Z_OVERLAP    = 200 * UPS // 8
+DET_W        = DETECTOR_W_PX     * UPS // REF_UPS
+DET_H        = DETECTOR_H_PX     * UPS // REF_UPS
+OVERLAP      = OVERLAP_PX_REF    * UPS // REF_UPS
+AXIS_INSET   = AXIS_INSET_PX_REF * UPS // REF_UPS
+Z_OVERLAP    = Z_OVERLAP_PX_REF  * UPS // REF_UPS
 
-# Sample cylinder in pipeline voxels.  Init (before upsampling) is
-# 2560 × 2744 × 2744 with CIRCLE_DIAM=2560 and Z_PAD=50 → sample z 2460.
-# After upsampling by UPS, dimensions scale linearly.
-SAMPLE_D_PX  = 2560 * UPS                         # mask diameter in voxels
-SAMPLE_H_PX  = 2460 * UPS                         # sample z-extent
-SAMPLE_D_MM  = SAMPLE_D_PX * VOXEL_UM * 1e-3      # ~28.67 mm (real brain size)
-SAMPLE_H_MM  = SAMPLE_H_PX * VOXEL_UM * 1e-3      # ~27.55 mm
+# Sample cylinder centered in the (3072·UPS)^3 dataset (33.92 mm cube).
+#   diameter: 0.95·3072 = 2918.4 → 2918·UPS voxels (mask in step00 uses
+#             CROP-grid --circle-diam=2432, which after 2560→3072 upsample
+#             gives 2432·(3072/2560) = 2918.4 pipeline voxels)
+#   height:   3072 − 2·50 = 2972·UPS voxels (step00 --z-pad=42 in CROP
+#             grid → ~50 in OUT grid → 2971 sample voxels in init.h5)
+SAMPLE_D_PX   = 2918 * UPS
+SAMPLE_H_PX   = 2972 * UPS
+SAMPLE_D_MM   = SAMPLE_D_PX * VOXEL_UM * 1e-3          # ≈ 32.2 mm
+SAMPLE_H_MM   = SAMPLE_H_PX * VOXEL_UM * 1e-3          # ≈ 32.8 mm
 
-# Nyquist-scaled angle count (matches step2_model_*.py: NTHETA = 3·N/4,
-# with N = 2744·UPS).  Draw only up to MAX_DRAWN_SPOKES spokes to keep the
-# right-panel figure legible when NTHETA is in the thousands.
-_N_PIPELINE      = 2744 * UPS
-NTHETA           = 3 * _N_PIPELINE // 4
-MAX_DRAWN_SPOKES = 64
-ANG_MAX          = 360
+# Nyquist-scaled angle count (matches step2_radon.py: NTHETA = 3·N/4).
+_N_PIPELINE       = 3072 * UPS
+NTHETA            = 3 * _N_PIPELINE // 4
+MAX_DRAWN_SPOKES  = 64
+ANG_MAX           = 360
 
 
 def px_to_mm(v):
@@ -175,8 +192,13 @@ def main() -> None:
     print(f"angles          : {NTHETA} over {ANG_MAX}°")
     print(f"TOTAL PROJ.     : {NTHETA} × {n_tiles} × {n_z} = {total_proj}")
 
-    os.makedirs(BASE, exist_ok=True)
-    positions_path = os.path.join(BASE, f"mosaic_positions{UPS}.txt")
+    # Outputs go to mosaic_modeling/drawings/ (next to this script), no
+    # matter where the user launched python from — so drawing scripts
+    # and their PNG/txt artifacts stay side by side.
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    _DRAW_DIR   = os.path.join(_SCRIPT_DIR, "drawings")
+    os.makedirs(_DRAW_DIR, exist_ok=True)
+    positions_path = os.path.join(_DRAW_DIR, f"mosaic_positions{UPS}.txt")
     np.savetxt(
         positions_path,
         origins.astype(int), fmt="%d",
@@ -424,7 +446,7 @@ def main() -> None:
                        edgecolor="0.7", pad=0.4))
 
     plt.tight_layout()
-    out_png = os.path.join(BASE, f"mosaic_schematic{UPS}.png")
+    out_png = os.path.join(_DRAW_DIR, f"mosaic_schematic{UPS}.png")
     plt.savefig(out_png, dpi=150, bbox_inches="tight")
     print(f"saved {out_png}")
     print(f"saved {positions_path}")

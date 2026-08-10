@@ -14,7 +14,17 @@
 # Writes VDS+banks h5 stores under $PATH_DATA:
 #   init.h5, big{UPS}x.h5, model_big{UPS}x/{proj.h5, data.h5}, mosaic_h5/*
 #
-# For UPS ≥ 8 swap step2_radon.py → step2_radon_large.py.
+# init.h5 is 3072^3 float32 (step00 crops the source TIFF to 2560^3,
+# upsamples to 3072^3 by factor 1.2, applies a cylindrical mask of
+# diameter ≈ 0.95·N with a cosine taper, leaves ~50 zero voxels at each
+# end of z with a cosine ramp).  Voxel matches detector px at UPS=8 →
+# 1.38 µm; scales as 1.38·8/UPS at other UPS.  Physical dataset = 33.92
+# mm cube; sample ≈ ⌀32.2 × 32.8 mm cylinder inside.  Defaults
+# (--circle-diam=2432 --z-pad=42) match the schematic
+# (SAMPLE_D_PX = 2918·UPS, SAMPLE_H_PX = 2972·UPS).
+#
+# For UPS ≥ 4 swap step2_radon.py → step2_radon_large.py (host-chunked
+# TomoLargeReal — rfft/float32) and step3_fresnel.py → step3_fresnel_large.py.
 
 NNODES=$(wc -l < $PBS_NODEFILE)
 NRANKS=4              # ranks per node (= GPUs per node on Polaris)
@@ -36,7 +46,7 @@ conda activate base
 cd "${SCRIPT_DIR}"
 
 # ================== USER KNOBS ==================
-UPS=${UPS:-1}
+UPS=2 #${UPS:-1}
 PATH_DATA=${PATH_DATA:-/eagle/APS_IRI/vnikitin/mosaic_brain}
 
 NZCHUNK=${NZCHUNK:-32}                       # z-slices per Radon call
@@ -88,12 +98,14 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
         --nbanks "$NBANKS" $(vcarg big "$BIG_VCHUNKS")
 
 # ---------- 2. Radon → proj.h5 -------------------------------------------
+# step2_radon.py: GPU-only TomoReal (rfft/float32); fits UPS ≤ 4 on a 40 GB
+# GPU.  For UPS ≥ 4 use step2_radon_large.py below (TomoLargeReal, host-
+# chunked; halved host fde vs the old complex64 TomoLarge).
 "${MPIEXEC[@]}" \
     python step2_radon.py --ups "$UPS" --path "$PATH_DATA" \
         --nzchunk "$NZCHUNK" --nbanks "$NBANKS" \
         $(vcarg proj "$PROJ_VCHUNKS")
-# UPS ≥ 8 (host-chunked TomoLarge; chunk-n/-theta/-xy auto-picked from N/NTHETA
-# — override with --chunk-n/-theta/-xy if you need to fit tighter host RAM).
+# UPS ≥ 4 (host-chunked TomoLargeReal; chunks auto-picked from --gpu-budget-gb).
 # "${MPIEXEC[@]}" \
 #     python step2_radon_large.py --ups "$UPS" --path "$PATH_DATA" \
 #         --nzchunk 1 --nbanks "$NBANKS" \
@@ -104,8 +116,16 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
     python step3_fresnel.py --ups "$UPS" --path "$PATH_DATA" \
         --npropchunk "$NPROPCHUNK" --nbanks "$NBANKS" \
         $(vcarg data "$DATA_VCHUNKS")
+# UPS ≥ 4 (host-chunked PropagationLarge; chunks auto-picked from --gpu-budget-gb):
+# "${MPIEXEC[@]}" \
+#     python step3_fresnel_large.py --ups "$UPS" --path "$PATH_DATA" \
+#         --npropchunk "$NPROPCHUNK" --nbanks "$NBANKS" \
+#         $(vcarg data "$DATA_VCHUNKS")
 
 # ---------- 4. data.h5 → mosaic_h5/{z}_{x}.h5 -----------------------------
+# --z-pad defaults to (NZ - SAMPLE_H_PX)/2 = (4096·UPS - 2720·UPS)/2 = 688·UPS
+# (schematic z=0 = sample top lands on that data row).  --air-fill=1.0 by
+# default (transmission of air) for out-of-bounds tile pixels.
 "${MPIEXEC[@]}" \
     python step4_extract.py --ups "$UPS" --path "$PATH_DATA"
 

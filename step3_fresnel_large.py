@@ -1,19 +1,25 @@
 #!/usr/bin/env python
-"""Fresnel propagation of the Radon projections to detector intensities.
+"""Fresnel propagation of the Radon projections to detector intensities
+using the host-chunked PropagationLarge — same output format as
+step3_fresnel.py but the padded (2NZ × 2N) Fresnel work buffer lives on
+the HOST, only per-strip pieces on the GPU.  Use this for UPS ≥ 8 (or
+whenever the (NPROPCHUNK, 2NZ, 2N) complex64 buffer no longer fits on a
+40 GB GPU).
 
-Reads {path}/model_big{UPS}x/proj.h5 (VDS + banks from step2_radon.py or
-step2_radon_large.py) and writes {path}/model_big{UPS}x/data.h5.
+Reads {path}/model_big{UPS}x/proj.h5 (VDS + banks) and writes
+{path}/model_big{UPS}x/data.h5.
 
 For each --data-vchunks super-chunk (θ_super, NZ, N) this rank owns:
   1. Read the θ-slab from proj.h5 via VDS (one big read).
-  2. Loop NPROPCHUNK θ-batches through the Fresnel pipeline:
-         psi  = exp(1j·(proj/NORM_CONST + 1j·(proj/(NORM_CONST·BETA_RATIO))))
-         data = |D_prop(psi)|²
+  2. Loop NPROPCHUNK θ-batches through PropagationLarge (HOST pre/post):
+         psi_h  = exp(1j·proj/NORM + …)                (numpy, host)
+         prop_h = cl_prop_large.D(psi_h, 0, chunks)     (host-staged GPU)
+         data_h = |prop_h|²                             (numpy, host)
   3. tomo_writex fans the vchunk buffer to disk across --nbanks writers.
 
 Multi-GPU via MPI + set_affinity_gpu.sh.  Launch:
-    mpirun -n <NGPU> set_affinity_gpu.sh python step3_fresnel.py \\
-        --ups 2 --path /data2/brain_sym_mosaic
+    mpirun -n <NGPU> set_affinity_gpu.sh python step3_fresnel_large.py \\
+        --ups 8 --path /data2/brain_sym_mosaic
 """
 from __future__ import annotations
 
@@ -25,7 +31,8 @@ import h5py
 import numpy as np
 import cupy as cp
 
-from processing.propagation import Propagation
+from processing.propagation_large import PropagationLarge
+from processing.chunk_pick import pick_prop_chunks
 from iohdf5.dxchange_hdf5_chunks import tomo_writex
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
@@ -37,11 +44,9 @@ from utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stag
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ups",  type=int, default=2,
+    p.add_argument("--ups",  type=int, default=8,
                    help="upsample factor (matches step1_upsample --ups)")
-    p.add_argument("--path", default="/data2/brain_sym_mosaic",
-                   help="base dir; reads {path}/model_big{UPS}x/proj.h5, "
-                        "writes {path}/model_big{UPS}x/data.h5")
+    p.add_argument("--path", default="/data2/brain_sym_mosaic")
     p.add_argument("--in-nz",  type=int, default=3072, help="init nz (before UPS)")
     p.add_argument("--in-n",   type=int, default=3072, help="init N  (before UPS)")
     p.add_argument("--ntheta", type=int, default=None,
@@ -55,10 +60,20 @@ def _parse_args() -> argparse.Namespace:
                    help="voxel = detector pixel, meters (parallel beam)")
     p.add_argument("--distance",  type=float, default=1.0,
                    help="sample → detector distance, meters")
-    p.add_argument("--npropchunk", type=int, default=8,
-                   help="angles per Fresnel batch")
+    p.add_argument("--npropchunk", type=int, default=1,
+                   help="angles per Fresnel batch (each D() call takes "
+                        "NPROPCHUNK angles; default 1 = one angle at a time, "
+                        "which minimises host RAM for very large NZ·N)")
     p.add_argument("--nbanks",     type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
+    p.add_argument("--chunk-nz", type=int, default=0,
+                   help="PropagationLarge x-strip depth; 0 = auto from --gpu-budget-gb")
+    p.add_argument("--chunk-2n", type=int, default=0,
+                   help="PropagationLarge y-strip width; 0 = auto from --gpu-budget-gb")
+    p.add_argument("--gpu-budget-gb", type=float, default=30.0,
+                   help="target GPU memory for chunk-picker (default 30 GB, "
+                        "leaves headroom on a 40 GB A100 for cuFFT plans + "
+                        "transient allocations across pipeline stages)")
     p.add_argument("--data-vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk for data.h5 (default: 8·NPROPCHUNK, NZ, N)")
@@ -88,27 +103,25 @@ NPROPCHUNK = _A.npropchunk
 NBANKS      = _A.nbanks
 DATA_VCHUNKS = tuple(_A.data_vchunks) if _A.data_vchunks else (8 * NPROPCHUNK, NZ, N)
 
+_auto_nz, _auto_2n = pick_prop_chunks(
+    nz=NZ, n=N, ntheta=NPROPCHUNK,
+    gpu_budget_bytes=int(_A.gpu_budget_gb * 1e9))
+CHUNK_NZ = _A.chunk_nz or _auto_nz
+CHUNK_2N = _A.chunk_2n or _auto_2n
 
-_psi_from_proj = cp.ElementwiseKernel(
-    "float32 delta_raw, float32 inv_norm, float32 inv_beta_ratio",
-    "complex64 psi",
-    """
-    float phase = delta_raw * inv_norm;
-    float atten = expf(-phase * inv_beta_ratio);
-    psi = complex<float>(atten * cosf(phase), atten * sinf(phase));
-    """,
-    "psi_from_proj",
-)
 
-_abs2_c64_to_f32 = cp.ElementwiseKernel(
-    "complex64 z",
-    "float32 out",
-    "out = z.real() * z.real() + z.imag() * z.imag();",
-    "abs2_c64",
-)
+def _validate_chunks() -> None:
+    problems = []
+    if NZ % CHUNK_NZ:
+        problems.append(f"--chunk-nz={CHUNK_NZ} must divide NZ={NZ}")
+    if (2 * N) % CHUNK_2N:
+        problems.append(f"--chunk-2n={CHUNK_2N} must divide 2N={2*N}")
+    if problems:
+        raise SystemExit("chunk-size problems:\n  " + "\n  ".join(problems))
 
 
 def main() -> None:
+    _validate_chunks()
     if DATA_VCHUNKS[0] % NPROPCHUNK != 0:
         raise SystemExit(
             f"--data-vchunks C0={DATA_VCHUNKS[0]} must be a multiple of "
@@ -125,7 +138,6 @@ def main() -> None:
     wavelength = 1.24e-9 / ENERGY
     fresnel_number = (VOXELSIZE ** 2) / (wavelength * DISTANCE)
 
-    # Pull theta from proj.h5 so we can attach it to data.h5 too.
     if RANK == 0:
         with h5py.File(PROJ_H5, "r") as f:
             theta_deg = f["exchange/theta"][:]
@@ -147,8 +159,11 @@ def main() -> None:
            f"Fresnel number (per pixel)={fresnel_number:.4g}")
     rprint(f"norm_const={float(NORM_CONST):.4g}  phase_scale={PHASE_SCALE}  "
            f"beta_ratio={BETA_RATIO}")
-    rprint(f"GPU est. — Prop._buf_big + fker: "
-           f"{(NPROPCHUNK + 1) * (2*NZ) * (2*N) * 8 / 1e9:.3f} GB")
+    rprint(f"chunks: CHUNK_NZ={CHUNK_NZ}  CHUNK_2N={CHUNK_2N}  "
+           f"(auto from gpu-budget={_A.gpu_budget_gb} GB)")
+    host_pass2_gb = NPROPCHUNK * 2 * NZ * CHUNK_2N * 8 / 1e9
+    rprint(f"host-side psi/fde ≈ {NPROPCHUNK * NZ * N * 8 / 1e9:.1f} + "
+           f"{NPROPCHUNK * NZ * 2 * N * 8 / 1e9:.1f} GB per D() call")
 
     if RANK == 0:
         describe_input(PROJ_H5)
@@ -170,8 +185,7 @@ def main() -> None:
     rprint(f"per-rank shm buffer={buf_gb:.2f} GB   "
            f"nvchunks={n_vchunks((NTHETA, NZ, N), DATA_VCHUNKS)}")
 
-    cl_prop = Propagation(N, NZ, NPROPCHUNK, 1,
-                          wavelength, VOXELSIZE, [DISTANCE])
+    cl_prop = PropagationLarge(N, NZ, wavelength, VOXELSIZE, [DISTANCE])
 
     d_min, d_max = np.inf, -np.inf
     d_sum, d_cnt = 0.0, 0
@@ -197,26 +211,40 @@ def main() -> None:
                 buf.fill(0)
 
                 t0 = time.perf_counter()
-                proj_slab_h = proj_dset[t0_vc:t1_vc, :, :]  # (K, NZ, N)
+                proj_slab_h = proj_dset[t0_vc:t1_vc, :, :]  # (K, NZ, N) float32
                 t_read += time.perf_counter() - t0
                 b_read += (t1_vc - t0_vc) * NZ * N * 4
+
+                # Pinned psi input reused across sub-batches — one alloc per
+                # iteration instead of one fresh np.empty per NPROPCHUNK batch.
+                psi_h_pinned = cl_prop.psi_buffer(NPROPCHUNK)
 
                 for tb0 in range(t0_vc, t1_vc, NPROPCHUNK):
                     tb1 = min(tb0 + NPROPCHUNK, t1_vc)
                     b   = tb1 - tb0
 
                     t0 = time.perf_counter()
-                    proj_d = cp.asarray(proj_slab_h[tb0 - t0_vc : tb1 - t0_vc])
-                    psi_d = _psi_from_proj(proj_d, inv_norm, inv_beta_ratio)
-                    del proj_d
+                    # HOST-side psi = exp(1j·(proj/NORM + 1j·(proj/(NORM·β))))
+                    # Written elementwise via numpy — for very large NZ·N this
+                    # avoids a GPU round-trip on the psi build itself.
+                    proj_batch = proj_slab_h[tb0 - t0_vc : tb1 - t0_vc]
+                    phase = proj_batch * inv_norm
+                    atten = np.exp(-phase * inv_beta_ratio).astype(np.float32)
+                    psi_h_pinned.real[:b] = atten * np.cos(phase)
+                    psi_h_pinned.imag[:b] = atten * np.sin(phase)
+                    if b < NPROPCHUNK:
+                        psi_h_pinned.real[b:] = 0
+                        psi_h_pinned.imag[b:] = 0
+                    del phase, atten
 
-                    prop_d = cl_prop.D(psi_d, 0)
-                    del psi_d
-                    intens_d = _abs2_c64_to_f32(prop_d)
-                    del prop_d
-                    data_batch_h = cp.asnumpy(intens_d[:b])
-                    del intens_d
-                    cp.get_default_memory_pool().free_all_blocks()
+                    # Fresnel propagate through PropagationLarge (host-staged GPU)
+                    prop_h = cl_prop.D(psi_h_pinned, 0, [CHUNK_NZ, CHUNK_2N])[:b]
+
+                    # |prop|² on host into a float32 batch
+                    data_batch_h = (prop_h.real * prop_h.real
+                                    + prop_h.imag * prop_h.imag).astype(
+                        np.float32, copy=False)
+                    del prop_h
                     t_prop += time.perf_counter() - t0
 
                     d_min = min(d_min, float(data_batch_h.min()))

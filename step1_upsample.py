@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-"""Upsample a (2560, 2744, 2744) init volume by UPS× in each axis, saving
+"""Upsample a (4096, 4096, 4096) init volume by UPS× in each axis, saving
 the result as a VDS+banks HDF5 store at {path}/big{UPS}x.h5.
 
     {path}/big{UPS}x.h5              VDS master
     {path}/big{UPS}x/big{UPS}x_data_*.h5   bank files
-        /exchange/data   (2560·UPS, 2744·UPS, 2744·UPS) float32
-                         chunks (1, 2744·UPS, 2744·UPS)
+        /exchange/data   (4096·UPS, 4096·UPS, 4096·UPS) float32
+                         chunks (1, 4096·UPS, 4096·UPS)
 
 Method: bilinear xy + linear z blend (trilinear, separable).  For each
 input z, a background thread prefetches the next input plane while the
@@ -49,9 +49,14 @@ def _parse_args() -> argparse.Namespace:
                    help="upsample factor (in every axis)")
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
                    help="base directory; reads {path}/init.h5, writes {path}/big{UPS}x.h5")
-    p.add_argument("--in-nz", type=int, default=2560, help="input nz")
-    p.add_argument("--in-n",  type=int, default=2744,
-                   help="input ny=nx (same name as step2/3 --in-n)")
+    p.add_argument("--in-nz", type=int, default=None,
+                   help="input nz — auto-detected from init.h5's shape if "
+                        "not passed (recommended).  Pass explicitly only to "
+                        "override (a mismatch triggers a hard error).")
+    p.add_argument("--in-n",  type=int, default=None,
+                   help="input ny=nx — auto-detected from init.h5's shape "
+                        "if not passed.  Default init.h5 is 3072³ (step00 "
+                        "output); so at UPS=8 the pipeline is 24576³.")
     p.add_argument("--n-read",  type=int, default=2,
                    help="background input prefetchers per rank")
     p.add_argument("--nbanks",  type=int, default=8,
@@ -70,8 +75,34 @@ BASE    = _A.path
 SRC_H5  = f"{BASE}/init.h5"
 DST_H5  = f"{BASE}/big{UPS}x.h5"
 
-IN_NZ   = _A.in_nz
-IN_NYX  = _A.in_n
+# Auto-detect IN_NZ/IN_NYX from init.h5's actual shape so we never disagree
+# with what's on disk (a mismatch was the source of the "last 25% of big{UPS}x
+# is zeros" bug — old default said 4096, real init.h5 was 3072).  CLI
+# override is a hard-error safeguard: if you passed --in-nz N and the file
+# says something else, we bail rather than silently zero-padding.
+import h5py as _h5py_probe
+try:
+    with _h5py_probe.File(SRC_H5, "r") as _f:
+        _key = "exchange/data" if "exchange/data" in _f else "data"
+        _nz_disk, _ny_disk, _nx_disk = _f[_key].shape
+except (OSError, KeyError) as _e:
+    raise SystemExit(
+        f"step1: cannot read init.h5 shape ({SRC_H5}): {_e}\n"
+        f"  hint: run step00_upsample_extract.py first to create init.h5."
+    )
+if _ny_disk != _nx_disk:
+    raise SystemExit(
+        f"step1: init.h5 is not square in xy: shape=({_nz_disk},{_ny_disk},{_nx_disk})")
+
+IN_NZ  = _A.in_nz if _A.in_nz is not None else _nz_disk
+IN_NYX = _A.in_n  if _A.in_n  is not None else _ny_disk
+if IN_NZ != _nz_disk or IN_NYX != _ny_disk:
+    raise SystemExit(
+        f"step1: --in-nz/--in-n disagrees with init.h5:\n"
+        f"  init.h5 shape = ({_nz_disk}, {_ny_disk}, {_nx_disk})\n"
+        f"  CLI          = (--in-nz={IN_NZ}, --in-n={IN_NYX})\n"
+        f"  remove --in-nz/--in-n to auto-detect, or match the file.")
+
 OUT_NZ  = IN_NZ  * UPS
 OUT_NYX = IN_NYX * UPS
 N_READ  = _A.n_read

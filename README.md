@@ -60,7 +60,9 @@ mosaic_modeling/
 ├── step2_radon_large.py            big → proj.h5     (host-chunked TomoLarge)
 ├── step3_fresnel.py                proj → data.h5    (shared regardless of variant)
 ├── step4_extract.py                data.h5 → mosaic_h5/{z}_{x}.h5
-├── test_h5_buffer_io.py            I/O benchmark
+├── tests/
+│   ├── test_h5_buffer_io.py        I/O benchmark
+│   └── test_large_variants.py      TomoLarge/PropagationLarge parity tests
 └── {tomo,polaris}_{run,test_h5}.sh launchers
 ```
 
@@ -75,7 +77,7 @@ alloc_shm`, etc.
 
 Every large dataset is written as a **top-level Virtual DataSet (VDS)
 master file + N per-super-chunk bank files** (the pattern from
-[test_h5_buffer_io.py](test_h5_buffer_io.py), which itself adapts the
+[tests/test_h5_buffer_io.py](tests/test_h5_buffer_io.py), which itself adapts the
 [doe-maxiv](https://gitlab.com/tomograms/doe-maxiv) `tomo_writex` scheme).
 
 For a dataset written with `--nbanks N` and vchunk shape `(C0, C1, C2)`:
@@ -401,7 +403,7 @@ float32, skip it.
 
 ## I/O benchmark
 
-[test_h5_buffer_io.py](test_h5_buffer_io.py) exercises the same
+[tests/test_h5_buffer_io.py](tests/test_h5_buffer_io.py) exercises the same
 VDS+banks + `tomo_writex` path the pipeline uses, without any compute,
 across three stages (seed, upsample-shaped, radon-shaped, fresnel-shaped).
 Useful for tuning `nbanks` / `vchunks` on a new machine.

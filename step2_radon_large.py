@@ -2,19 +2,25 @@
 """Radon projections — host-chunked variant of step2_radon.py.
 
 Same output format (VDS + banks proj.h5) but uses the host-chunked
-TomoLarge implementation from tomo_large.py: the big (nz, 2N, 2N) `fde`
-and (nz, ntheta, N) `sino` buffers live on the HOST, and small pieces
-are staged through the GPU.  Peak GPU memory becomes proportional to
---chunk-n/--chunk-theta/--chunk-xy, not to (2N)², so much larger N
-can be modelled on a 40 GB GPU.
+TomoLargeReal implementation from tomo_large.py: the big (nz, 2N, N+1)
+`fde` and (nz, ntheta, N) `sino` buffers live on the HOST (pinned), and
+small pieces are staged through the GPU.  Peak GPU memory becomes
+proportional to --chunk-n/--chunk-theta/--chunk-xy, not to (2N)², so
+much larger N can be modelled on a 40 GB GPU.
 
-Chunk sizes passed to TomoLarge.R must divide the sizes they slice into:
+TomoLargeReal uses rfft/float32 throughout — half the host fde memory
+of the complex64 TomoLarge path, half the x-FFT bandwidth, and no
+complex↔real wrapping at the boundaries.
+
+Chunk sizes passed to TomoLargeReal.R must divide the sizes they slice into:
   --chunk-n     divides N and 2N
   --chunk-theta divides NTHETA
   --chunk-xy    divides 2N
 
-Defaults 686 / 343 / 686 are divisors of 2744 and 2058, so they work for
-any integer --ups ≥ 1.
+Defaults are auto-picked by processing/chunk_pick.pick_tomo_chunks() to
+fit within --gpu-budget-gb / 10 per stage (headroom for cuFFT plans +
+pool fragmentation).  At the current N=4096·UPS geometry every N and 2N
+factor is a pure power of 2, so cuFFT stays on its fast radix-2 path.
 
 Launch:
     mpirun -n <NGPU> set_affinity_gpu.sh python step2_radon_large.py \\
@@ -30,7 +36,7 @@ import h5py
 import numpy as np
 import cupy as cp
 
-from processing.tomo_large import TomoLarge
+from processing.tomo_large import TomoLargeReal
 from iohdf5.dxchange_hdf5_chunks import tomo_writex
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
@@ -44,18 +50,22 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ups",  type=int, default=8)
     p.add_argument("--path", default="/data2/brain_sym_mosaic")
-    p.add_argument("--in-nz",  type=int, default=2560)
-    p.add_argument("--in-n",   type=int, default=2744)
+    p.add_argument("--in-nz",  type=int, default=3072)
+    p.add_argument("--in-n",   type=int, default=3072)
     p.add_argument("--ntheta", type=int, default=None,
                    help="angles over 360°; default = 3·N/4")
     p.add_argument("--nzchunk", type=int, default=1,
                    help="z-slices per Radon call")
     p.add_argument("--chunk-n",     type=int, default=0,
-                   help="x/y FFT strip width;  0 = auto (largest divisor of N   ≤ CHUNK_CAP_N)")
+                   help="x/y FFT strip width;  0 = auto from --gpu-budget-gb")
     p.add_argument("--chunk-theta", type=int, default=0,
-                   help="angle batch for r-IFFT; 0 = auto (largest divisor of NTHETA ≤ CHUNK_CAP_THETA)")
+                   help="angle batch for r-IFFT; 0 = auto from --gpu-budget-gb")
     p.add_argument("--chunk-xy",    type=int, default=0,
-                   help="NUFFT gather bin edge; 0 = auto (largest divisor of 2N   ≤ CHUNK_CAP_N)")
+                   help="NUFFT gather bin edge; 0 = auto from --gpu-budget-gb")
+    p.add_argument("--gpu-budget-gb", type=float, default=30.0,
+                   help="target GPU memory for chunk-picker (default 30 GB, "
+                        "leaves headroom on a 40 GB A100 for cuFFT plans + "
+                        "transient allocations across pipeline stages)")
     p.add_argument("--nbanks", type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
     p.add_argument("--proj-vchunks", type=int, nargs=3, default=None,
@@ -80,27 +90,18 @@ ROTATION_AXIS = N / 2
 
 NZCHUNK     = _A.nzchunk
 
-# Auto-chunk caps.  Tuned so that at UPS=8 (N=21952, NTHETA=16464) the
-# picks are 686 / 343 / 686 (the values originally hand-tuned for a
-# 40 GB A100); for smaller N/NTHETA the picker returns the largest
-# divisor of the axis that stays under the cap, so the GPU stages
-# never overshoot the memory budget and the FFT/gather loops never
-# silently drop a tail.
-CHUNK_CAP_N     = 700
-CHUNK_CAP_THETA = 350
+# Auto-picked chunks are sized so each GPU stage (x-FFT / y-FFT / gather
+# / IFFT) fits within budget/10 live bytes — the 10× headroom accounts
+# for cuFFT plan workspace, padding intermediates, and pool fragmentation
+# across stages.  See processing/chunk_pick.py for the exact formulas.
+from processing.chunk_pick import pick_tomo_chunks
 
-
-def _largest_divisor_le(n: int, cap: int) -> int:
-    """Largest positive divisor of n that is ≤ cap.  Falls back to 1."""
-    d = int(min(cap, n))
-    while d > 1 and n % d:
-        d -= 1
-    return d
-
-
-CHUNK_N     = _A.chunk_n     or _largest_divisor_le(N,     CHUNK_CAP_N)
-CHUNK_XY    = _A.chunk_xy    or _largest_divisor_le(2 * N, CHUNK_CAP_N)
-CHUNK_THETA = _A.chunk_theta or _largest_divisor_le(NTHETA, CHUNK_CAP_THETA)
+_auto_n, _auto_theta, _auto_xy = pick_tomo_chunks(
+    n=N, ntheta=NTHETA, nz=NZCHUNK,
+    gpu_budget_bytes=int(_A.gpu_budget_gb * 1e9))
+CHUNK_N     = _A.chunk_n     or _auto_n
+CHUNK_XY    = _A.chunk_xy    or _auto_xy
+CHUNK_THETA = _A.chunk_theta or _auto_theta
 NBANKS      = _A.nbanks
 PROJ_VCHUNKS = tuple(_A.proj_vchunks) if _A.proj_vchunks else (NTHETA, 8 * NZCHUNK, N)
 
@@ -117,13 +118,14 @@ def _validate_chunks() -> None:
         raise SystemExit("chunk-size problems:\n  " + "\n  ".join(problems))
 
 
-def load_chunk(src_dset, z_start: int, z_end: int) -> np.ndarray:
-    """(k, N, N) complex64 host array (imag=0) for TomoLarge input."""
-    k = z_end - z_start
-    buf = np.empty((k, N, N), dtype=np.complex64)
-    buf.real = src_dset[z_start:z_end, :, :]
-    buf.imag = 0
-    return buf
+def load_chunk_into(src_dset, dst: np.ndarray, z_start: int, z_end: int) -> None:
+    """Read src_dset[z_start:z_end] straight into the first (z_end-z_start)
+    rows of `dst` (a pinned float32 buffer owned by TomoLargeReal).  Skips
+    the fresh (k, N, N) allocation that `astype(np.float32, copy=False)`
+    would trigger when the on-disk dtype ≠ float32."""
+    kz = z_end - z_start
+    src_dset.read_direct(dst, source_sel=np.s_[z_start:z_end, :, :],
+                         dest_sel=np.s_[:kz, :, :])
 
 
 def main() -> None:
@@ -152,8 +154,10 @@ def main() -> None:
     barrier()
     rprint(f"UPS={UPS}  nz={NZ} n={N} ntheta={NTHETA} nzchunk={NZCHUNK}")
     rprint(f"chunks: CHUNK_N={CHUNK_N}  CHUNK_THETA={CHUNK_THETA}  CHUNK_XY={CHUNK_XY}")
-    fde_gb  = NZCHUNK * (2*N)**2 * 8 / 1e9
-    sino_gb = NZCHUNK * NTHETA * N * 8 / 1e9
+    # TomoLargeReal buffers: fde is rfft-half (2N × (N+1)) c64, and
+    # sino_real is a f32 view of sino_c's memory (no extra allocation).
+    fde_gb  = NZCHUNK * (2*N) * (N + 1) * 8 / 1e9
+    sino_gb = NTHETA * NZCHUNK * N * 8 / 1e9
     rprint(f"HOST est. per R call: fde≈{fde_gb:.1f} GB, sino≈{sino_gb:.2f} GB")
 
     if RANK == 0:
@@ -179,13 +183,19 @@ def main() -> None:
     proj_min, proj_max = np.inf, -np.inf
     chunks_arg = [CHUNK_N, CHUNK_THETA, CHUNK_XY]
 
-    rprint("building TomoLarge...")
-    cl_tomo = TomoLarge(N, theta_rad, ROTATION_AXIS)
-    rprint("TomoLarge ready.")
+    rprint("building TomoLargeReal...")
+    cl_tomo = TomoLargeReal(N, theta_rad, ROTATION_AXIS)
+    rprint("TomoLargeReal ready.")
 
     ivchunks = list(iter_vchunks((NTHETA, NZ, N), PROJ_VCHUNKS))
     my_ivchunks = ivchunks[RANK::SIZE]
     shm, buf = alloc_shm(PROJ_VCHUNKS, np.float32)
+
+    # Pinned obj input, allocated once and reused across all iterations.
+    # h5py reads straight into it; last (kz < NZCHUNK) chunk keeps the
+    # tail zero-padded by a one-time fill below.
+    obj_pinned = cl_tomo.obj_buffer(NZCHUNK)
+    obj_pinned.fill(0)
 
     try:
         with h5py.File(SRC_H5, "r") as fsrc:
@@ -202,20 +212,19 @@ def main() -> None:
                     kz = z1 - z0
 
                     t0 = time.perf_counter()
-                    chunk_h = load_chunk(src_dset, z0, z1)
+                    load_chunk_into(src_dset, obj_pinned, z0, z1)
                     if kz < NZCHUNK:
-                        pad = np.zeros((NZCHUNK, N, N), dtype=np.complex64)
-                        pad[:kz] = chunk_h
-                        chunk_h = pad
+                        obj_pinned[kz:].fill(0)
                     t_read += time.perf_counter() - t0
                     b_read += kz * N * N * 4    # source is float32 on disk
 
                     t0 = time.perf_counter()
-                    res_h = cl_tomo.R(chunk_h, chunks_arg)
-                    del chunk_h
-                    proj_chunk_h = res_h[:, :kz].real.astype(
-                        np.float32, copy=False)
-                    del res_h
+                    # TomoLargeReal.R returns a (NTHETA, NZCHUNK, N) float32
+                    # VIEW into the class's pinned sino buffer — valid until
+                    # the next R() call.  We copy out via buf[...]= below,
+                    # so the view lifetime doesn't leak past this iteration.
+                    res_h = cl_tomo.R(obj_pinned, chunks_arg)
+                    proj_chunk_h = res_h[:, :kz]
                     t_radon += time.perf_counter() - t0
 
                     buf[:, z0 - z0_vc : z1 - z0_vc, :] = proj_chunk_h
@@ -234,6 +243,7 @@ def main() -> None:
                       f"write={t_write:.1f}s)", flush=True)
     finally:
         free_shm(shm)
+        cl_tomo.free()           # return cached pinned/GPU buffers to pools
         del cl_tomo
         cp.get_default_memory_pool().free_all_blocks()
     barrier()

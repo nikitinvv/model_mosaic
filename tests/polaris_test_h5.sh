@@ -29,10 +29,10 @@ PATH_DATA=/eagle/APS_IRI/vnikitin/iotest_buf_ups${UPS}_mpi
 NBANKS=4
 NTASKS=4
 
-INIT_VCHUNKS="32 2744 2744"
-BIG_VCHUNKS="$((32*UPS)) $((2744*UPS)) $((2744*UPS))"
-PROJ_VCHUNKS="128 $((2560*UPS)) $((2744*UPS))"
-DATA_VCHUNKS="128 $((2560*UPS)) $((2744*UPS))"
+INIT_VCHUNKS="32 4096 4096"
+BIG_VCHUNKS="$((32*UPS)) $((4096*UPS)) $((4096*UPS))"
+PROJ_VCHUNKS="128 $((4096*UPS)) $((4096*UPS))"
+DATA_VCHUNKS="128 $((4096*UPS)) $((4096*UPS))"
 # ================================================
 
 NNODES=$(wc -l < "$PBS_NODEFILE")
