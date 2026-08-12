@@ -90,9 +90,13 @@ SAMPLE_H_PX   = 2972 * UPS
 SAMPLE_D_MM   = SAMPLE_D_PX * VOXEL_UM * 1e-3          # ≈ 32.2 mm
 SAMPLE_H_MM   = SAMPLE_H_PX * VOXEL_UM * 1e-3          # ≈ 32.8 mm
 
-# Nyquist-scaled angle count (matches step2_radon.py: NTHETA = 3·N/4).
+# Angle counts.  Tomography (step2/step3) samples 180° with N_HALF = 3·N/4
+# angles (Nyquist-scaled).  step4 fabricates a 360° tile-scan from
+# data.h5's mirror crop, so each tile file carries NTHETA = 2·N_HALF =
+# 3·N/2 frames over the full 360°.
 _N_PIPELINE       = 3072 * UPS
-NTHETA            = 3 * _N_PIPELINE // 4
+N_HALF            = 3 * _N_PIPELINE // 4
+NTHETA            = 2 * N_HALF
 MAX_DRAWN_SPOKES  = 64
 ANG_MAX           = 360
 
@@ -144,7 +148,105 @@ def compute_z_stack(sample_h_px: float):
     return positions, overshoot
 
 
+def compute_tile_placements(NZ: int, N: int,
+                            det_h: int, det_w: int,
+                            z_pad: int,
+                            x_origins, z_positions):
+    """Per-tile direct placement in big-projection pixel coords.
+
+    Detector footprint of tile (zi, xi) is (det_h, det_w) centered at
+    (z_center, x_center) — the DIRECT placement (angles [0°, 180°)).
+    crop_{top,bottom,left,right} trim the parts of that footprint that
+    fall outside [0, NZ) x [0, N).
+
+    The MIRROR placement (used for angles [180°, 360°) via the
+    parallel-beam identity proj(θ, x) = proj(θ+π, N-1-x)) is derived
+    from the direct one at read time — it has the same z_center and
+    x_center_mir = N - x_center; z-crops are shared, x-crops swap
+    under the h-flip.  We don't store it in the txt file because it
+    carries no independent information.
+
+    z_pad shifts schematic-z (sample-top origin) to big-projection row 0;
+    N/2 shifts schematic-x (rotation-axis origin) to big-projection col 0.
+    """
+    placements = []
+    for zi, zpos in enumerate(z_positions):
+        z_start_full = int(round(zpos)) + z_pad
+        z_center     = z_start_full + det_h // 2
+        crop_top     = max(0, -z_start_full)
+        crop_bottom  = max(0, z_start_full + det_h - NZ)
+        for xi, xorg in enumerate(x_origins):
+            x_start_full = int(round(xorg)) + N // 2
+            x_center     = x_start_full + det_w // 2
+            crop_left    = max(0, -x_start_full)
+            crop_right   = max(0, x_start_full + det_w - N)
+            placements.append(dict(
+                zi=zi, xi=xi,
+                z_center=z_center, x_center=x_center,
+                crop_top=crop_top, crop_bottom=crop_bottom,
+                crop_left=crop_left, crop_right=crop_right,
+            ))
+    return placements
+
+
+def write_positions_file(path: str, NZ: int, N: int, det_h: int, det_w: int,
+                         n_z: int, n_x: int, ntheta: int, overlap: int,
+                         placements) -> None:
+    """Write mosaic_positions{UPS}.txt in the schema step4/step5 consume.
+
+    Machine-parseable header line carries big-proj dims, tile shape,
+    NTHETA (tile files' 360° angle count), N_HALF (= NTHETA//2, the
+    180° tomo angle count in data.h5), and OVERLAP (used by step5 as
+    the tent-weight cap).  One row per tile with 8 int columns —
+    only the DIRECT placement is stored; the mirror is derived at read
+    time (same z_center; x_center_mir = N - x_center; z-crops shared;
+    x-crops swap under the h-flip).
+    """
+    n_half = ntheta // 2
+    header = (
+        "Mosaic tile positions.\n"
+        f"NZ={NZ} N={N} DET_H={det_h} DET_W={det_w} "
+        f"n_z={n_z} n_x={n_x} NTHETA={ntheta} N_HALF={n_half} "
+        f"OVERLAP={overlap}\n"
+        "\n"
+        "One row per tile — DIRECT placement only.  Mirror placement is\n"
+        "derived: same z_center; x_center_mir = N - x_center; z-crops\n"
+        "shared; x-crops swap under the h-flip.\n"
+        "\n"
+        "step4_extract crops tile data from the DIRECT footprint in data.h5\n"
+        "and fabricates a 360° tile scan (NTHETA frames): the first N_HALF\n"
+        "are the direct crop; the second N_HALF are the mirror crop with an\n"
+        "h-flip, per proj(θ, x) = proj(θ+π, N-1-x).\n"
+        "\n"
+        "step6_stitch reduces back to a 180° big projection of shape\n"
+        "(N_HALF, NZ, N):\n"
+        "  for each output θ in [0, N_HALF):\n"
+        "    place tile[θ]              at (z_center, x_center)      no flip\n"
+        "    place tile[θ + N_HALF][:, :, ::-1] at (z_center, N - x_center)\n"
+        "\n"
+        f"Stored tile shape = ({det_h}-crop_top-crop_bottom, "
+        f"{det_w}-crop_left-crop_right).\n"
+        "In big projection, direct tile occupies:\n"
+        f"  rows [z_center - {det_h}/2 + crop_top,  "
+        f"z_center + {det_h}/2 - crop_bottom)\n"
+        f"  cols [x_center - {det_w}/2 + crop_left, "
+        f"x_center + {det_w}/2 - crop_right)\n"
+        "\n"
+        "columns: z_tile x_tile z_center x_center "
+        "crop_top crop_bottom crop_left crop_right"
+    )
+    rows = np.array([
+        [p["zi"], p["xi"],
+         p["z_center"], p["x_center"],
+         p["crop_top"], p["crop_bottom"], p["crop_left"], p["crop_right"]]
+        for p in placements
+    ], dtype=np.int64)
+    np.savetxt(path, rows, fmt="%d", header=header)
+
+
 def main() -> None:
+    from mpi_utils import banner
+    banner("0", "plan mosaic tile layout — schematic PNG + mosaic_positions.txt")
     sample_r_px = mm_to_px(SAMPLE_D_MM) / 2.0
     sample_h_px = mm_to_px(SAMPLE_H_MM)
 
@@ -192,20 +294,30 @@ def main() -> None:
     print(f"angles          : {NTHETA} over {ANG_MAX}°")
     print(f"TOTAL PROJ.     : {NTHETA} × {n_tiles} × {n_z} = {total_proj}")
 
-    # Outputs go to mosaic_modeling/drawings/ (next to this script), no
+    # Outputs split by file type: positions text file lives in
+    # mosaic_modeling/mosaic_positions/ (a single-purpose folder shared with
+    # step4/step5), schematic PNG stays in mosaic_modeling/drawings/
+    # alongside the other figure-generation scripts.  No
     # matter where the user launched python from — so drawing scripts
     # and their PNG/txt artifacts stay side by side.
     _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     _DRAW_DIR   = os.path.join(_SCRIPT_DIR, "drawings")
+    _POS_DIR    = os.path.join(_SCRIPT_DIR, "mosaic_positions")
     os.makedirs(_DRAW_DIR, exist_ok=True)
-    positions_path = os.path.join(_DRAW_DIR, f"mosaic_positions{UPS}.txt")
-    np.savetxt(
-        positions_path,
-        origins.astype(int), fmt="%d",
-        header=(f"x tile origins (detector px).  axis={int(x_axis)}, "
-                f"tile={DET_W}, overlap={OVERLAP}, axis_inset={AXIS_INSET}, "
-                f"z stacks={n_z}, sample ⌀{SAMPLE_D_MM:.2f} mm"),
-    )
+    os.makedirs(_POS_DIR,  exist_ok=True)
+    positions_path = os.path.join(_POS_DIR, f"mosaic_positions{UPS}.txt")
+    # Big-projection dims match step2/step3 (--in-nz/--in-n default 3072 · UPS).
+    # z_pad = (NZ - SAMPLE_H_PX)/2 matches step4's derivation of the same offset.
+    _NZ = _N = 3072 * UPS
+    _z_pad = (_NZ - SAMPLE_H_PX) // 2
+    placements = compute_tile_placements(_NZ, _N,
+                                         det_h=DET_H, det_w=DET_W,
+                                         z_pad=_z_pad,
+                                         x_origins=origins,
+                                         z_positions=z_positions)
+    write_positions_file(positions_path, _NZ, _N, DET_H, DET_W,
+                         n_z, n_tiles, ntheta=NTHETA, overlap=OVERLAP,
+                         placements=placements)
 
     # ============ figure ============
     fig, (axL, axM, axR) = plt.subplots(1, 3, figsize=(20, 8),
@@ -216,7 +328,9 @@ def main() -> None:
 
     # --------- LEFT: full physical view (mm) ----------
     axL.set_aspect("equal")
-    x_lo_mm = -SAMPLE_D_MM / 2 - 3.0
+    # Include mirror tiles (reflected about x=0) in the frame.
+    _mirror_lo_mm = -px_to_mm(origins[-1] + DET_W)
+    x_lo_mm = min(-SAMPLE_D_MM / 2, _mirror_lo_mm) - 3.0
     x_hi_mm = px_to_mm(origins[-1] + DET_W) + 3.0
     y_lim   = SAMPLE_D_MM / 2 + 4.0
     axL.set_xlim(x_lo_mm, x_hi_mm)
@@ -227,7 +341,9 @@ def main() -> None:
         f"360° extended-FOV mosaic — {n_tiles} x-tiles × {n_z} z-stacks × {NTHETA} angles\n"
         f"detector {DET_W}×{DET_H} px @ {PIXEL_UM} µm  |  "
         f"voxel = det.pixel = {VOXEL_UM} µm  |  "
-        f"overlap {OVERLAP} px = {px_to_mm(OVERLAP)*1e3:.0f} µm"
+        f"overlap {OVERLAP} px = {px_to_mm(OVERLAP)*1e3:.0f} µm\n"
+        f"solid = direct placement (angles [0°,180°));  "
+        f"dashed = mirror placement (angles [180°,360°) via h-flip)"
     )
 
     # Full sample cross-section (cylinder → circle in xy plane)
@@ -239,20 +355,34 @@ def main() -> None:
              ha="center", color="tab:red", fontsize=10)
 
     # Detector tiles at mid-z, drawn as thin horizontal bars because
-    # DET_H (3.4 mm) is much smaller than sample height/diameter
+    # DET_H (3.4 mm) is much smaller than sample height/diameter.
+    # Solid = direct placement (angles [0°, 180°)); dashed = mirror
+    # placement used by step5 for angles [180°, 360°) via the parallel-
+    # beam identity proj(θ, x) = proj(θ+π, N-1-x).
     y_tile_mm = -px_to_mm(DET_H) / 2
     tile_h_mm = px_to_mm(DET_H)
+    w_mm      = px_to_mm(DET_W)
     for i, (x0, col) in enumerate(zip(origins, tile_colors)):
         x0_mm = px_to_mm(x0)
-        w_mm  = px_to_mm(DET_W)
+        # Direct placement (solid, filled).
         axL.add_patch(Rectangle((x0_mm, y_tile_mm), w_mm, tile_h_mm,
                                 facecolor=col, alpha=0.35,
                                 edgecolor=col, lw=1.4))
         axL.text(x0_mm + w_mm / 2, y_tile_mm + tile_h_mm / 2, f"{i}",
                  ha="center", va="center", fontsize=16, color=col,
                  fontweight="bold")
+        # Mirror placement (dashed outline, no fill) at the reflection
+        # of the direct footprint across the rotation axis.
+        mx0_mm = -x0_mm - w_mm
+        axL.add_patch(Rectangle((mx0_mm, y_tile_mm), w_mm, tile_h_mm,
+                                facecolor="none",
+                                edgecolor=col, lw=1.2, linestyle="--"))
+        axL.text(mx0_mm + w_mm / 2, y_tile_mm + tile_h_mm / 2, f"{i}'",
+                 ha="center", va="center", fontsize=13, color=col,
+                 fontweight="bold", alpha=0.85)
 
-    # Overlap bands (physical x-overlap)
+    # Overlap bands (physical x-overlap) — direct side only; the mirror
+    # side mirrors these bands and is left visually implicit.
     for i in range(n_tiles - 1):
         x_b = px_to_mm(origins[i + 1])
         band_w = px_to_mm(origins[i] + DET_W) - x_b

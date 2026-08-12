@@ -4,7 +4,7 @@
 Reads {path}/model_big{UPS}x/proj.h5 (VDS + banks from step2_radon.py or
 step2_radon_large.py) and writes {path}/model_big{UPS}x/data.h5.
 
-For each --data-vchunks super-chunk (θ_super, NZ, N) this rank owns:
+For each --vchunks super-chunk (θ_super, NZ, N) this rank owns:
   1. Read the θ-slab from proj.h5 via VDS (one big read).
   2. Loop NPROPCHUNK θ-batches through the Fresnel pipeline:
          psi  = exp(1j·(proj/NORM_CONST + 1j·(proj/(NORM_CONST·BETA_RATIO))))
@@ -12,7 +12,7 @@ For each --data-vchunks super-chunk (θ_super, NZ, N) this rank owns:
   3. tomo_writex fans the vchunk buffer to disk across --nbanks writers.
 
 Multi-GPU via MPI + set_affinity_gpu.sh.  Launch:
-    mpirun -n <NGPU> set_affinity_gpu.sh python step3_fresnel.py \\
+    mpirun -n <NGPU> set_affinity_gpu.sh python step3_propagation.py \\
         --ups 2 --path /data2/brain_sym_mosaic
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
 )
-from utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
+from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
 def _parse_args() -> argparse.Namespace:
@@ -42,10 +42,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
                    help="base dir; reads {path}/model_big{UPS}x/proj.h5, "
                         "writes {path}/model_big{UPS}x/data.h5")
-    p.add_argument("--in-nz",  type=int, default=3072, help="init nz (before UPS)")
-    p.add_argument("--in-n",   type=int, default=3072, help="init N  (before UPS)")
     p.add_argument("--ntheta", type=int, default=None,
-                   help="angles over 360°; default = 3·N/4")
+                   help="angles over 180°; default = 3·N/4")
     p.add_argument("--beta-ratio", type=float, default=100.0,
                    help="weak absorption: β = phase/beta_ratio")
     p.add_argument("--phase-scale", type=float, default=1.0,
@@ -53,13 +51,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--energy",    type=float, default=30.0, help="keV")
     p.add_argument("--voxelsize", type=float, default=1.38e-6,
                    help="voxel = detector pixel, meters (parallel beam)")
-    p.add_argument("--distance",  type=float, default=1.0,
+    p.add_argument("--distance",  type=float, default=0.2,
                    help="sample → detector distance, meters")
     p.add_argument("--npropchunk", type=int, default=8,
                    help="angles per Fresnel batch")
     p.add_argument("--nbanks",     type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
-    p.add_argument("--data-vchunks", type=int, nargs=3, default=None,
+    p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk for data.h5 (default: 8·NPROPCHUNK, NZ, N)")
     return p.parse_args()
@@ -73,8 +71,9 @@ DST_DIR  = f"{BASE_DIR}/model_big{UPS}x"
 PROJ_H5  = f"{DST_DIR}/proj.h5"
 DATA_H5  = f"{DST_DIR}/data.h5"
 
-NZ         = _A.in_nz * UPS
-N          = _A.in_n  * UPS
+IN_NZ = IN_N = 3072            # init.h5 dims after step00; UPS scales from here
+NZ    = IN_NZ * UPS
+N     = IN_N  * UPS
 NTHETA     = _A.ntheta if _A.ntheta is not None else 3 * N // 4
 BETA_RATIO = _A.beta_ratio
 PHASE_SCALE = _A.phase_scale
@@ -86,7 +85,7 @@ DISTANCE   = _A.distance
 
 NPROPCHUNK = _A.npropchunk
 NBANKS      = _A.nbanks
-DATA_VCHUNKS = tuple(_A.data_vchunks) if _A.data_vchunks else (8 * NPROPCHUNK, NZ, N)
+VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8 * NPROPCHUNK, NZ, N)
 
 
 _psi_from_proj = cp.ElementwiseKernel(
@@ -109,14 +108,14 @@ _abs2_c64_to_f32 = cp.ElementwiseKernel(
 
 
 def main() -> None:
-    if DATA_VCHUNKS[0] % NPROPCHUNK != 0:
+    if VCHUNKS[0] % NPROPCHUNK != 0:
         raise SystemExit(
-            f"--data-vchunks C0={DATA_VCHUNKS[0]} must be a multiple of "
+            f"--vchunks C0={VCHUNKS[0]} must be a multiple of "
             f"--npropchunk={NPROPCHUNK}.")
-    if DATA_VCHUNKS[1] != NZ or DATA_VCHUNKS[2] != N:
+    if VCHUNKS[1] != NZ or VCHUNKS[2] != N:
         raise SystemExit(
-            f"--data-vchunks C1×C2 must equal NZ×N ({NZ}×{N}).  "
-            f"Got {DATA_VCHUNKS[1]}×{DATA_VCHUNKS[2]}.")
+            f"--vchunks C1×C2 must equal NZ×N ({NZ}×{N}).  "
+            f"Got {VCHUNKS[1]}×{VCHUNKS[2]}.")
 
     if RANK == 0:
         os.makedirs(DST_DIR, exist_ok=True)
@@ -153,10 +152,10 @@ def main() -> None:
     if RANK == 0:
         describe_input(PROJ_H5)
         describe_output(DATA_H5, (NTHETA, NZ, N), np.float32,
-                        DATA_VCHUNKS, "proj", NBANKS)
+                        VCHUNKS, "proj", NBANKS)
 
     ctx = initx_and_bcast(DATA_H5, shape=(NTHETA, NZ, N),
-                          dtype=np.float32, vchunks=DATA_VCHUNKS,
+                          dtype=np.float32, vchunks=VCHUNKS,
                           stype="proj", nbanks=NBANKS,
                           rank=RANK, comm=COMM)
     if RANK == 0:
@@ -166,9 +165,9 @@ def main() -> None:
             f["exchange"].create_dataset("theta", data=theta_deg)
     barrier()
 
-    buf_gb = vchunk_bytes(DATA_VCHUNKS, np.float32) / 1e9
+    buf_gb = vchunk_bytes(VCHUNKS, np.float32) / 1e9
     rprint(f"per-rank shm buffer={buf_gb:.2f} GB   "
-           f"nvchunks={n_vchunks((NTHETA, NZ, N), DATA_VCHUNKS)}")
+           f"nvchunks={n_vchunks((NTHETA, NZ, N), VCHUNKS)}")
 
     cl_prop = Propagation(N, NZ, NPROPCHUNK, 1,
                           wavelength, VOXELSIZE, [DISTANCE])
@@ -183,17 +182,17 @@ def main() -> None:
     t_read = t_prop = t_write = 0.0
     b_read = b_write = 0
 
-    ivchunks = list(iter_vchunks((NTHETA, NZ, N), DATA_VCHUNKS))
+    ivchunks = list(iter_vchunks((NTHETA, NZ, N), VCHUNKS))
     my_ivchunks = ivchunks[RANK::SIZE]
-    shm, buf = alloc_shm(DATA_VCHUNKS, np.float32)
+    shm, buf = alloc_shm(VCHUNKS, np.float32)
 
     try:
         with h5py.File(PROJ_H5, "r") as fp:
             proj_dset = fp["exchange/data"]
 
             for k, ivc in enumerate(my_ivchunks, start=1):
-                t0_vc = ivc[0] * DATA_VCHUNKS[0]
-                t1_vc = min(t0_vc + DATA_VCHUNKS[0], NTHETA)
+                t0_vc = ivc[0] * VCHUNKS[0]
+                t1_vc = min(t0_vc + VCHUNKS[0], NTHETA)
                 buf.fill(0)
 
                 t0 = time.perf_counter()
@@ -259,5 +258,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    from utils import run_main
+    from mpi_utils import run_main
     run_main(main)

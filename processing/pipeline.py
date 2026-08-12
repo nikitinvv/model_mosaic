@@ -59,6 +59,36 @@ def alloc_pinned(shape, dtype):
     return np.frombuffer(mem, dtp, n).reshape(shape)
 
 
+# Cap on bytes per single `cudaHostAlloc` call.  Empirically 32 GiB is
+# safely under the per-call limits seen on Linux boxes here (some
+# systems cap around 64–128 GiB per call, some much lower under memory
+# pressure).  BandedPinned splits requests larger than this across
+# multiple allocations; callers using pick_n_bands get the min number
+# of bands that keeps each alloc under the cap.
+MAX_PINNED_BAND_BYTES = 32 * (1 << 30)
+
+
+def pick_n_bands(shape, dtype, band_axis=1, min_bands=1,
+                 max_band_bytes=MAX_PINNED_BAND_BYTES):
+    """Pick a band count so each BandedPinned band stays under
+    ``max_band_bytes`` while dividing ``shape[band_axis]`` evenly.
+
+    Returns at least ``min_bands`` (typical callers pass their old
+    fixed count so the divisor upgrade is monotone — small problems
+    keep the historical fanout, large problems get more).  If no
+    divisor of ``shape[band_axis]`` satisfies the cap, returns
+    ``shape[band_axis]`` (one row per band, worst-case).
+    """
+    axis_len = int(shape[band_axis])
+    nbytes   = int(np.prod(shape)) * np.dtype(dtype).itemsize
+    n_min    = max(min_bands,
+                   (nbytes + max_band_bytes - 1) // max_band_bytes)
+    for n in range(int(n_min), axis_len + 1):
+        if axis_len % n == 0:
+            return n
+    return axis_len
+
+
 class BandedPinned:
     """A logical (shape, dtype) array split across `n_bands` separate
     pinned-host allocations along `band_axis` — used when a single
@@ -333,7 +363,7 @@ class ComputeD2HPipe:
     """2-stage (compute ‖ D2H) pipeline for loops whose input is already
     GPU-resident (or trivially produced) — no H2D stage.
 
-    Use case: TomoLarge's gather over z-slices.  For each zc the same
+    Use case: TomoLargeReal's gather over z-slices.  For each zc the same
     (fde_d, x0, y0) inputs are reused (uploaded once per bin outside
     the loop), the kernel writes into a small output buffer, and we
     D2H that buffer to pinned host then scatter into the host sino

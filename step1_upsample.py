@@ -11,7 +11,7 @@ Method: bilinear xy + linear z blend (trilinear, separable).  For each
 input z, a background thread prefetches the next input plane while the
 GPU upsamples in xy and blends UPS output planes between the current pair.
 
-Each rank owns a subset of super-chunks (--big-vchunks) round-robin
+Each rank owns a subset of super-chunks (--vchunks) round-robin
 across ranks, fills a shared-memory buffer of that shape by looping
 compute over its input z-range, then tomo_writex fans the buffer across
 --nbanks bank files.  Reads of init.h5 go through its VDS master via
@@ -39,7 +39,7 @@ from iohdf5.h5_vchunks import (
     describe_input, describe_output,
     vchunk_bytes,
 )
-from utils import COMM, RANK, SIZE, barrier, rprint, report_stage
+from mpi_utils import COMM, RANK, SIZE, barrier, rprint, report_stage
 
 
 # --------------------- CLI -----------------------------------------------
@@ -61,7 +61,7 @@ def _parse_args() -> argparse.Namespace:
                    help="background input prefetchers per rank")
     p.add_argument("--nbanks",  type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
-    p.add_argument("--big-vchunks", type=int, nargs=3, default=None,
+    p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk shape for big{UPS}x.h5 (default: "
                         "8·UPS, OUT_NYX, OUT_NYX; RAM buffer = C0·C1·C2·4 bytes)")
@@ -107,7 +107,7 @@ OUT_NZ  = IN_NZ  * UPS
 OUT_NYX = IN_NYX * UPS
 N_READ  = _A.n_read
 NBANKS  = _A.nbanks
-BIG_VCHUNKS = tuple(_A.big_vchunks) if _A.big_vchunks else (8 * UPS, OUT_NYX, OUT_NYX)
+VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8 * UPS, OUT_NYX, OUT_NYX)
 
 
 # --------------------- GPU backend ---------------------------------------
@@ -140,22 +140,22 @@ def _blend_and_pull(up_curr_d, up_next_d, r: int) -> np.ndarray:
 
 # --------------------- main -----------------------------------------------
 def main() -> None:
-    if BIG_VCHUNKS[0] % UPS != 0:
+    if VCHUNKS[0] % UPS != 0:
         raise SystemExit(
-            f"--big-vchunks C0={BIG_VCHUNKS[0]} must be a multiple of "
+            f"--vchunks C0={VCHUNKS[0]} must be a multiple of "
             f"UPS={UPS} so vchunk boundaries align with input planes.")
 
     if RANK == 0:
         describe_input(SRC_H5)
         describe_output(DST_H5, (OUT_NZ, OUT_NYX, OUT_NYX), np.float32,
-                        BIG_VCHUNKS, "proj", NBANKS)
+                        VCHUNKS, "proj", NBANKS)
 
     ctx = initx_and_bcast(DST_H5, shape=(OUT_NZ, OUT_NYX, OUT_NYX),
-                          dtype=np.float32, vchunks=BIG_VCHUNKS,
+                          dtype=np.float32, vchunks=VCHUNKS,
                           stype="proj", nbanks=NBANKS,
                           rank=RANK, comm=COMM)
 
-    buf_gb = vchunk_bytes(BIG_VCHUNKS, np.float32) / 1e9
+    buf_gb = vchunk_bytes(VCHUNKS, np.float32) / 1e9
     rprint(f"upsample: {UPS}×  method=trilinear (bilinear xy + linear z)  "
            f"read={N_READ}  MPI ranks={SIZE}  per-rank shm buffer={buf_gb:.2f} GB")
 
@@ -167,10 +167,10 @@ def main() -> None:
     barrier()
 
     # Round-robin vchunk sharding — matches test_h5_buffer_io.py.
-    ivchunks = list(iter_vchunks((OUT_NZ, OUT_NYX, OUT_NYX), BIG_VCHUNKS))
+    ivchunks = list(iter_vchunks((OUT_NZ, OUT_NYX, OUT_NYX), VCHUNKS))
     my_ivchunks = ivchunks[RANK::SIZE]
 
-    shm, buf = alloc_shm(BIG_VCHUNKS, np.float32)
+    shm, buf = alloc_shm(VCHUNKS, np.float32)
     try:
         with h5py.File(SRC_H5, "r") as fsrc, \
              ThreadPoolExecutor(max_workers=N_READ,
@@ -192,8 +192,8 @@ def main() -> None:
             b_read = b_write = 0
             for k, ivc in enumerate(my_ivchunks, start=1):
                 # Output z-range for this vchunk.
-                z0_out = ivc[0] * BIG_VCHUNKS[0]
-                z1_out = min(z0_out + BIG_VCHUNKS[0], OUT_NZ)
+                z0_out = ivc[0] * VCHUNKS[0]
+                z1_out = min(z0_out + VCHUNKS[0], OUT_NZ)
                 # Input planes needed to fill it (integer division; C0%UPS==0).
                 z0_in  = z0_out // UPS
                 z1_in  = (z1_out + UPS - 1) // UPS
@@ -254,5 +254,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    from utils import run_main
+    from mpi_utils import run_main
     run_main(main)

@@ -44,7 +44,7 @@ import cupy as cp
 from cupyx.scipy.ndimage import gaussian_filter as _cp_gaussian_filter
 from scipy.ndimage import zoom as _zoom
 
-from utils import (
+from mpi_utils import (
     COMM as _COMM, RANK as _RANK, SIZE as _SIZE,
     barrier as _barrier, report_stage,
 )
@@ -59,13 +59,6 @@ def _parse_args() -> argparse.Namespace:
         help="source 3-D reconstruction TIFF (multi-page)")
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
         help="base output directory; init.h5 goes to {path}/init.h5")
-    # --src-nz / --src-nyx are only informational: at import we read the
-    # TIFF header and OVERRIDE these from the actual file shape.  Kept for
-    # backwards compatibility with older command lines.
-    p.add_argument("--src-nz",  type=int, default=3264,
-                   help="informational; overridden by actual TIFF shape")
-    p.add_argument("--src-nyx", type=int, default=3264,
-                   help="informational; overridden by actual TIFF shape")
     # --- CROP (pre-upsample) grid: source is center-cropped to this size
     # and the cylindrical mask is applied here.
     p.add_argument("--crop-nz",  type=int, default=2560,
@@ -115,9 +108,6 @@ def _parse_args() -> argparse.Namespace:
                    help="threads per rank for I/O + separable filter")
     p.add_argument("--chunk-z", type=int, default=64,
                    help="z-slices processed per compute chunk")
-    p.add_argument("--nbanks", type=int, default=8,
-                   help="DEPRECATED — init.h5 is now a single HDF5 file, "
-                        "no bank fan-out.  Kept for CLI compatibility.")
     p.add_argument("--init-vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk shape for init.h5 (default: "
@@ -129,8 +119,6 @@ _A = _parse_args()
 
 SRC_TIFF      = _A.src
 DST_H5        = f"{_A.path}/init.h5"
-SRC_NZ        = _A.src_nz
-SRC_NY = SRC_NX = _A.src_nyx
 CROP_NZ       = _A.crop_nz
 CROP_NYX      = _A.crop_nyx
 OUT_NZ        = _A.out_nz
@@ -144,7 +132,6 @@ SHARPEN_SIGMA  = _A.sharpen_sigma
 SMOOTH_SIGMA   = _A.smooth_sigma
 N_THREADS     = _A.n_threads
 CHUNK_Z       = _A.chunk_z
-NBANKS        = _A.nbanks
 INIT_VCHUNKS  = tuple(_A.init_vchunks) if _A.init_vchunks else (CHUNK_Z, _A.out_nyx, _A.out_nyx)
 
 SAMPLE_NZ = CROP_NZ - 2 * Z_PAD    # sample-slice count in CROP grid
@@ -165,22 +152,13 @@ except Exception:
     _SRC = None
 _tiff_local = threading.local()
 
-# Detect ACTUAL source dims from TIFF (override --src-* CLI defaults).
+# Source dims come straight from the TIFF header.
 if _SRC is not None:
-    _ACT_NZ, _ACT_NY, _ACT_NX = _SRC.shape
+    SRC_NZ, SRC_NY, SRC_NX = _SRC.shape
 else:
     with tifffile.TiffFile(SRC_TIFF) as _tf_probe:
-        _ACT_NZ = len(_tf_probe.pages)
-        _ACT_NY, _ACT_NX = _tf_probe.pages[0].shape
-if _RANK == 0 and (
-    _ACT_NZ != SRC_NZ or _ACT_NY != SRC_NY or _ACT_NX != SRC_NX
-):
-    print(f"[step00] TIFF actual shape ({_ACT_NZ}, {_ACT_NY}, {_ACT_NX}) "
-          f"overrides --src-nz={SRC_NZ} --src-nyx={SRC_NY} CLI defaults",
-          flush=True)
-SRC_NZ = _ACT_NZ
-SRC_NY = _ACT_NY
-SRC_NX = _ACT_NX
+        SRC_NZ = len(_tf_probe.pages)
+        SRC_NY, SRC_NX = _tf_probe.pages[0].shape
 
 # Source-to-CROP offsets.  If SRC is bigger than CROP we center-crop; if
 # smaller (unusual) we center-pad with zeros (air).  _read_crop_plane
@@ -461,5 +439,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    from utils import run_main
+    from mpi_utils import run_main
     run_main(main)

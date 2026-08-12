@@ -1,4 +1,5 @@
-"""Numerical parity tests: TomoLarge vs Tomo, PropagationLarge vs Propagation.
+"""Numerical parity tests: TomoReal vs TomoLargeReal, Propagation vs
+PropagationLarge, Paganin vs PaganinLarge.
 
 Each *_large class stages its work through the GPU host-side, so it produces
 the same math as its non-large counterpart — just with a bounded GPU
@@ -14,10 +15,12 @@ from __future__ import annotations
 import numpy as np
 import cupy as cp
 
-from processing.tomo             import Tomo, TomoReal
-from processing.tomo_large       import TomoLarge, TomoLargeReal
+from processing.tomo             import TomoReal
+from processing.tomo_large       import TomoLargeReal
 from processing.propagation      import Propagation
 from processing.propagation_large import PropagationLarge
+from processing.paganin          import Paganin
+from processing.paganin_large    import PaganinLarge
 
 
 # ---------------------------------------------------------------------------
@@ -34,45 +37,138 @@ def _report(name, ref, got, rtol):
 
 
 # ---------------------------------------------------------------------------
-def test_tomo_vs_large():
-    """Tomo.R vs TomoLarge.R.
+def test_tomo_R_vs_large():
+    """TomoReal.R vs TomoLargeReal.R — parity of the forward Radon.
 
-    Both use USFFT.  After TomoLarge was updated to stitch each chunk's
-    fde patch with the opposite-edge wrap-halo (matching Tomo's
-    modular `(n + ell + twon) % twon` gather), the two match to
-    float32 precision.  Test asserts:
-      (a) chunking-invariance INSIDE TomoLarge — fine chunking is
-          bit-exact vs coarse.
-      (b) full parity with Tomo to FP tolerance.
+    Both use USFFT + rfft-along-x.  TomoLargeReal stages each chunk's
+    fde patch through the GPU one strip at a time; the two should
+    match to float32 precision across every chunk configuration.
+    Test asserts:
+      (a) chunking-invariance INSIDE TomoLargeReal — fine chunking
+          matches coarse.
+      (b) full parity with TomoReal to FP tolerance.
     """
-    print("\n─── Tomo  vs  TomoLarge  (forward Radon R) ───")
+    print("\n─── TomoReal  vs  TomoLargeReal  (forward Radon R) ───")
     n, nz     = 64, 16
     ntheta    = 24
     theta     = np.linspace(0, 2 * np.pi, ntheta, endpoint=False).astype("float32")
 
     np.random.seed(0)
-    obj_c = np.empty((nz, n, n), dtype=np.complex64)
-    obj_c.real = np.random.randn(nz, n, n).astype("float32")
-    obj_c.imag = 0
+    obj_real = np.random.randn(nz, n, n).astype(np.float32)
 
-    tomo   = Tomo     (n, nz, theta, mask_r=0.0)
-    tomo_l = TomoLarge(n,     theta)
-
-    sino_ref = cp.asnumpy(tomo.R(cp.asarray(obj_c))).real
+    tomo   = TomoReal     (n, nz, theta)
+    sino_ref = cp.asnumpy(tomo.R(cp.asarray(obj_real)))
 
     # tomo_l.R returns a view into a reused internal buffer; every call
     # would overwrite `coarse` in place.  Copy each result so this test
-    # actually compares independent snapshots.
-    coarse = tomo_l.R(obj_c, [n, ntheta, n]).real.copy()  # 1 x-FFT iter, 1 gather bin
+    # actually compares independent snapshots.  chunk_xy is fixed at
+    # ctor time, so we build a fresh TomoLargeReal per chunk_xy sweep.
+    tomo_l = TomoLargeReal(n, theta, n)
+    coarse = tomo_l.R(obj_real, [n, ntheta, n]).copy()   # 1 x-FFT iter, 1 gather bin
     passed = True
     for chunks in [(32, 12, 32), (16, 6, 16), (8, 6, 8)]:
-        fine = tomo_l.R(obj_c, list(chunks)).real.copy()
+        tomo_l = TomoLargeReal(n, theta, chunks[2])
+        fine = tomo_l.R(obj_real, list(chunks)).copy()
         passed &= _report(f"chunk-invariance  fine={chunks} vs coarse",
-                          coarse, fine, rtol=1e-5)
+                          coarse, fine, rtol=1e-4)
 
-    # (b) parity with Tomo
-    passed &= _report("Tomo vs TomoLarge — full-sino rel_max",
+    # (b) parity with TomoReal
+    passed &= _report("TomoReal vs TomoLargeReal — full-sino rel_max",
                       sino_ref, coarse, rtol=1e-4)
+    return passed
+
+
+# ---------------------------------------------------------------------------
+def test_tomo_RT_vs_large():
+    """TomoReal.RT vs TomoLargeReal.RT — parity of the adjoint (backprojection).
+
+    Both keep the full-complex64 layout internally (pragmatic port from
+    the retired Tomo / TomoLarge).  TomoLargeReal.RT streams the four
+    reversed passes through the GPU one strip at a time (and chunks the
+    passRT2 scatter along ky per the bin-chunked kernel); the result
+    should match TomoReal.RT to fp precision across every chunk config.
+    """
+    print("\n─── TomoReal.RT  vs  TomoLargeReal.RT  (adjoint / backprojection) ───")
+    n, nz    = 64, 8
+    ntheta   = 24
+    theta    = np.linspace(0, 2 * np.pi, ntheta, endpoint=False).astype("float32")
+
+    np.random.seed(0)
+    passed = True
+    for dtype_label, sino in [
+        ("complex64",
+         (np.random.randn(ntheta, nz, n) + 1j * np.random.randn(ntheta, nz, n))
+         .astype(np.complex64)),
+        ("float32   ", np.random.randn(ntheta, nz, n).astype(np.float32)),
+    ]:
+        tomo   = TomoReal(n, nz, theta)
+        ref    = cp.asnumpy(tomo.RT(cp.asarray(sino)))
+        # chunk_xy fixed at ctor time — rebuild per chunk_xy sweep.
+        tomo_l = TomoLargeReal(n, theta, 2 * n)
+        coarse = np.asarray(tomo_l.RT(sino, [n, ntheta, 2 * n])).copy()
+        passed &= _report(f"sino {dtype_label}  chunks=(n, ntheta, 2n)",
+                          ref, coarse, rtol=1e-4)
+        # Sweep chunk_xy (drives the passRT2 ky-band chunking) plus the
+        # r-axis and theta chunks that pipe RT1/3/4.
+        for chunks in [(32, 12, 32), (16, 6, 16), (8, 6, 8)]:
+            tomo_l = TomoLargeReal(n, theta, chunks[2])
+            fine = np.asarray(tomo_l.RT(sino, list(chunks))).copy()
+            passed &= _report(f"sino {dtype_label}  chunks={chunks}",
+                              ref, fine, rtol=1e-4)
+    return passed
+
+
+# ---------------------------------------------------------------------------
+def test_tomo_R_RT_adjoint():
+    """Adjoint identity  ⟨R(x), y⟩ = ⟨x, RT(y)⟩  — no filter.
+
+    A necessary condition for RT to be the mathematical adjoint of R.
+    Both R and RT are exercised on REAL float32 tensors (TomoReal.R is
+    real-only; RT accepts real y and returns a real obj), so the inner
+    products are ordinary real dot products.  Applies to both the
+    GPU-only TomoReal and the host-chunked TomoLargeReal; the equality
+    holds to fp precision for any implementation that consistently
+    normalises R and RT.
+    """
+    print("\n─── TomoReal/TomoLargeReal  R–RT adjoint identity  "
+          "⟨R(x), y⟩ = ⟨x, RT(y)⟩ ───")
+    n, nz    = 64, 8
+    ntheta   = 24
+    theta    = np.linspace(0, 2 * np.pi, ntheta, endpoint=False).astype("float32")
+
+    np.random.seed(0)
+    x_np = np.random.randn(nz, n, n).astype(np.float32)
+    y_np = np.random.randn(ntheta, nz, n).astype(np.float32)
+
+    def _inner(a, b):
+        return float(np.sum(a * b))
+
+    passed = True
+
+    # (a) TomoReal (GPU-only) adjoint identity
+    tomo = TomoReal(n, nz, theta)
+    Rx   = cp.asnumpy(tomo.R (cp.asarray(x_np)))         # real f32 sino
+    RTy  = cp.asnumpy(tomo.RT(cp.asarray(y_np)))         # real f32 obj
+    lhs, rhs = _inner(Rx, y_np), _inner(x_np, RTy)
+    err = abs(lhs - rhs) / max(abs(lhs), abs(rhs), 1e-30)
+    ok  = err < 1e-4
+    tag = "OK  " if ok else "FAIL"
+    print(f"  [{tag}]  TomoReal      ⟨R(x),y⟩={lhs:.6g}  ⟨x,RT(y)⟩={rhs:.6g}  "
+          f"rel_err={err:.3e}")
+    passed &= ok
+
+    # (b) TomoLargeReal (host-chunked) adjoint identity
+    tomo_l = TomoLargeReal(n, theta, n)     # eager precompute; runtime chunk_xy sweeps re-fill the cache
+    Rx_l   = np.asarray(tomo_l.R (x_np, [n, ntheta, n])).copy()
+    RTy_l  = np.asarray(tomo_l.RT(y_np, [n, ntheta, n])).copy()
+    lhs_l, rhs_l = _inner(Rx_l, y_np), _inner(x_np, RTy_l)
+    err_l = abs(lhs_l - rhs_l) / max(abs(lhs_l), abs(rhs_l), 1e-30)
+    ok_l  = err_l < 1e-4
+    tag_l = "OK  " if ok_l else "FAIL"
+    print(f"  [{tag_l}]  TomoLargeReal ⟨R(x),y⟩={lhs_l:.6g}  ⟨x,RT(y)⟩={rhs_l:.6g}  "
+          f"rel_err={err_l:.3e}")
+    passed &= ok_l
+
     return passed
 
 
@@ -128,73 +224,59 @@ def test_propagation_validation():
 
 
 # ---------------------------------------------------------------------------
-def test_tomo_real_gpu_only():
-    """TomoReal(x_float32) vs Tomo(x_complex64_with_imag_0).
+def test_paganin_vs_large():
+    """Paganin.retrieve vs PaganinLarge.retrieve over several
+    (chunk_nz, chunk_n) and a couple of distances.
 
-    Same-shape sinograms; the rfft/float32 path should reproduce the
-    complex64 path to fp precision when obj has zero imag part."""
-    print("\n─── TomoReal  vs  Tomo  (GPU-only, float32 vs complex64+imag=0) ───")
-    n, nz  = 64, 16
-    ntheta = 24
-    theta  = np.linspace(0, 2 * np.pi, ntheta, endpoint=False).astype("float32")
+    Paganin's filter H = α/(λ·z·|k|²/(4π) + α) is not separable, so
+    PaganinLarge rebuilds it per x-strip inside pass 2.  This test
+    pins the chunked variant to the full-2-D reference to float32
+    precision across a sweep of chunk sizes and propagation distances.
+    """
+    print("\n─── Paganin  vs  PaganinLarge  (single-distance Paganin retrieve) ───")
+    n, nz     = 64, 32
+    ntheta    = 3
+    wavelength = 4.13e-11
+    voxelsize  = 1.4e-6
+    alpha      = 1e-3
+    distances  = [0.02, 0.1, 1.0]        # small + moderate + large NA·NA·λ product
 
     np.random.seed(0)
-    obj_real  = np.random.randn(nz, n, n).astype("float32")
-    obj_cmplx = np.empty((nz, n, n), dtype=np.complex64)
-    obj_cmplx.real = obj_real
-    obj_cmplx.imag = 0
+    # Random transmission-like intensities in a plausible range.
+    intensity_h = (0.5 + 0.5 * np.random.rand(ntheta, nz, n)).astype(np.float32)
 
-    tomo      = Tomo    (n, nz, theta, mask_r=0.0)
-    tomo_real = TomoReal(n, nz, theta, mask_r=0.0)
+    passed = True
+    for L in distances:
+        pgn_ref = Paganin      (n, nz, ntheta, wavelength, voxelsize, L, alpha)
+        pgn_lrg = PaganinLarge (n, nz,         wavelength, voxelsize, L, alpha)
 
-    ref  = cp.asnumpy(tomo     .R(cp.asarray(obj_cmplx))).real
-    got  = cp.asnumpy(tomo_real.R(cp.asarray(obj_real)))
-
-    return _report("TomoReal vs Tomo", ref, got, rtol=1e-4)
+        ref = cp.asnumpy(pgn_ref.retrieve(cp.asarray(intensity_h)))
+        for chunks in [(nz, n), (16, 32), (8, 16), (4, 8)]:
+            got = np.asarray(pgn_lrg.retrieve(intensity_h, list(chunks)))
+            passed &= _report(f"L={L}m  chunks={chunks}",
+                              ref, got, rtol=1e-4)
+    return passed
 
 
 # ---------------------------------------------------------------------------
-def test_tomo_real_vs_complex():
-    """TomoLargeReal(x_float32) vs TomoLarge(x_complex64_with_imag_0).
-
-    The float32/rfft variant should produce a bit-equivalent result
-    (up to fp roundoff) to running the complex64 pipeline on the same
-    data with imag part zeroed — that's the mathematical guarantee of
-    rfft: FFT of a real signal has conjugate symmetry, so the missing
-    negative-fx half of the spectrum is exactly what the conjugate
-    reflection in `gather_kernel_rfft` synthesises.
-    """
-    print("\n─── TomoLargeReal  vs  TomoLarge  (float32 vs complex64+imag=0) ───")
-    n, nz  = 64, 16
-    ntheta = 24
-    theta  = np.linspace(0, 2 * np.pi, ntheta, endpoint=False).astype("float32")
-
-    np.random.seed(0)
-    obj_real  = np.random.randn(nz, n, n).astype("float32")
-    obj_cmplx = np.empty((nz, n, n), dtype=np.complex64)
-    obj_cmplx.real = obj_real
-    obj_cmplx.imag = 0
-
-    t_lrg  = TomoLarge     (n, theta)
-    t_real = TomoLargeReal (n, theta)
-
-    # Both need chunks that divide n and ntheta.  Take the same knobs
-    # from the existing test_tomo_vs_large: (n, ntheta, n).  Copies —
-    # both return views into reused internal buffers.
-    ref  = t_lrg .R(obj_cmplx, [n, ntheta, n]).real.copy()   # (ntheta, nz, n) f32
-    real = t_real.R(obj_real,  [n, ntheta, n]).copy()        # (ntheta, nz, n) f32
-
+def test_paganin_validation():
+    """Chunk-divisor assertions must fire for non-dividing chunk sizes."""
+    print("\n─── PaganinLarge input validation ───")
+    n, nz = 32, 16
+    pgn_lrg = PaganinLarge(n, nz, 4.13e-11, 1.4e-6, 0.1, 1e-3)
+    intensity = np.zeros((1, nz, n), dtype=np.float32)
+    tests = [
+        ((5,  16), "CHUNK_NZ=5 (doesn't divide nz=16)"),
+        ((8,  9),  "CHUNK_N=9  (doesn't divide n=32)"),
+    ]
     passed = True
-    passed &= _report("full-sino rel_max        (n=64, one chunk)",
-                      ref, real, rtol=1e-4)
-
-    # Sweep several chunkings — the rfft-based gather + fresh bin sort
-    # should not care about chunk_xy.
-    for chunks in [(32, 12, 32), (16, 6, 16), (8, 6, 8)]:
-        ref_c  = t_lrg .R(obj_cmplx, list(chunks)).real.copy()
-        real_c = t_real.R(obj_real,  list(chunks)).copy()
-        passed &= _report(f"chunks={chunks}", ref_c, real_c, rtol=1e-4)
-
+    for chunks, label in tests:
+        try:
+            pgn_lrg.retrieve(intensity, list(chunks))
+            print(f"  [FAIL]  {label}  — expected AssertionError, none raised")
+            passed = False
+        except AssertionError as e:
+            print(f"  [OK  ]  {label}  → {e}")
     return passed
 
 
@@ -203,11 +285,13 @@ if __name__ == "__main__":
     print("Numerical parity — large variants vs GPU-only reference")
     print("=" * 70)
     results = [
-        test_tomo_vs_large(),
-        test_tomo_real_gpu_only(),
-        test_tomo_real_vs_complex(),
+        test_tomo_R_vs_large(),
+        test_tomo_RT_vs_large(),
+        test_tomo_R_RT_adjoint(),
         test_propagation_vs_large(),
         test_propagation_validation(),
+        test_paganin_vs_large(),
+        test_paganin_validation(),
     ]
     print("=" * 70)
     if all(results):

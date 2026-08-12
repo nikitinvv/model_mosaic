@@ -47,7 +47,7 @@ echo "    proj-vchunks = ${PROJ_VCHUNKS}"
 echo "    data-vchunks = ${DATA_VCHUNKS}"
 
 mpirun -n "${N_GPUS}" set_affinity_gpu.sh \
-    python "${SCRIPT_DIR}/test_h5_buffer_io.py" \
+    python "${SCRIPT_DIR}/tests/test_h5_buffer_io.py" \
         --path "${PATH_DATA}" --ups "${UPS}" \
         --nbanks "${NBANKS}" --ntasks "${NTASKS}" \
         --init-vchunks ${INIT_VCHUNKS} \

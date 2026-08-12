@@ -9,18 +9,14 @@ proportional to --chunk-n/--chunk-theta/--chunk-xy, not to (2N)², so
 much larger N can be modelled on a 40 GB GPU.
 
 TomoLargeReal uses rfft/float32 throughout — half the host fde memory
-of the complex64 TomoLarge path, half the x-FFT bandwidth, and no
+of a full-complex64 path, half the x-FFT bandwidth, and no
 complex↔real wrapping at the boundaries.
 
 Chunk sizes passed to TomoLargeReal.R must divide the sizes they slice into:
   --chunk-n     divides N and 2N
   --chunk-theta divides NTHETA
   --chunk-xy    divides 2N
-
-Defaults are auto-picked by processing/chunk_pick.pick_tomo_chunks() to
-fit within --gpu-budget-gb / 10 per stage (headroom for cuFFT plans +
-pool fragmentation).  At the current N=4096·UPS geometry every N and 2N
-factor is a pure power of 2, so cuFFT stays on its fast radix-2 path.
+Defaults (768) divide every 3072·UPS grid; override per-run if needed.
 
 Launch:
     mpirun -n <NGPU> set_affinity_gpu.sh python step2_radon_large.py \\
@@ -42,7 +38,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
 )
-from utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
+from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
 def _parse_args() -> argparse.Namespace:
@@ -50,25 +46,19 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ups",  type=int, default=8)
     p.add_argument("--path", default="/data2/brain_sym_mosaic")
-    p.add_argument("--in-nz",  type=int, default=3072)
-    p.add_argument("--in-n",   type=int, default=3072)
     p.add_argument("--ntheta", type=int, default=None,
-                   help="angles over 360°; default = 3·N/4")
+                   help="angles over 180°; default = 3·N/4")
     p.add_argument("--nzchunk", type=int, default=1,
                    help="z-slices per Radon call")
-    p.add_argument("--chunk-n",     type=int, default=0,
-                   help="x/y FFT strip width;  0 = auto from --gpu-budget-gb")
-    p.add_argument("--chunk-theta", type=int, default=0,
-                   help="angle batch for r-IFFT; 0 = auto from --gpu-budget-gb")
-    p.add_argument("--chunk-xy",    type=int, default=0,
-                   help="NUFFT gather bin edge; 0 = auto from --gpu-budget-gb")
-    p.add_argument("--gpu-budget-gb", type=float, default=30.0,
-                   help="target GPU memory for chunk-picker (default 30 GB, "
-                        "leaves headroom on a 40 GB A100 for cuFFT plans + "
-                        "transient allocations across pipeline stages)")
+    p.add_argument("--chunk-n",     type=int, default=768,
+                   help="x/y FFT strip width")
+    p.add_argument("--chunk-theta", type=int, default=768,
+                   help="angle batch for r-IFFT")
+    p.add_argument("--chunk-xy",    type=int, default=768,
+                   help="NUFFT gather bin edge")
     p.add_argument("--nbanks", type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
-    p.add_argument("--proj-vchunks", type=int, nargs=3, default=None,
+    p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk for proj.h5 (default: NTHETA, 8·NZCHUNK, N)")
     return p.parse_args()
@@ -82,28 +72,19 @@ SRC_H5   = f"{BASE_DIR}/big{UPS}x.h5"
 DST_DIR  = f"{BASE_DIR}/model_big{UPS}x"
 PROJ_H5  = f"{DST_DIR}/proj.h5"
 
-NZ      = _A.in_nz * UPS
-N       = _A.in_n  * UPS
+IN_NZ = IN_N = 3072            # init.h5 dims after step00; UPS scales from here
+NZ    = IN_NZ * UPS
+N     = IN_N  * UPS
 NTHETA  = _A.ntheta if _A.ntheta is not None else 3 * N // 4
-ANG_MAX = 2 * np.pi
-ROTATION_AXIS = N / 2
+ANG_MAX = np.pi          # tomo needs 180°; step4 synthesises the 360° tile-scan
+                         # via the tomo identity proj(θ,x) = proj(θ+π, N-1-x)
 
 NZCHUNK     = _A.nzchunk
-
-# Auto-picked chunks are sized so each GPU stage (x-FFT / y-FFT / gather
-# / IFFT) fits within budget/10 live bytes — the 10× headroom accounts
-# for cuFFT plan workspace, padding intermediates, and pool fragmentation
-# across stages.  See processing/chunk_pick.py for the exact formulas.
-from processing.chunk_pick import pick_tomo_chunks
-
-_auto_n, _auto_theta, _auto_xy = pick_tomo_chunks(
-    n=N, ntheta=NTHETA, nz=NZCHUNK,
-    gpu_budget_bytes=int(_A.gpu_budget_gb * 1e9))
-CHUNK_N     = _A.chunk_n     or _auto_n
-CHUNK_XY    = _A.chunk_xy    or _auto_xy
-CHUNK_THETA = _A.chunk_theta or _auto_theta
+CHUNK_N     = _A.chunk_n
+CHUNK_THETA = _A.chunk_theta
+CHUNK_XY    = _A.chunk_xy
 NBANKS      = _A.nbanks
-PROJ_VCHUNKS = tuple(_A.proj_vchunks) if _A.proj_vchunks else (NTHETA, 8 * NZCHUNK, N)
+VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (NTHETA, 8 * NZCHUNK, N)
 
 
 def _validate_chunks() -> None:
@@ -130,13 +111,13 @@ def load_chunk_into(src_dset, dst: np.ndarray, z_start: int, z_end: int) -> None
 
 def main() -> None:
     _validate_chunks()
-    if PROJ_VCHUNKS[1] % NZCHUNK != 0:
+    if VCHUNKS[1] % NZCHUNK != 0:
         raise SystemExit(
-            f"--proj-vchunks C1={PROJ_VCHUNKS[1]} must be a multiple of "
+            f"--vchunks C1={VCHUNKS[1]} must be a multiple of "
             f"--nzchunk={NZCHUNK}.")
-    if PROJ_VCHUNKS[0] != NTHETA:
+    if VCHUNKS[0] != NTHETA:
         raise SystemExit(
-            f"--proj-vchunks C0={PROJ_VCHUNKS[0]} must equal NTHETA={NTHETA}.")
+            f"--vchunks C0={VCHUNKS[0]} must equal NTHETA={NTHETA}.")
 
     if RANK == 0:
         os.makedirs(DST_DIR, exist_ok=True)
@@ -163,10 +144,10 @@ def main() -> None:
     if RANK == 0:
         describe_input(SRC_H5)
         describe_output(PROJ_H5, (NTHETA, NZ, N), np.float32,
-                        PROJ_VCHUNKS, "slice", NBANKS)
+                        VCHUNKS, "slice", NBANKS)
 
     ctx = initx_and_bcast(PROJ_H5, shape=(NTHETA, NZ, N),
-                          dtype=np.float32, vchunks=PROJ_VCHUNKS,
+                          dtype=np.float32, vchunks=VCHUNKS,
                           stype="slice", nbanks=NBANKS,
                           rank=RANK, comm=COMM)
     if RANK == 0:
@@ -176,20 +157,20 @@ def main() -> None:
             f["exchange"].create_dataset("theta", data=theta_deg)
     barrier()
 
-    buf_gb = vchunk_bytes(PROJ_VCHUNKS, np.float32) / 1e9
+    buf_gb = vchunk_bytes(VCHUNKS, np.float32) / 1e9
     rprint(f"per-rank shm buffer={buf_gb:.2f} GB   "
-           f"nvchunks={n_vchunks((NTHETA, NZ, N), PROJ_VCHUNKS)}")
+           f"nvchunks={n_vchunks((NTHETA, NZ, N), VCHUNKS)}")
 
     proj_min, proj_max = np.inf, -np.inf
     chunks_arg = [CHUNK_N, CHUNK_THETA, CHUNK_XY]
 
     rprint("building TomoLargeReal...")
-    cl_tomo = TomoLargeReal(N, theta_rad, ROTATION_AXIS)
+    cl_tomo = TomoLargeReal(N, theta_rad, CHUNK_XY)     # eager index precompute
     rprint("TomoLargeReal ready.")
 
-    ivchunks = list(iter_vchunks((NTHETA, NZ, N), PROJ_VCHUNKS))
+    ivchunks = list(iter_vchunks((NTHETA, NZ, N), VCHUNKS))
     my_ivchunks = ivchunks[RANK::SIZE]
-    shm, buf = alloc_shm(PROJ_VCHUNKS, np.float32)
+    shm, buf = alloc_shm(VCHUNKS, np.float32)
 
     # Pinned obj input, allocated once and reused across all iterations.
     # h5py reads straight into it; last (kz < NZCHUNK) chunk keeps the
@@ -203,8 +184,8 @@ def main() -> None:
             t_read = t_radon = t_write = 0.0
             b_read = b_write = 0
             for k_i, ivc in enumerate(my_ivchunks, start=1):
-                z0_vc = ivc[1] * PROJ_VCHUNKS[1]
-                z1_vc = min(z0_vc + PROJ_VCHUNKS[1], NZ)
+                z0_vc = ivc[1] * VCHUNKS[1]
+                z1_vc = min(z0_vc + VCHUNKS[1], NZ)
                 buf.fill(0)
 
                 for z0 in range(z0_vc, z1_vc, NZCHUNK):
@@ -263,5 +244,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    from utils import run_main
+    from mpi_utils import run_main
     run_main(main)

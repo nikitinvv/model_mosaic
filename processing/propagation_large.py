@@ -1,5 +1,5 @@
 """PropagationLarge — host-chunked Fresnel propagation for volumes too big
-for GPU-only Propagation.  Mirrors TomoLarge's staging pattern: the padded
+for GPU-only Propagation.  Mirrors TomoLargeReal's staging pattern: the padded
 (2nz × 2n) Fresnel work buffer lives on the HOST; only one strip at a time
 is on the GPU, so peak GPU memory is proportional to the chunk sizes
 rather than to (2nz × 2n).
@@ -12,7 +12,7 @@ so we never allocate the full 2D kernel — just two 1D arrays (a few
 hundred kB each on the GPU) and apply them during the x-FFT and y-FFT
 passes respectively.
 
-Only the forward operator D is provided (step3_fresnel.py only uses D).
+Only the forward operator D is provided (step3_propagation.py only uses D).
 """
 from __future__ import annotations
 
@@ -20,7 +20,8 @@ import cupy as cp
 import cupyx.scipy.fft as cufft
 import numpy as np
 
-from processing.pipeline import StreamPipe, alloc_pinned, BandedPinned
+from processing.pipeline import BandedPinned, pick_n_bands
+from processing._scratch import ScratchMixin
 
 # See tomo_large.FDE_N_BANDS — same driver-cap workaround.  fde in prop is
 # (ntheta, nz, 2n) c64; nz is the biggest axis at UPS≥8 so we band on it.
@@ -31,7 +32,7 @@ FDE_N_BANDS = 4
 OUT_N_BANDS = 8
 
 
-class PropagationLarge:
+class PropagationLarge(ScratchMixin):
     """Fresnel forward propagator with host-staged x/y FFT chunking.
 
     Same math as Propagation.D, but the (ntheta, 2nz, 2n) work buffer
@@ -81,43 +82,52 @@ class PropagationLarge:
         self._fde = None
         self._out = None
         self._psi = None                         # optional caller-side psi
-        # Cached pipes — pinned+GPU ping-pong buffers survive across
-        # D() calls, so we don't burn tens of GB of pinned pages every
-        # invocation.  Rebuilt only when the driving shape changes.
-        self._pipe1 = None
-        self._pipe2 = None
-        self._pipe3 = None
-        # Shared pinned scratch pool for pipe1/2/3 (they run sequentially
-        # — see TomoLarge for the rationale).  Peak pipe pinned RAM drops
-        # from sum-of-passes to max-of-passes.
-        self._scratch_in      = None
-        self._scratch_out     = None
-        self._scratch_in_cap  = 0
-        self._scratch_out_cap = 0
-        # Same idea on the GPU side (see TomoLarge for details).
-        self._scratch_in_gpu  = None
-        self._scratch_out_gpu = None
-        self._scratch_in_gpu_cap  = 0
-        self._scratch_out_gpu_cap = 0
+        # Shared scratch pools + StreamPipe cache from ScratchMixin (see
+        # _scratch.py).  All three passes' pinned ping-pongs share the
+        # single 'in'/'out' byte pools; cached pipes live under 'p1'/
+        # 'p2'/'p3' and are rebuilt on shape/dtype changes.
+        self._init_scratch()
+        # Reused GPU scratch for the x-/y-mirror pad helpers — avoids
+        # allocating a fresh (…, 2n) or (…, 2nz, …) buffer per call and
+        # freeing it back into the cupy pool.  Reshaped on demand.
+        self._padx_scratch = None
+        self._pady_scratch = None
 
     # --- padding helpers (GPU, symmetric mirror; matches pad_fwd_kernel) ---
     def _pad_x_mirror_gpu(self, strip_d):
-        """(ntheta, k, n) → (ntheta, k, 2n) symmetric-mirror padded along x."""
+        """(ntheta, k, n) → (ntheta, k, 2n) symmetric-mirror padded along x.
+
+        Reuses ``self._padx_scratch`` across calls so the (…, 2n) buffer
+        isn't repeatedly allocated and freed back into the cupy pool.
+        """
         n = self.n
         half = n // 2
         ntheta, k, _ = strip_d.shape
-        out = cp.empty((ntheta, k, 2 * n), dtype=strip_d.dtype)
+        need_shape = (ntheta, k, 2 * n)
+        if (self._padx_scratch is None
+                or self._padx_scratch.shape != need_shape
+                or self._padx_scratch.dtype != strip_d.dtype):
+            self._padx_scratch = cp.empty(need_shape, dtype=strip_d.dtype)
+        out = self._padx_scratch
         out[:, :, half : half + n]  = strip_d
         out[:, :,      : half]      = strip_d[:, :,  :half][:, :, ::-1]
         out[:, :, half + n :]       = strip_d[:, :, -half:][:, :, ::-1]
         return out
 
     def _pad_y_mirror_gpu(self, strip_d):
-        """(ntheta, nz, m) → (ntheta, 2nz, m) symmetric-mirror padded along y."""
+        """(ntheta, nz, m) → (ntheta, 2nz, m) symmetric-mirror padded along y.
+
+        Reuses ``self._pady_scratch`` across calls (see _pad_x_mirror_gpu).
+        """
         nz = self.nz
         half = nz // 2
         ntheta, _, m = strip_d.shape
-        out = cp.empty((ntheta, 2 * nz, m), dtype=strip_d.dtype)
+        need_shape = (ntheta, 2 * nz, m)
+        if (self._pady_scratch is None
+                or self._pady_scratch.shape != need_shape
+                or self._pady_scratch.dtype != strip_d.dtype):
+            self._pady_scratch = cp.empty(need_shape, dtype=strip_d.dtype)
+        out = self._pady_scratch
         out[:, half : half + nz, :] = strip_d
         out[:,      : half,      :] = strip_d[:,  :half, :][:, ::-1, :]
         out[:, half + nz :,      :] = strip_d[:, -half:, :][:, ::-1, :]
@@ -126,70 +136,15 @@ class PropagationLarge:
     # ---------- explicit teardown -------------------------------------------
     def free(self):
         """Release cached pinned host + GPU buffers back to their pools.
-        See TomoLarge.free for the rationale — call between iterations
+        See TomoLargeReal.free for the rationale — call between iterations
         of a size sweep so previous multi-hundred-GB pinned allocations
         don't linger through the next allocation attempt."""
         self._fde = None
         self._out = None
         self._psi = None
-        self._pipe1 = None
-        self._pipe2 = None
-        self._pipe3 = None
-        self._scratch_in  = None
-        self._scratch_out = None
-        self._scratch_in_cap  = 0
-        self._scratch_out_cap = 0
-        self._scratch_in_gpu  = None
-        self._scratch_out_gpu = None
-        self._scratch_in_gpu_cap  = 0
-        self._scratch_out_gpu_cap = 0
-
-    # ---------- shared pinned scratch pool — see TomoLarge._scratch_views
-    def _scratch_views(self, which, shape, dtype):
-        dtp = np.dtype(dtype)
-        need = int(np.prod(shape)) * dtp.itemsize
-        if which == 'in':
-            if self._scratch_in_cap < need:
-                self._scratch_in = [alloc_pinned((need,), np.uint8)
-                                    for _ in range(2)]
-                self._scratch_in_cap = need
-            bufs = self._scratch_in
-        else:
-            if self._scratch_out_cap < need:
-                self._scratch_out = [alloc_pinned((need,), np.uint8)
-                                     for _ in range(2)]
-                self._scratch_out_cap = need
-            bufs = self._scratch_out
-        return [np.frombuffer(b, dtp, int(np.prod(shape))).reshape(shape)
-                for b in bufs]
-
-    # ---------- shared GPU scratch pool — see TomoLarge._scratch_gpu_views
-    def _scratch_gpu_views(self, which, shape, dtype):
-        dtp = np.dtype(dtype)
-        n_elem = int(np.prod(shape))
-        need = n_elem * dtp.itemsize
-        n_c64 = (need + 7) // 8
-        if which == 'in':
-            if self._scratch_in_gpu_cap < need:
-                for p in (self._pipe1, self._pipe2, self._pipe3):
-                    if p is not None:
-                        p.in_gpu = []
-                self._scratch_in_gpu = None
-                self._scratch_in_gpu = [cp.empty((n_c64,), dtype=cp.complex64)
-                                        for _ in range(2)]
-                self._scratch_in_gpu_cap = n_c64 * 8
-            bufs = self._scratch_in_gpu
-        else:
-            if self._scratch_out_gpu_cap < need:
-                for p in (self._pipe1, self._pipe2, self._pipe3):
-                    if p is not None:
-                        p.out_gpu = []
-                self._scratch_out_gpu = None
-                self._scratch_out_gpu = [cp.empty((n_c64,), dtype=cp.complex64)
-                                         for _ in range(2)]
-                self._scratch_out_gpu_cap = n_c64 * 8
-            bufs = self._scratch_out_gpu
-        return [b.view(dtype)[:n_elem].reshape(shape) for b in bufs]
+        self._padx_scratch = None
+        self._pady_scratch = None
+        self._free_scratch()
 
     # ---------- pinned host-buffer cache ------------------------------------
     # Allocated PINNED so pipe load/store callbacks CPU-memcpy pinned→pinned
@@ -201,8 +156,10 @@ class PropagationLarge:
         FDE_N_BANDS + tomo_large.py for rationale."""
         shape = (ntheta, self.nz, 2 * self.n)
         if self._fde is None or self._fde.shape != shape:
+            n_bands = pick_n_bands(shape, np.complex64, band_axis=1,
+                                   min_bands=FDE_N_BANDS)
             self._fde = BandedPinned(shape, np.complex64,
-                                     n_bands=FDE_N_BANDS, band_axis=1)
+                                     n_bands=n_bands, band_axis=1)
         return self._fde
 
     def _get_out(self, ntheta):
@@ -211,14 +168,16 @@ class PropagationLarge:
         OUT_N_BANDS)."""
         shape = (ntheta, self.nz, self.n)
         if self._out is None or self._out.shape != shape:
+            n_bands = pick_n_bands(shape, np.complex64, band_axis=1,
+                                   min_bands=OUT_N_BANDS)
             self._out = BandedPinned(shape, np.complex64,
-                                     n_bands=OUT_N_BANDS, band_axis=1)
+                                     n_bands=n_bands, band_axis=1)
         return self._out
 
     def psi_buffer(self, ntheta):
         """Return a pinned (ntheta, nz, n) c64 buffer callers can fill in
         place (e.g. writing psi.real/psi.imag from proj slabs in
-        step3_fresnel_large) before passing to :meth:`D`.  Cached across
+        step3_propagation_large) before passing to :meth:`D`.  Cached across
         calls; contents are undefined on entry.
 
         Mirrors :meth:`TomoLargeReal.obj_buffer` — swaps the fresh
@@ -229,12 +188,14 @@ class PropagationLarge:
         Banded along nz (same OUT_N_BANDS as _out) so callers with very
         large nz don't trip the per-alloc cap.  Callers that write
         ``.real``/``.imag`` slices must iterate over `.bands` — see
-        step3_fresnel_large for the pattern.
+        step3_propagation_large for the pattern.
         """
         shape = (ntheta, self.nz, self.n)
         if self._psi is None or self._psi.shape != shape:
+            n_bands = pick_n_bands(shape, np.complex64, band_axis=1,
+                                   min_bands=OUT_N_BANDS)
             self._psi = BandedPinned(shape, np.complex64,
-                                     n_bands=OUT_N_BANDS, band_axis=1)
+                                     n_bands=n_bands, band_axis=1)
         return self._psi
 
     # --- forward Fresnel ---------------------------------------------------
@@ -288,18 +249,8 @@ class PropagationLarge:
 
         in_shape  = (ntheta, chunk_nz, n)
         out_shape = (ntheta, chunk_nz, 2 * n)
-        pin_in  = self._scratch_views('in',  in_shape,  np.complex64)
-        pin_out = self._scratch_views('out', out_shape, np.complex64)
-        if (self._pipe1 is None
-                or self._pipe1.in_shape  != in_shape
-                or self._pipe1.out_shape != out_shape):
-            self._pipe1 = StreamPipe(in_shape, out_shape,
-                                     np.complex64, np.complex64,
-                                     pinned_in=pin_in, pinned_out=pin_out)
-        else:
-            self._pipe1.in_pin  = pin_in
-            self._pipe1.out_pin = pin_out
-        pipe = self._pipe1
+        pipe = self._get_pipe('p1', in_shape, out_shape,
+                              np.complex64, np.complex64)
 
         # psi may be a plain ndarray (bench: user-owned) or a BandedPinned
         # (step3: filled via psi_buffer at large UPS).  copy_to handles both
@@ -339,17 +290,8 @@ class PropagationLarge:
         K_y_d = self.K_y[j]
 
         shape = (ntheta, nz, chunk_2n)
-        pin_in  = self._scratch_views('in',  shape, np.complex64)
-        pin_out = self._scratch_views('out', shape, np.complex64)
-        if (self._pipe2 is None
-                or self._pipe2.in_shape != shape
-                or self._pipe2.out_shape != shape):
-            self._pipe2 = StreamPipe(shape, shape, np.complex64, np.complex64,
-                                     pinned_in=pin_in, pinned_out=pin_out)
-        else:
-            self._pipe2.in_pin  = pin_in
-            self._pipe2.out_pin = pin_out
-        pipe = self._pipe2
+        pipe = self._get_pipe('p2', shape, shape,
+                              np.complex64, np.complex64)
 
         def load(k, dst):
             x0 = k * chunk_2n
@@ -386,18 +328,8 @@ class PropagationLarge:
 
         in_shape  = (ntheta, chunk_nz, 2 * n)
         out_shape = (ntheta, chunk_nz, n)
-        pin_in  = self._scratch_views('in',  in_shape,  np.complex64)
-        pin_out = self._scratch_views('out', out_shape, np.complex64)
-        if (self._pipe3 is None
-                or self._pipe3.in_shape  != in_shape
-                or self._pipe3.out_shape != out_shape):
-            self._pipe3 = StreamPipe(in_shape, out_shape,
-                                     np.complex64, np.complex64,
-                                     pinned_in=pin_in, pinned_out=pin_out)
-        else:
-            self._pipe3.in_pin  = pin_in
-            self._pipe3.out_pin = pin_out
-        pipe = self._pipe3
+        pipe = self._get_pipe('p3', in_shape, out_shape,
+                              np.complex64, np.complex64)
 
         def load(k, dst):
             z0 = k * chunk_nz

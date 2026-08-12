@@ -36,7 +36,7 @@ DATA_VCHUNKS="128 $((4096*UPS)) $((4096*UPS))"
 # ================================================
 
 NNODES=$(wc -l < "$PBS_NODEFILE")
-NRANKS=4            # matches 4 GPUs/node on Polaris (mirrors polaris_run.sh)
+NRANKS=4            # matches 4 GPUs/node on Polaris (mirrors polaris_pipeline_run.sh)
 NTOTRANKS=$(( NNODES * NRANKS ))
 
 SCRIPT_DIR="${PBS_O_WORKDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -69,7 +69,7 @@ echo "    data-vchunks = ${DATA_VCHUNKS}"
 # concurrent metadata opens.
 # --cpu-bind none: each rank's multiprocessing pool needs all cores.
 mpiexec -n "${NTOTRANKS}" --ppn "${NRANKS}" --cpu-bind none \
-    python "${SCRIPT_DIR}/test_h5_buffer_io.py" \
+    python "${SCRIPT_DIR}/tests/test_h5_buffer_io.py" \
         --path "${PATH_DATA}" --ups "${UPS}" \
         --nbanks "${NBANKS}" --ntasks "${NTASKS}" \
         --init-vchunks ${INIT_VCHUNKS} \

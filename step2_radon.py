@@ -7,10 +7,10 @@ Writes proj.h5 (VDS + banks; vchunks pattern from test_h5_buffer_io.py):
     {path}/model_big{UPS}x/proj.h5             VDS master (output)
     {path}/model_big{UPS}x/proj/proj_data_*.h5 bank files
 
-For each z-super-chunk (--proj-vchunks C1) this rank owns, loop NZCHUNK-sized
+For each z-super-chunk (--vchunks C1) this rank owns, loop NZCHUNK-sized
 Radon calls to fill a shared-memory buffer, then tomo_writex fans it across
---nbanks POSIX writers.  Uses the GPU-only Tomo class (whole (nz, 2N, 2N)
-frequency-domain buffer lives on the GPU) — for very large N use
+--nbanks POSIX writers.  Uses the GPU-only TomoReal class (whole (nz, 2N, N+1)
+rfft-half frequency-domain buffer lives on the GPU) — for very large N use
 step2_radon_large.py which host-chunks.
 
 Multi-GPU via MPI + set_affinity_gpu.sh.  Launch:
@@ -38,7 +38,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
 )
-from utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
+from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
 def _parse_args() -> argparse.Namespace:
@@ -48,17 +48,13 @@ def _parse_args() -> argparse.Namespace:
                    help="upsample factor (matches step1_upsample --ups)")
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
                    help="base directory; reads {path}/big{UPS}x.h5, writes {path}/model_big{UPS}x/proj.h5")
-    p.add_argument("--in-nz",  type=int, default=3072, help="init nz (before UPS)")
-    p.add_argument("--in-n",   type=int, default=3072, help="init N  (before UPS)")
     p.add_argument("--ntheta", type=int, default=None,
-                   help="angles over 360°; default = 3·N/4")
-    p.add_argument("--mask-r", type=float, default=0.0,
-                   help="soft circular mask radius (0 disables)")
+                   help="angles over 180°; default = 3·N/4")
     p.add_argument("--nzchunk", type=int, default=8,
                    help="z-slices per Radon call")
     p.add_argument("--nbanks",  type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
-    p.add_argument("--proj-vchunks", type=int, nargs=3, default=None,
+    p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk for proj.h5 (default: NTHETA, "
                         "8·NZCHUNK, N).  RAM buffer = C0·C1·C2·4 bytes/rank.")
@@ -73,14 +69,15 @@ SRC_H5   = f"{BASE_DIR}/big{UPS}x.h5"
 DST_DIR  = f"{BASE_DIR}/model_big{UPS}x"
 PROJ_H5  = f"{DST_DIR}/proj.h5"
 
-NZ      = _A.in_nz * UPS
-N       = _A.in_n  * UPS
+IN_NZ = IN_N = 3072            # init.h5 dims after step00; UPS scales from here
+NZ    = IN_NZ * UPS
+N     = IN_N  * UPS
 NTHETA  = _A.ntheta if _A.ntheta is not None else 3 * N // 4
-ANG_MAX = 2 * np.pi
-MASK_R  = _A.mask_r
+ANG_MAX = np.pi          # tomo needs 180°; step4 synthesises the 360° tile-scan
+                         # via the tomo identity proj(θ,x) = proj(θ+π, N-1-x)
 NZCHUNK = _A.nzchunk
 NBANKS  = _A.nbanks
-PROJ_VCHUNKS = tuple(_A.proj_vchunks) if _A.proj_vchunks else (NTHETA, 8 * NZCHUNK, N)
+VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (NTHETA, 8 * NZCHUNK, N)
 
 
 def load_chunk(src_dset, z_start: int, z_end: int) -> np.ndarray:
@@ -90,13 +87,13 @@ def load_chunk(src_dset, z_start: int, z_end: int) -> np.ndarray:
 
 
 def main() -> None:
-    if PROJ_VCHUNKS[1] % NZCHUNK != 0:
+    if VCHUNKS[1] % NZCHUNK != 0:
         raise SystemExit(
-            f"--proj-vchunks C1={PROJ_VCHUNKS[1]} must be a multiple of "
+            f"--vchunks C1={VCHUNKS[1]} must be a multiple of "
             f"--nzchunk={NZCHUNK}.")
-    if PROJ_VCHUNKS[0] != NTHETA:
+    if VCHUNKS[0] != NTHETA:
         raise SystemExit(
-            f"--proj-vchunks C0={PROJ_VCHUNKS[0]} must equal NTHETA={NTHETA} "
+            f"--vchunks C0={VCHUNKS[0]} must equal NTHETA={NTHETA} "
             f"(single-θ-batch mode).")
 
     if RANK == 0:
@@ -113,11 +110,10 @@ def main() -> None:
           f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','')}",
           flush=True)
     barrier()
-    rprint(f"UPS={UPS}  nz={NZ} n={N} ntheta={NTHETA} nzchunk={NZCHUNK}  "
-           f"mask_r={MASK_R}")
+    rprint(f"UPS={UPS}  nz={NZ} n={N} ntheta={NTHETA} nzchunk={NZCHUNK}")
     # TomoReal keeps the padded (2N × 2N) buffer as REAL float32 and the
-    # rfft output as (2N × (N+1)) complex64 — half the memory of the
-    # complex64 Tomo path.
+    # rfft output as (2N × (N+1)) complex64 — half the memory of a
+    # full-complex64 path.
     rprint(f"GPU est. — TomoReal padded (f32): "
            f"{NZCHUNK * (2*N)**2 * 4 / 1e9:.1f} GB  "
            f"+ rfft fde (c64): {NZCHUNK * (2*N) * (N+1) * 8 / 1e9:.1f} GB")
@@ -125,10 +121,10 @@ def main() -> None:
     if RANK == 0:
         describe_input(SRC_H5)
         describe_output(PROJ_H5, (NTHETA, NZ, N), np.float32,
-                        PROJ_VCHUNKS, "slice", NBANKS)
+                        VCHUNKS, "slice", NBANKS)
 
     ctx = initx_and_bcast(PROJ_H5, shape=(NTHETA, NZ, N),
-                          dtype=np.float32, vchunks=PROJ_VCHUNKS,
+                          dtype=np.float32, vchunks=VCHUNKS,
                           stype="slice", nbanks=NBANKS,
                           rank=RANK, comm=COMM)
     if RANK == 0:
@@ -138,19 +134,19 @@ def main() -> None:
             f["exchange"].create_dataset("theta", data=theta_deg)
     barrier()
 
-    buf_gb = vchunk_bytes(PROJ_VCHUNKS, np.float32) / 1e9
+    buf_gb = vchunk_bytes(VCHUNKS, np.float32) / 1e9
     rprint(f"per-rank shm buffer={buf_gb:.2f} GB   "
-           f"nvchunks={n_vchunks((NTHETA, NZ, N), PROJ_VCHUNKS)}")
+           f"nvchunks={n_vchunks((NTHETA, NZ, N), VCHUNKS)}")
 
     proj_min, proj_max = np.inf, -np.inf
 
     rprint("building TomoReal (allocating buffers + cuFFT plans)...")
-    cl_tomo = TomoReal(N, NZCHUNK, theta_rad, mask_r=MASK_R)
+    cl_tomo = TomoReal(N, NZCHUNK, theta_rad)
     rprint("TomoReal ready.")
 
-    ivchunks = list(iter_vchunks((NTHETA, NZ, N), PROJ_VCHUNKS))
+    ivchunks = list(iter_vchunks((NTHETA, NZ, N), VCHUNKS))
     my_ivchunks = ivchunks[RANK::SIZE]
-    shm, buf = alloc_shm(PROJ_VCHUNKS, np.float32)
+    shm, buf = alloc_shm(VCHUNKS, np.float32)
 
     try:
         with h5py.File(SRC_H5, "r") as fsrc:
@@ -158,8 +154,8 @@ def main() -> None:
             t_read = t_radon = t_write = 0.0
             b_read = b_write = 0
             for k, ivc in enumerate(my_ivchunks, start=1):
-                z0_vc = ivc[1] * PROJ_VCHUNKS[1]
-                z1_vc = min(z0_vc + PROJ_VCHUNKS[1], NZ)
+                z0_vc = ivc[1] * VCHUNKS[1]
+                z1_vc = min(z0_vc + VCHUNKS[1], NZ)
                 buf.fill(0)
 
                 for z0 in range(z0_vc, z1_vc, NZCHUNK):
@@ -223,5 +219,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    from utils import run_main
+    from mpi_utils import run_main
     run_main(main)

@@ -11,6 +11,7 @@ Outputs (all saved next to this script, in mosaic_modeling/drawings/):
     pipeline_step2_ups{UPS}.png    step2  RADON
     pipeline_step3_ups{UPS}.png    step3  FRESNEL
     pipeline_step4_ups{UPS}.png    step4  MOSAIC EXTRACT
+    pipeline_step5_ups{UPS}.png    step5  CORRECT (dezinger + darkflat + FW rings)
     pipeline_overview_ups{UPS}.png full vertical flow (all steps stacked)
 """
 
@@ -95,7 +96,7 @@ stages = [
          file=f'model_big{UPS}x/proj.h5   /exchange/data',
          shape=proj_shape, extra='φ(θ, z, s)  before propagation',
          color='#ffb98a'),
-    dict(kind='step', num=3, script='step3_fresnel.py',
+    dict(kind='step', num=3, script='step3_propagation.py',
          title='FRESNEL PROPAGATION',
          body='ψ = exp(i·φ − φ/β_ratio)  →  I = |D_R₂ψ|²\n'
               'E = 30 keV,  R₂ = 1 m  ·  GPU  ·  MPI'),
@@ -111,6 +112,14 @@ stages = [
          file='mosaic_h5/{z_idx}_{x_idx}.h5   ×' + f' {N_TILES}',
          shape=tile_shape, extra=f'one file per (z-stack, x-tile) position',
          color='#c66b52'),
+    dict(kind='step', num=5, script='step5_correct.py',
+         title='PREPROCESS TILES',
+         body='dezinger + dark-flat correction + FW ring removal\n'
+              'per-tile GPU pass (nzchunk row-strips)  ·  MPI round-robin'),
+    dict(kind='data', name=f'{N_TILES} corrected tiles',
+         file='mosaic_h5_pre/{z_idx}_{x_idx}.h5   ×' + f' {N_TILES}',
+         shape=tile_shape, extra='same schema as mosaic_h5/, ring-suppressed',
+         color='#a05840'),
 ]
 
 

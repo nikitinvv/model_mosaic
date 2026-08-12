@@ -1,0 +1,68 @@
+# Mosaic tile positions.
+# NZ=393216 N=393216 DET_H=38816 DET_W=51712 n_z=11 n_x=4 NTHETA=589824 N_HALF=294912 OVERLAP=3200
+# 
+# One row per tile — DIRECT placement only.  Mirror placement is
+# derived: same z_center; x_center_mir = N - x_center; z-crops
+# shared; x-crops swap under the h-flip.
+# 
+# step4_extract crops tile data from the DIRECT footprint in data.h5
+# and fabricates a 360° tile scan (NTHETA frames): the first N_HALF
+# are the direct crop; the second N_HALF are the mirror crop with an
+# h-flip, per proj(θ, x) = proj(θ+π, N-1-x).
+# 
+# step5_stitch reduces back to a 180° big projection of shape
+# (N_HALF, NZ, N):
+#   for each output θ in [0, N_HALF):
+#     place tile[θ]              at (z_center, x_center)      no flip
+#     place tile[θ + N_HALF][:, :, ::-1] at (z_center, N - x_center)
+# 
+# Stored tile shape = (38816-crop_top-crop_bottom, 51712-crop_left-crop_right).
+# In big projection, direct tile occupies:
+#   rows [z_center - 38816/2 + crop_top,  z_center + 38816/2 - crop_bottom)
+#   cols [x_center - 51712/2 + crop_left, x_center + 51712/2 - crop_right)
+# 
+# columns: z_tile x_tile z_center x_center crop_top crop_bottom crop_left crop_right
+0 0 18528 219264 880 0 0 0
+0 1 18528 267776 880 0 0 0
+0 2 18528 316288 880 0 0 0
+0 3 18528 364800 880 0 0 0
+1 0 54144 219264 0 0 0 0
+1 1 54144 267776 0 0 0 0
+1 2 54144 316288 0 0 0 0
+1 3 54144 364800 0 0 0 0
+2 0 89760 219264 0 0 0 0
+2 1 89760 267776 0 0 0 0
+2 2 89760 316288 0 0 0 0
+2 3 89760 364800 0 0 0 0
+3 0 125376 219264 0 0 0 0
+3 1 125376 267776 0 0 0 0
+3 2 125376 316288 0 0 0 0
+3 3 125376 364800 0 0 0 0
+4 0 160992 219264 0 0 0 0
+4 1 160992 267776 0 0 0 0
+4 2 160992 316288 0 0 0 0
+4 3 160992 364800 0 0 0 0
+5 0 196608 219264 0 0 0 0
+5 1 196608 267776 0 0 0 0
+5 2 196608 316288 0 0 0 0
+5 3 196608 364800 0 0 0 0
+6 0 232224 219264 0 0 0 0
+6 1 232224 267776 0 0 0 0
+6 2 232224 316288 0 0 0 0
+6 3 232224 364800 0 0 0 0
+7 0 267840 219264 0 0 0 0
+7 1 267840 267776 0 0 0 0
+7 2 267840 316288 0 0 0 0
+7 3 267840 364800 0 0 0 0
+8 0 303456 219264 0 0 0 0
+8 1 303456 267776 0 0 0 0
+8 2 303456 316288 0 0 0 0
+8 3 303456 364800 0 0 0 0
+9 0 339072 219264 0 0 0 0
+9 1 339072 267776 0 0 0 0
+9 2 339072 316288 0 0 0 0
+9 3 339072 364800 0 0 0 0
+10 0 374688 219264 0 880 0 0
+10 1 374688 267776 0 880 0 0
+10 2 374688 316288 0 880 0 0
+10 3 374688 364800 0 880 0 0

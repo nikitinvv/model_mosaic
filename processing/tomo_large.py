@@ -1,9 +1,21 @@
-"""TomoLarge — host-chunked USFFT Radon for volumes too big for GPU-only Tomo.
+"""TomoLargeReal — host-chunked USFFT Radon for volumes too big for the
+GPU-only TomoReal.
 
-Vendored from radon_large/tomo_large.py.  Stages small pieces of the padded
-(2N × 2N) frequency-domain buffer through the GPU while keeping the big
-`fde` and `sino` arrays on the HOST.  Peak GPU memory is proportional to
-the chunk sizes rather than to (2N)².
+Stages small pieces of the padded (2N × 2N) frequency-domain buffer
+through the GPU while keeping the big `fde` and `sino` arrays on the
+HOST.  Peak GPU memory is proportional to the chunk sizes rather than
+to (2N)².
+
+Forward R uses an rfft along x throughout (halved fde host RAM, halved
+x-FFT cost); adjoint RT keeps a pragmatic full-complex path (rfft-aware
+adjoint scatter is deferred).  RT's own persistent fde buffer is
+`(nz, 2n, 2n) c64` pinned banded — allocated lazily on first RT() call
+so R-only workloads pay nothing for it.
+
+At UPS ≥ 16 the RT adjoint scatter would OOM on the GPU if a single
+(nz, 2n, 2n) c64 slice had to live there; `_passRT2_scatter` chunks
+the destination fde along the ky axis (`gather_kernel_ychunk`) so peak
+GPU is `nz * chunk_xy * 2n * 8` bytes per launch.
 """
 from __future__ import annotations
 
@@ -11,8 +23,14 @@ import numpy as np
 import cupy as cp
 import cupyx.scipy.fft as cufft
 
-from processing.kernels import gather_kernel1, gather_kernel_rfft
-from processing.pipeline import StreamPipe, ComputeD2HPipe, alloc_pinned, BandedPinned
+from processing.kernels import (
+    gather_kernel, gather_kernel_ychunk, gather_kernel_rfft,
+    scatter_compact_kernel, gather_compact_kernel,
+)
+from processing.pipeline import (
+    ComputeD2HPipe, alloc_pinned, BandedPinned, pick_n_bands,
+)
+from processing._scratch import ScratchMixin
 
 # Number of pinned bands `_get_fde` splits its (nz, 2n, ...) buffer into
 # along the 2n axis.  cudaHostAlloc has a per-request cap (~64 GiB on some
@@ -22,577 +40,36 @@ from processing.pipeline import StreamPipe, ComputeD2HPipe, alloc_pinned, Banded
 FDE_N_BANDS = 4
 
 
-class TomoLarge:
+# =============================================================================
+# TomoLargeReal — host-chunked USFFT Radon.
+# =============================================================================
+class TomoLargeReal(ScratchMixin):
     """Radon transform via USFFT with host-staged chunking.
 
-    R(obj, chunks) is the only entry-point used by model_radon_large.py;
-    the adjoint RT is included for round-trip debugging.
-    """
-
-    def __init__(self, n, theta, rotation_axis=None):
-        """USFFT parameter setup (host-side); no per-call GPU allocations."""
-        eps = 1e-3
-        mu  = -np.log(eps) / (2 * n * n)
-        m   = int(np.ceil(2 * n * 1 / np.pi *
-                          np.sqrt(-mu * np.log(eps) + (mu * n) ** 2 / 4)))
-
-        ntheta = len(theta)
-
-        # phi is the Gaussian pre-multiplication kernel; phi[i, j] =
-        # exp(mu·n²·(t[i]²+t[j]²))·(1−n%4) is separable → store only the
-        # 1-D factor and the ±1 scalar.  Saves n² c64 at UPS≥8.
-        t = np.linspace(-1 / 2, 1 / 2, n, endpoint=False).astype("float32")
-        phi1d     = np.exp(mu * (n * n) * (t * t)).astype("complex64")
-        phi_scale = np.complex64(1 - n % 4)
-
-        # c2dfftshift is the outer product of the (2n,) ±1 checkerboard
-        # with itself; store just the 1-D vector.  Saves (2n)² i8.
-        c1dfftshift    = (1 - 2 * ((cp.arange(1, n + 1) % 2))).astype("int8")
-        c2dfftshift1d  = (1 - 2 * (np.arange(1, 2 * n + 1) % 2)).astype("int8")
-
-        # Sample coordinates x = cos(theta)·r, y = −sin(theta)·r are now
-        # recomputed inside the gather kernel from (cos_theta, sin_theta,
-        # full_idx).  Store only the two (ntheta,) trig tables here.
-        theta32   = theta.astype("float32")
-        cos_theta = np.cos(theta32).astype("float32")
-        sin_theta = np.sin(theta32).astype("float32")
-
-        self.cos_theta   = cos_theta
-        self.sin_theta   = sin_theta
-        self.n           = n
-        self.ntheta      = ntheta
-        self.theta       = theta32
-        self.mua         = cp.array([mu], dtype="float32")
-        self.m           = m
-        self.phi1d       = phi1d
-        self.phi_scale   = phi_scale
-        self.c1dfftshift = c1dfftshift
-        self.c2dfftshift1d = c2dfftshift1d
-        # GPU-side trig tables + 1-D FFT weights uploaded once per R() call.
-        self._cos_theta_gpu = None
-        self._sin_theta_gpu = None
-        # rotation_axis is accepted for API compatibility but unused here
-        # (rotation is centred at N/2 via the sample-point formulas).
-        self.rotation_axis = rotation_axis
-
-        # Cached pageable host buffers (biggest allocations in R()).
-        self._fde  = None
-        self._sino = None
-        # Cached pipes + per-bin GPU staging (preserved across R() calls;
-        # rebuilt only when the driving shape/dtype changes).  Keeps the
-        # pinned ping-pong buffers alive across calls so we don't burn
-        # tens of GB of pinned pages on every invocation.
-        self._pipe1  = None
-        self._pipe2  = None
-        self._pipe4  = None
-        self._pipe_gather = None
-        # Contiguous pinned staging for Pass-3 fde fetch — reused across
-        # bins; sized to max bin fetch.  1D so bin-width variations reshape
-        # to a contiguous head slice without stride issues.
-        self._pin_fde_stg = None
-        # Cache the (nel, idx) result of _sort_into_chunks — deterministic
-        # given chunk_xy, so re-doing it every R() call wastes ~16·ntheta·n
-        # bytes (~116 GB @ UPS=32) of pageable-host alloc/free churn.
-        self._sort_key   = None
-        self._sort_cache = None
-        # Shared pinned scratch pool for the sequentially-run StreamPipes
-        # (pipe1/pipe2/pipe4).  Each is a pair of pinned byte buffers grown
-        # on demand to the max pass need; every pass takes fresh views out
-        # of the same bytes.  Saves the per-pipe pinned duplication that
-        # used to sit idle whenever a pipe wasn't the currently-running one.
-        self._scratch_in      = None
-        self._scratch_out     = None
-        self._scratch_in_cap  = 0
-        self._scratch_out_cap = 0
-        # GPU-side analog of the pinned scratch: cupy complex64 buffers
-        # viewed per-pass as the required (shape, dtype).  Because
-        # pipe1/pipe2/pipe4 run sequentially, only one holds live GPU
-        # buffers at a time; without this, all three cached pipes retain
-        # their own ping-pong GPU allocations in the cupy pool.
-        self._scratch_in_gpu  = None
-        self._scratch_out_gpu = None
-        self._scratch_in_gpu_cap  = 0
-        self._scratch_out_gpu_cap = 0
-
-    def _sort_into_chunks(self, chunk_xy):
-        """Precompute per-chunk sample lists for a given XY chunk size.
-
-        qid is built theta-by-theta on the fly so we never materialise the
-        full x/y coordinate table on the host (that used to cost 2·4·ntheta·n
-        bytes = 54 GB at UPS=32).  Stored as int32 — max qid = (2n/chunk_xy)²
-        which fits comfortably (< 2^31 for every UPS we run).  Result is
-        cached on the instance and reused across R() calls with the same
-        chunk_xy.
-        """
-        if self._sort_key == chunk_xy:
-            return self._sort_cache
-
-        n = self.n
-        n_bin = 2 * n // chunk_xy
-        r = (np.arange(n, dtype="float32") - n / 2) / n
-        qid = np.empty(self.ntheta * n, dtype="int32")
-        for k in range(self.ntheta):
-            x_k = np.clip( self.cos_theta[k] * r, -0.5, 0.5 - 1e-5)
-            y_k = np.clip(-self.sin_theta[k] * r, -0.5, 0.5 - 1e-5)
-            fx  = np.floor(2 * n * x_k).astype("int32") + n
-            fy  = np.floor(2 * n * y_k).astype("int32") + n
-            qid[k * n:(k + 1) * n] = (fy // chunk_xy) * n_bin + fx // chunk_xy
-
-        # idx is int64 because ntheta·n exceeds 2^31 at UPS=32.  No x_s/y_s
-        # copies — the kernel recomputes from full_idx = idx[bin_slice].
-        idx = np.argsort(qid, kind="stable")
-        qid_s = qid[idx]
-
-        nel = np.zeros(n_bin * n_bin, dtype="int64")
-        change_points = np.flatnonzero(np.diff(qid_s, prepend=qid_s[0] - 1))
-        run_lengths = np.diff(np.append(change_points, len(qid_s)))
-        nel[qid_s[change_points]] = run_lengths
-        del qid, qid_s   # release the ~2·(ntheta·n·4)-byte scratch
-
-        self._sort_key   = chunk_xy
-        self._sort_cache = (nel, idx)
-        return self._sort_cache
-
-    def _get_st_end(self, indx, indy, chunk_xy):
-        """Halo-extended chunk range in the ABSOLUTE (2n × 2n) grid frame.
-        Unclamped: may be negative or exceed 2n; edge chunks are stitched
-        together with the opposite-edge wrap in `_fetch_fde_chunk` so that
-        the padded (2n × 2n) Fourier grid is treated as periodic — same
-        semantics as `Tomo`'s modular `(n + ell + twon) % twon` gather.
-        """
-        m = self.m
-        stx = indx * chunk_xy - m
-        endx = (indx + 1) * chunk_xy + m + 1
-        sty = indy * chunk_xy - m
-        endy = (indy + 1) * chunk_xy + m + 1
-        return [stx, endx, sty, endy]
-
-    def _fetch_fde_chunk_to_gpu(self, fde, sty, endy, stx, endx):
-        """Return a contiguous cupy c64 array of shape (nz, endy−sty, endx−stx)
-        containing fde[:, sty:endy, stx:endx] with WRAP on both trailing axes
-        (periodic 2n × 2n).
-
-        fde is banded on axis 1, so a single fancy-index expression like
-        `fde[:, ky[:, None], kx[None, :]]` no longer works.  We split into
-        two paths and construct the GPU patch directly:
-          * fast path (no wrap): per-band basic-slice H2D via copy_to_gpu.
-          * wrap path (edge bins only): build a small host temp using
-            per-band fancy indexing on the wrapped ky vector, then upload.
-        """
-        n2 = 2 * self.n
-        nz = fde.shape[0]
-        dst = cp.empty((nz, endy - sty, endx - stx), dtype=cp.complex64)
-        if 0 <= sty and endy <= n2 and 0 <= stx and endx <= n2:
-            fde.copy_to_gpu(dst, np.s_[:, sty:endy, stx:endx])
-            return dst
-        # Wrap path — small edge-bin allocation on host, then one H2D.
-        ky = np.arange(sty, endy) % n2
-        kx = np.arange(stx, endx) % n2
-        patch = np.empty((nz, endy - sty, endx - stx), dtype=np.complex64)
-        for bi in range(fde.n_bands):
-            b_lo = bi * fde.band_rows
-            b_hi = b_lo + fde.band_rows
-            mask = (ky >= b_lo) & (ky < b_hi)
-            if not mask.any():
-                continue
-            local_ky = ky[mask] - b_lo
-            patch[:, mask, :] = fde.bands[bi][:, local_ky[:, None], kx[None, :]]
-        dst.set(patch)
-        return dst
-
-    # ---------- explicit teardown -------------------------------------------
-    def free(self):
-        """Release cached pinned host + GPU buffers back to their pools.
-        Call this between iterations of a size sweep (or before switching
-        to a very different size) so the previous instance's fde/sino
-        (multi-hundred-GB pinned) don't linger through the next
-        allocation attempt.  Cheaper than waiting for GC."""
-        self._fde  = None
-        self._sino = None
-        self._pipe1 = None
-        self._pipe2 = None
-        self._pipe4 = None
-        self._pipe_gather = None
-        self._scratch_in  = None
-        self._scratch_out = None
-        self._scratch_in_cap  = 0
-        self._scratch_out_cap = 0
-        self._scratch_in_gpu  = None
-        self._scratch_out_gpu = None
-        self._scratch_in_gpu_cap  = 0
-        self._scratch_out_gpu_cap = 0
-
-    # ---------- shared pinned scratch pool for pipe1/2/4 --------------------
-    def _scratch_views(self, which, shape, dtype):
-        """Return a 2-element list of pinned numpy views (shape, dtype) into
-        one of the shared byte scratch buffers.  Grows the underlying pinned
-        allocation to the requested size on demand.
-
-        `which` = 'in' or 'out' — pipe1/2/4 each need one ping-pong pair on
-        each side, but only one pipe runs at a time, so all three passes
-        share the same underlying bytes.  Peak pinned pipe RAM drops from
-        ``sum(pipe_bytes)`` to ``max(pipe_bytes)``.
-        """
-        dtp = np.dtype(dtype)
-        need = int(np.prod(shape)) * dtp.itemsize
-        if which == 'in':
-            if self._scratch_in_cap < need:
-                self._scratch_in = [alloc_pinned((need,), np.uint8)
-                                    for _ in range(2)]
-                self._scratch_in_cap = need
-            bufs = self._scratch_in
-        else:
-            if self._scratch_out_cap < need:
-                self._scratch_out = [alloc_pinned((need,), np.uint8)
-                                     for _ in range(2)]
-                self._scratch_out_cap = need
-            bufs = self._scratch_out
-        return [np.frombuffer(b, dtp, int(np.prod(shape))).reshape(shape)
-                for b in bufs]
-
-    # ---------- shared GPU scratch pool for pipe1/2/4 -----------------------
-    def _scratch_gpu_views(self, which, shape, dtype):
-        """Return 2 cupy views (shape, dtype) into the shared GPU scratch
-        buffers.  Analog of _scratch_views but for the pipe in_gpu/out_gpu
-        ping-pongs.  Underlying storage is a pair of complex64 buffers big
-        enough for the largest pass; views reinterpret the bytes.
-        """
-        dtp = np.dtype(dtype)
-        n_elem = int(np.prod(shape))
-        need = n_elem * dtp.itemsize
-        n_c64 = (need + 7) // 8         # complex64 = 8 B; upper bound on elems
-        if which == 'in':
-            if self._scratch_in_gpu_cap < need:
-                # Drop caches on the cached pipes so their old (smaller) views
-                # release their refcount on the old scratch bytes before we
-                # allocate the new (bigger) scratch — keeps peak = max, not
-                # old+new.
-                for p in (self._pipe1, self._pipe2, self._pipe4):
-                    if p is not None:
-                        p.in_gpu = []
-                self._scratch_in_gpu = None      # release first
-                self._scratch_in_gpu = [cp.empty((n_c64,), dtype=cp.complex64)
-                                        for _ in range(2)]
-                self._scratch_in_gpu_cap = n_c64 * 8
-            bufs = self._scratch_in_gpu
-        else:
-            if self._scratch_out_gpu_cap < need:
-                for p in (self._pipe1, self._pipe2, self._pipe4):
-                    if p is not None:
-                        p.out_gpu = []
-                self._scratch_out_gpu = None
-                self._scratch_out_gpu = [cp.empty((n_c64,), dtype=cp.complex64)
-                                         for _ in range(2)]
-                self._scratch_out_gpu_cap = n_c64 * 8
-            bufs = self._scratch_out_gpu
-        # Reinterpret each c64 buffer as the requested dtype, then slice
-        # and reshape to the target shape.
-        return [b.view(dtype)[:n_elem].reshape(shape) for b in bufs]
-
-    # ---------- pinned host-buffer cache ------------------------------------
-    # Allocated PINNED so the Pass-3 fde fetch (cp.array(fde[..slice..]))
-    # is a fast pinned→GPU H2D and so the step2/step3 HDD-read pipelines
-    # can read chunks directly into these buffers.  Cached across R()
-    # calls when the shape matches so we don't re-pin many GB per call.
-    def _get_fde(self, nz):
-        """(nz, 2n, 2n) complex64 buffer with the y-padding rows zeroed —
-        Pass 1 writes only rows [n/2, 3n/2), so only the outer rows need
-        to start at zero (Pass 2's y-FFT depends on that padding).
-        Banded on the 2n (band_axis=1) axis; see FDE_N_BANDS."""
-        n = self.n
-        shape = (nz, 2 * n, 2 * n)
-        if self._fde is None or self._fde.shape != shape:
-            self._fde = BandedPinned(shape, np.complex64,
-                                     n_bands=FDE_N_BANDS, band_axis=1)
-            # First alloc: touch every page once so the whole buffer is
-            # resident (subsequent runs skip the page-fault storm).
-            self._fde.fill(0)
-        else:
-            # Reused buffer — zero only the y-padding rows that Pass 1
-            # doesn't overwrite (avoids a full 275 GB write at UPS=32).
-            self._fde[:, :n // 2, :]     = 0
-            self._fde[:, n // 2 + n:, :] = 0
-        return self._fde
-
-    def _get_sino(self, nz):
-        """(ntheta, nz, n) complex64 sino buffer.  Gather overwrites every
-        element, so contents may be undefined on entry."""
-        shape = (self.ntheta, nz, self.n)
-        if self._sino is None or self._sino.shape != shape:
-            self._sino = alloc_pinned(shape, np.complex64)
-        return self._sino
-
-    # ---------- forward Radon ------------------------------------------------
-    def R(self, obj, chunks):
-        """(nz, n, n) obj → (ntheta, nz, n) sinogram; obj/sino live on host.
-
-        chunks = [CHUNK_N, CHUNK_THETA, CHUNK_XY] — chunk sizes for the
-        1-D FFTs, angle grouping, and gather bin size respectively.
-        """
-        chunk_n, chunk_theta, chunk_xy = chunks
-        nz = obj.shape[0]
-
-        # Pinned host accumulators — allocated once, reused across calls.
-        fde  = self._get_fde(nz)                     # (nz, 2n, 2n) c64 zeros
-        sino = self._get_sino(nz)                    # (ntheta, nz, n) c64
-
-        # Per-chunk NUFFT sample sort — theta-major (nel, idx) only.
-        nel, idx = self._sort_into_chunks(chunk_xy)
-
-        # Upload the trig tables the gather kernel reads.  Tiny (~4·ntheta
-        # bytes each) so we just re-upload per R() call.
-        self._cos_theta_gpu = cp.asarray(self.cos_theta)
-        self._sin_theta_gpu = cp.asarray(self.sin_theta)
-
-        # No per-pass pool clearing — the cached pipes reuse their pinned +
-        # GPU buffers across R() calls, and we WANT the pool to keep those
-        # blocks live.  Fragmentation from mid-pass cufft plan workspaces
-        # is bounded by the (halved) chunk-picker budget.
-        self._pass1_xfft   (obj,  fde, chunk_n)
-        self._pass2_yfft   (      fde, chunk_n)
-        self._pass3_gather (      fde, sino, nel, idx, chunk_xy)
-        self._pass4_ifft   (            sino, chunk_theta)
-
-        return sino
-
-    # ---------- individual passes -------------------------------------------
-    def _pass1_xfft(self, obj, fde, chunk_n):
-        """Pass 1 — pipelined x-axis FFT strips.
-
-        For each chunk k, transfers obj[:, k·chunk_n:(k+1)·chunk_n] to the
-        GPU, multiplies by phi (rebuilt from the 1-D factor via broadcast),
-        zero-pads x from n to 2n, FFTs along x, multiplies by c2dfftshift
-        twice (before and after the FFT — the fftshift-via-multiply trick),
-        then writes the padded output row strip into fde[...].
-        """
-        n, nz = self.n, obj.shape[0]
-        phi_scale = self.phi_scale
-        phi1d_gpu = cp.asarray(self.phi1d)                # (n,)  c64  ~ 1 MB @ UPS=32
-        c2d1d_gpu = cp.asarray(self.c2dfftshift1d)        # (2n,) i8   ~200 KB @ UPS=32
-
-        in_shape  = (nz, chunk_n, n)
-        out_shape = (nz, chunk_n, 2 * n)
-        # Fresh pinned views come from the shared scratch pool every call
-        # (scratch may have grown since last time); the GPU ping-pong
-        # buffers are the expensive part, so we keep the StreamPipe object
-        # cached whenever the shapes match — otherwise `self._pipe1 =
-        # StreamPipe(...)` momentarily holds two sets of GPU ping-pongs
-        # while the old is still referenced, doubling cupy's pool peak.
-        pin_in  = self._scratch_views('in',  in_shape,  np.complex64)
-        pin_out = self._scratch_views('out', out_shape, np.complex64)
-        if (self._pipe1 is None
-                or self._pipe1.in_shape  != in_shape
-                or self._pipe1.out_shape != out_shape):
-            self._pipe1 = StreamPipe(in_shape, out_shape,
-                                     np.complex64, np.complex64,
-                                     pinned_in=pin_in, pinned_out=pin_out)
-        else:
-            self._pipe1.in_pin  = pin_in
-            self._pipe1.out_pin = pin_out
-        pipe = self._pipe1
-
-        def load(k, dst):
-            st = k * chunk_n
-            dst[:] = obj[:, st:st + chunk_n, :]
-
-        def compute(k, in_gpu, out_gpu):
-            st, end = k * chunk_n, (k + 1) * chunk_n
-            phix = phi1d_gpu[st:end]                             # (chunk_n,)  c64
-            c2dx = c2d1d_gpu[st:end]                             # (chunk_n,)  i8
-            out_gpu.fill(0)
-            # phi[i, j] = phi_scale · phi1d[i] · phi1d[j] — broadcast in-kernel.
-            out_gpu[:, :, n // 2 : n // 2 + n] = (
-                phi_scale * phix[None, :, None] * phi1d_gpu[None, None, :] * in_gpu
-            )
-            # Chained ±1 mask via 1-D broadcast; two multiplies fuse better
-            # than materialising the (chunk_n, 2n) outer product.
-            out_gpu *= c2dx[None, :, None]
-            out_gpu *= c2d1d_gpu[None, None, :]
-            out_gpu[...] = cp.fft.fft(out_gpu, axis=-1)
-            out_gpu *= c2dx[None, :, None]
-            out_gpu *= c2d1d_gpu[None, None, :]
-
-        def store(k, src):
-            st = k * chunk_n
-            fde.copy_from(src, np.s_[:, n // 2 + st : n // 2 + st + chunk_n, :])
-
-        pipe.run(load, compute, store, n // chunk_n)
-
-    def _pass2_yfft(self, fde, chunk_n):
-        """Pass 2 — pipelined y-axis FFT strips (chunked along x)."""
-        n, nz = self.n, fde.shape[0]
-        c2d1d_gpu = cp.asarray(self.c2dfftshift1d)        # (2n,) i8
-
-        shape = (nz, 2 * n, chunk_n)
-        pin_in  = self._scratch_views('in',  shape, np.complex64)
-        pin_out = self._scratch_views('out', shape, np.complex64)
-        if (self._pipe2 is None
-                or self._pipe2.in_shape != shape
-                or self._pipe2.out_shape != shape):
-            self._pipe2 = StreamPipe(shape, shape, np.complex64, np.complex64,
-                                     pinned_in=pin_in, pinned_out=pin_out)
-        else:
-            self._pipe2.in_pin  = pin_in
-            self._pipe2.out_pin = pin_out
-        pipe = self._pipe2
-
-        def load(k, dst):
-            st = k * chunk_n
-            fde.copy_to(dst, np.s_[:, :, st:st + chunk_n])
-
-        def compute(k, in_gpu, out_gpu):
-            st, end = k * chunk_n, (k + 1) * chunk_n
-            c2dx = c2d1d_gpu[st:end]                     # (chunk_n,) i8
-            # c2d_full[y, x] = c2d1d[y] · c2d1d[st + x] — apply as two
-            # broadcasted multiplies; avoids the (2n, chunk_n) intermediate.
-            cp.multiply(in_gpu, c2d1d_gpu[None, :, None], out=out_gpu)
-            out_gpu *= c2dx[None, None, :]
-            # cufft's overwrite_x is unreliable for non-innermost axes in
-            # this cupy version → use cp.fft.fft (returns a new array).
-            out_gpu[...] = cp.fft.fft(out_gpu, axis=1)
-            out_gpu *= c2d1d_gpu[None, :, None]
-            out_gpu *= c2dx[None, None, :]
-
-        def store(k, src):
-            st = k * chunk_n
-            fde.copy_from(src, np.s_[:, :, st:st + chunk_n])
-
-        pipe.run(load, compute, store, 2 * n // chunk_n)
-
-    def _pass3_gather(self, fde, sino, nel, idx, chunk_xy):
-        """Pass 3 — NUFFT gather per (indx, indy) bin, with the inner z
-        loop streamed via ComputeD2HPipe.
-
-        Each bin uploads its fde chunk (H2D once) plus its per-sample flat
-        index list (int64), then runs gather_kernel1 for every z-slice on
-        the compute stream while the previous slice's D2H drains on a
-        second stream, and the main thread scatters the pinned result into
-        `sino` via a precomputed flat index.  The kernel recomputes
-        (x, y) = (cos_theta·r, −sin_theta·r) from full_idx.
-        """
-        n = self.n
-        nz = fde.shape[0]
-        m, mua = self.m, self.mua
-        n_chunk_xy = 2 * n // chunk_xy
-        cos_theta_gpu = self._cos_theta_gpu
-        sin_theta_gpu = self._sin_theta_gpu
-
-        # Buffers sized to the largest bin; reused across bins AND across
-        # R() calls (cached on the instance).
-        max_nel = int(max((int(v) for v in nel), default=0))
-        if max_nel == 0:
-            return
-        if (self._pipe_gather is None
-                or self._pipe_gather.out_shape != (max_nel,)):
-            self._pipe_gather = ComputeD2HPipe((max_nel,), np.complex64)
-        gather_pipe = self._pipe_gather
-
-        offset = 0
-        # Reshape sino to a flat 1D view so gather-index scatter is simple.
-        sino_flat = sino.reshape(-1)
-
-        for indy in range(n_chunk_xy):
-            for indx in range(n_chunk_xy):
-                nel_i = int(nel[indy * n_chunk_xy + indx])
-                if nel_i == 0:
-                    continue
-                stx, endx, sty, endy = self._get_st_end(indx, indy, chunk_xy)
-
-                # Upload on the compute stream so the kernel reads after
-                # the H2D completes.  fde is banded pinned — the fetch
-                # helper builds a contiguous GPU patch either via per-band
-                # copy_to_gpu (fast path) or a small host stitch + one
-                # H2D (wrap path for edge bins).
-                full_idx  = idx[offset : offset + nel_i]      # int64, host
-                flat_base = (full_idx // n) * nz * n + (full_idx % n)
-                with gather_pipe.s_comp:
-                    fde_d = self._fetch_fde_chunk_to_gpu(fde, sty, endy, stx, endx)
-                    fidx_d = cp.asarray(full_idx)             # int64
-
-                grid, block = (int(np.ceil(nel_i / 1024)),), (1024,)
-
-                def compute(zc, out_gpu,
-                            _nel=nel_i, _fde=fde_d, _fidx=fidx_d,
-                            _stx=stx, _endx=endx, _sty=sty, _endy=endy,
-                            _grid=grid, _block=block):
-                    out_gpu[:_nel].fill(0)
-                    gather_kernel1(_grid, _block,
-                        (out_gpu[:_nel], _fde[zc],
-                         _fidx, cos_theta_gpu, sin_theta_gpu,
-                         m, mua, _nel,
-                         _stx, _endx, _sty, _endy, n, 0))
-
-                def store(zc, src_pinned, _nel=nel_i, _base=flat_base):
-                    sino_flat[_base + zc * n] = src_pinned[:_nel]
-
-                gather_pipe.run(compute, store, nz)
-                offset += nel_i
-
-    def _pass4_ifft(self, sino, chunk_theta):
-        """Pass 4 — pipelined 1-D IFFT along the r axis + normalisation."""
-        n, ntheta = self.n, self.ntheta
-        nz = sino.shape[1]
-        c1d_gpu = cp.asarray(self.c1dfftshift)
-        scale = np.float32(1.0 / (4 * n * np.sqrt(n * ntheta)))
-
-        shape = (chunk_theta, nz, n)
-        pin_in  = self._scratch_views('in',  shape, np.complex64)
-        pin_out = self._scratch_views('out', shape, np.complex64)
-        if (self._pipe4 is None
-                or self._pipe4.in_shape  != shape
-                or self._pipe4.out_shape != shape
-                or self._pipe4.out_dtype != np.dtype(np.complex64)):
-            self._pipe4 = StreamPipe(shape, shape, np.complex64, np.complex64,
-                                     pinned_in=pin_in, pinned_out=pin_out)
-        else:
-            self._pipe4.in_pin  = pin_in
-            self._pipe4.out_pin = pin_out
-        pipe = self._pipe4
-
-        def load(k, dst):
-            st = k * chunk_theta
-            dst[:] = sino[st:st + chunk_theta]
-
-        def compute(k, in_gpu, out_gpu):
-            cp.multiply(in_gpu, c1d_gpu, out=out_gpu)
-            cufft.ifft(out_gpu, axis=-1, overwrite_x=True)   # in-place on innermost
-            out_gpu *= c1d_gpu
-            out_gpu *= scale
-
-        def store(k, src):
-            st = k * chunk_theta
-            sino[st:st + chunk_theta] = src
-
-        pipe.run(load, compute, store, ntheta // chunk_theta)
-
-
-# =============================================================================
-# TomoLargeReal — float32 obj + rfft-along-x variant of TomoLarge.
-# =============================================================================
-class TomoLargeReal:
-    """Same forward Radon as TomoLarge, but the object is REAL (float32)
-    and the x-axis FFT uses rfft — cutting the (nz, 2n, 2n) complex64
-    ``fde`` buffer down to (nz, 2n, n+1) (half the host RAM, half the
-    x-axis FFT cost).  Along y we still do a full complex FFT of length
-    2n.  The gather kernel exploits ``X[fx, fy] = conj(X[-fx, -fy])``
-    (real-input symmetry) to reach into the missing negative-fx half
-    without ever storing it.
-
-    Semantics: R(obj_float32) is bit-equivalent (up to fp roundoff) to
-    ``TomoLarge.R(obj_complex64_with_imag_zero).real`` for the same obj.
+    The object is REAL (float32) and the forward x-axis FFT uses rfft —
+    cutting the (nz, 2n, 2n) complex64 ``fde`` buffer down to
+    (nz, 2n, n+1) (half the host RAM, half the x-axis FFT cost).  Along y
+    we still do a full complex FFT of length 2n.  The gather kernel
+    exploits ``X[fx, fy] = conj(X[-fx, -fy])`` (real-input symmetry) to
+    reach into the missing negative-fx half without ever storing it.
 
     Layout choices (both fftshift tricks dropped, RAW fftfreq order):
       * fde stored in fftfreq order along BOTH x (rfft, so [0, n]) and
         y (full fft, so [0, 2n) with wrap).  No c2dfftshift needed.
       * sino stored in centered (fftshift-along-r) order for backward
-        compatibility with downstream step3 / analysis code.  The Pass 4
+        compatibility with downstream step3 / analysis code.  Pass 4's
         1-D IFFT along r therefore still uses c1dfftshift.
 
     Output sino: **REAL float32**, shape ``(ntheta, nz, n)`` — Pass 4
-    takes ``.real`` after the r-axis IFFT (imag ≈ 0 for real obj).
+    takes ``.real`` after the r-axis IFFT (imag ≈ 0 for real obj input).
+
+    Adjoint RT: full complex64 path (uses `_fde_rt` at (nz, 2n, 2n) c64
+    pinned banded, distinct from R's (nz, 2n, n+1) `_fde`).  See the
+    module docstring — this is a pragmatic port; an rfft-aware adjoint
+    scatter kernel is deferred.
     """
 
-    def __init__(self, n, theta, rotation_axis=None):
+    def __init__(self, n, theta, chunk_xy):
         eps = 1e-3
         mu  = -np.log(eps) / (2 * n * n)
         m   = int(np.ceil(2 * n / np.pi *
@@ -600,13 +77,18 @@ class TomoLargeReal:
         ntheta = len(theta)
 
         # phi: real Gaussian pre-multiplication.  Separable — store 1-D
-        # factor + ±1 scalar (see TomoLarge.__init__ for full derivation).
+        # factor + ±1 scalar.  Saves n² c64 at UPS≥8.
         t = np.linspace(-1 / 2, 1 / 2, n, endpoint=False).astype("float32")
         phi1d     = np.exp(mu * (n * n) * (t * t)).astype("float32")
         phi_scale = np.float32(1 - n % 4)
 
         # c1dfftshift kept — needed for the centered sino layout in Pass 4.
         c1dfftshift = (1 - 2 * ((cp.arange(1, n + 1) % 2))).astype("int8")
+
+        # c2dfftshift 1-D vector (outer product) — needed by the RT path's
+        # full-complex y-IFFT / x-IFFT passes.  Stored as (2n,) i8; the
+        # forward passes do not need it (raw fftfreq order).
+        c2dfftshift1d = (1 - 2 * (np.arange(1, 2 * n + 1) % 2)).astype("int8")
 
         # Trig tables — the gather kernel recomputes (x, y) from these
         # plus a per-sample flat index.
@@ -624,36 +106,45 @@ class TomoLargeReal:
         self.phi1d       = phi1d                 # float32 (n,)
         self.phi_scale   = phi_scale
         self.c1dfftshift = c1dfftshift
-        self.rotation_axis = rotation_axis
+        self.c2dfftshift1d = c2dfftshift1d
 
         # Cached pinned host buffers.  sino_real is a VIEW into the first
         # half of sino's bytes (float32 vs complex64), so there's no
         # separate cache — it's derived per R() call in _pass4_ifft.
-        self._fde       = None                   # (nz, 2n, n+1) complex64
+        self._fde       = None                   # (nz, 2n, n+1) complex64 — R
+        self._fde_rt    = None                   # (nz, 2n, 2n) complex64 — RT
         self._sino      = None                   # (ntheta, nz, n) complex64
         self._obj       = None                   # (nz, n, n) float32 — pinned
-        # Cached pipes + Pass-3 pinned staging (see TomoLarge for rationale).
-        self._pipe1  = None
-        self._pipe2  = None
-        self._pipe4  = None
+        # See the pass3 gather pipe rationale (avoid re-pinning across calls).
         self._pipe_gather = None
-        self._pin_fde_stg = None       # 1D pinned pool for the fde fetch
+        # Reused (nz, chunk_n, 2n) float32 scratch for _pass1_xfft's
+        # center-placed pad-then-rfft input; reshaped/rezeroed on demand.
+        self._pad_scratch = None
         # GPU trig tables uploaded once per R() call.
         self._cos_theta_gpu = None
         self._sin_theta_gpu = None
-        # See TomoLarge._sort_into_chunks for the caching rationale.
+        # Cache the (nel, idx) result of _sort_into_chunks — deterministic
+        # given chunk_xy, so re-doing it every R() call wastes a lot of
+        # pageable-host alloc/free churn.
         self._sort_key   = None
         self._sort_cache = None
-        # Shared pinned scratch for pipe1/pipe2/pipe4 — see TomoLarge for
-        # the rationale (sequential passes → dedupe the ping-pong pinned).
-        self._scratch_in      = None
-        self._scratch_out     = None
-        self._scratch_in_cap  = 0
-        self._scratch_out_cap = 0
-        self._scratch_in_gpu  = None
-        self._scratch_out_gpu = None
-        self._scratch_in_gpu_cap  = 0
-        self._scratch_out_gpu_cap = 0
+        # Cache the per-ky-band sample-index lists for _passRT2_scatter's
+        # compact scatter kernel — same lazy-per-chunk_xy pattern.
+        self._pb_key   = None
+        self._pb_cache = None    # list[np.ndarray[int64]], length n_bands
+        # Chunk sizes for the currently-executing RT() call — stashed on
+        # self so the four passes can read them without threading extra
+        # args through.  See RT() and _passRT2_scatter.
+        self._chunks_rt = None
+        # Shared scratch pools + StreamPipe cache from ScratchMixin.
+        self._init_scratch()
+
+        # Precompute both R and RT index tables now.  chunk_xy is fixed
+        # for the lifetime of the instance — step2 / step7 / benches all
+        # know it at construction, so the first R()/RT() call sees the
+        # cached result rather than paying the precompute inline.
+        self._sort_into_chunks(chunk_xy)
+        self._per_band_precompute(chunk_xy)
 
     # ---------- bin sort for the gather -----------------------------------
     def _sort_into_chunks(self, chunk_xy):
@@ -661,7 +152,7 @@ class TomoLargeReal:
         stored [0, n+1) half-spectrum).  qid built theta-by-theta from the
         trig tables + r — no ntheta·n coordinate table ever materialised
         on the host.  qid stored as int32; max rk_x = n < 2^31.  Result
-        cached per chunk_xy across R() calls (same rationale as TomoLarge).
+        cached per chunk_xy across R() calls.
         """
         if self._sort_key == chunk_xy:
             return self._sort_cache
@@ -691,6 +182,73 @@ class TomoLargeReal:
         self._sort_cache = (nel, idx, nx_bins)
         return self._sort_cache
 
+    def _per_band_precompute(self, chunk_xy, chunk_theta_gpu=4096):
+        """Precompute per-ky-band (theta_i, x_i) int32 pairs for
+        `scatter_compact_kernel`.  Streamed GPU compute in theta-slabs
+        of `chunk_theta_gpu` angles; per band D2H'd and decoded once.
+        No persistent (ntheta, n) centers array — only the per-band
+        (theta_i, x_i) tuples (~3.6 GB at UPS=8, scales with total
+        sample count).
+
+        Wrap-around spillover at the top (b=0) and bottom (b=n_bands-1)
+        bands is folded in so a sample with centre near ky=0 (index 0
+        or 2n-1) appears in both edge bands.
+        """
+        n, ntheta = self.n, self.ntheta
+        m         = self.m
+        twon      = 2 * n
+        n_bands   = (twon + chunk_xy - 1) // chunk_xy
+        cx        = np.float32(n * 0.5)
+        x_d       = cp.arange(n, dtype=cp.float32) - cx
+        sin_np    = np.sin(self.theta).astype(np.float32)
+
+        parts = [[] for _ in range(n_bands)]
+        for t0 in range(0, ntheta, chunk_theta_gpu):
+            t1     = min(t0 + chunk_theta_gpu, ntheta)
+            sin_d  = cp.asarray(sin_np[t0:t1])
+            rk_d   = cp.rint(-2.0 * x_d[None, :] * sin_d[:, None]).astype(cp.int32)
+            centers_d = (((n + rk_d) % twon).astype(cp.int32)).ravel()
+            for b in range(n_bands):
+                y_lo   = b * chunk_xy
+                y_hi   = min(y_lo + chunk_xy, twon)
+                mask_d = (centers_d + m >= y_lo) & (centers_d - m < y_hi)
+                if y_lo == 0 and m > 0:
+                    mask_d |= (centers_d >= twon - m)
+                if y_hi == twon and m > 0:
+                    mask_d |= (centers_d < m)
+                local = cp.asnumpy(cp.where(mask_d)[0])            # int64
+                if local.size:
+                    parts[b].append(local + (t0 * n))
+            del sin_d, rk_d, centers_d
+
+        # Store as list of (theta_i, x_i) int32 tuples — kernel takes
+        # these directly, no per-RT-call decode needed.  Within each
+        # band, sort samples by rk_y (their fde ky-index) so adjacent
+        # threads scatter into adjacent fde rows: better L2 hit rate
+        # and less atomicAdd contention per warp.
+        theta_np = self.theta                            # (ntheta,) f32
+        sin_np   = np.sin(theta_np).astype(np.float32)
+        per_band = []
+        for pb in parts:
+            if not pb:
+                per_band.append((np.zeros(0, dtype=np.int32),
+                                 np.zeros(0, dtype=np.int32)))
+                continue
+            flat    = np.concatenate(pb)
+            theta_i = (flat // n).astype(np.int32)
+            x_i     = (flat %  n).astype(np.int32)
+            # rk_y = round(-2·sin(θ[i])·(x_i − n/2)); sort ascending on GPU.
+            ti_d = cp.asarray(theta_i)
+            xi_d = cp.asarray(x_i)
+            sd   = cp.asarray(sin_np)[ti_d]
+            rk_y = cp.rint(-2.0 * sd * (xi_d.astype(cp.float32) - cx)).astype(cp.int32)
+            order = cp.argsort(rk_y, kind="stable")
+            per_band.append((cp.asnumpy(ti_d[order]),
+                             cp.asnumpy(xi_d[order])))
+            del ti_d, xi_d, sd, rk_y, order
+        self._pb_cache = per_band
+        return per_band
+
     def _get_st_end(self, indx, chunk_xy):
         """Halo-extended x-column range in the stored [0, n+1) half-spectrum."""
         n, m = self.n, self.m
@@ -698,89 +256,73 @@ class TomoLargeReal:
         endx = min(n + 1, (indx + 1) * chunk_xy + m + 1)
         return stx, endx
 
-    # ---------- explicit teardown — see TomoLarge.free -----------------
+    # ---------- explicit teardown -------------------------------------------
     def free(self):
-        self._fde  = None
-        self._sino = None
-        self._obj  = None
-        self._pipe1 = None
-        self._pipe2 = None
-        self._pipe4 = None
+        """Release cached pinned host + GPU buffers back to their pools.
+        Call this between iterations of a size sweep (or before switching
+        to a very different size) so the previous instance's fde/sino
+        (multi-hundred-GB pinned) don't linger through the next
+        allocation attempt."""
+        self._fde         = None
+        self._fde_rt      = None
+        self._sino        = None
+        self._obj         = None
+        self._obj_rt      = None
         self._pipe_gather = None
-        self._scratch_in  = None
-        self._scratch_out = None
-        self._scratch_in_cap  = 0
-        self._scratch_out_cap = 0
-        self._scratch_in_gpu  = None
-        self._scratch_out_gpu = None
-        self._scratch_in_gpu_cap  = 0
-        self._scratch_out_gpu_cap = 0
+        self._pad_scratch = None
+        self._sort_key    = None
+        self._sort_cache  = None
+        self._pb_key      = None
+        self._pb_cache    = None
+        self._free_scratch()
 
-    # ---------- shared pinned scratch pool — see TomoLarge._scratch_views
-    def _scratch_views(self, which, shape, dtype):
-        dtp = np.dtype(dtype)
-        need = int(np.prod(shape)) * dtp.itemsize
-        if which == 'in':
-            if self._scratch_in_cap < need:
-                self._scratch_in = [alloc_pinned((need,), np.uint8)
-                                    for _ in range(2)]
-                self._scratch_in_cap = need
-            bufs = self._scratch_in
-        else:
-            if self._scratch_out_cap < need:
-                self._scratch_out = [alloc_pinned((need,), np.uint8)
-                                     for _ in range(2)]
-                self._scratch_out_cap = need
-            bufs = self._scratch_out
-        return [np.frombuffer(b, dtp, int(np.prod(shape))).reshape(shape)
-                for b in bufs]
-
-    # ---------- shared GPU scratch pool — see TomoLarge._scratch_gpu_views
-    def _scratch_gpu_views(self, which, shape, dtype):
-        dtp = np.dtype(dtype)
-        n_elem = int(np.prod(shape))
-        need = n_elem * dtp.itemsize
-        n_c64 = (need + 7) // 8
-        if which == 'in':
-            if self._scratch_in_gpu_cap < need:
-                for p in (self._pipe1, self._pipe2, self._pipe4):
-                    if p is not None:
-                        p.in_gpu = []
-                self._scratch_in_gpu = None
-                self._scratch_in_gpu = [cp.empty((n_c64,), dtype=cp.complex64)
-                                        for _ in range(2)]
-                self._scratch_in_gpu_cap = n_c64 * 8
-            bufs = self._scratch_in_gpu
-        else:
-            if self._scratch_out_gpu_cap < need:
-                for p in (self._pipe1, self._pipe2, self._pipe4):
-                    if p is not None:
-                        p.out_gpu = []
-                self._scratch_out_gpu = None
-                self._scratch_out_gpu = [cp.empty((n_c64,), dtype=cp.complex64)
-                                         for _ in range(2)]
-                self._scratch_out_gpu_cap = n_c64 * 8
-            bufs = self._scratch_out_gpu
-        return [b.view(dtype)[:n_elem].reshape(shape) for b in bufs]
-
-    # ---------- pinned host-buffer cache — see TomoLarge for rationale
+    # ---------- pinned host-buffer cache ------------------------------------
     def _get_fde(self, nz):
-        """Return the pinned (nz, 2n, n+1) c64 fde buffer, split into
-        FDE_N_BANDS chunks along the 2n (band_axis=1) axis so no single
-        cudaHostAlloc exceeds the driver's per-call cap at large UPS.
+        """Return the pinned (nz, 2n, n+1) c64 fde buffer (for R), split
+        into FDE_N_BANDS chunks along the 2n (band_axis=1) axis so no
+        single cudaHostAlloc exceeds the driver's per-call cap at large UPS.
         """
         shape = (nz, 2 * self.n, self.n + 1)
         if self._fde is None or self._fde.shape != shape:
+            n_bands = pick_n_bands(shape, np.complex64, band_axis=1,
+                                   min_bands=FDE_N_BANDS)
             self._fde = BandedPinned(shape, np.complex64,
-                                     n_bands=FDE_N_BANDS, band_axis=1)
+                                     n_bands=n_bands, band_axis=1)
         self._fde.fill(0)
         return self._fde
+
+    def _get_fde_rt(self, nz):
+        """Return the pinned (nz, 2n, 2n) c64 fde buffer (for RT).
+        Separate from `_fde` because RT uses the full-complex layout —
+        double the columns (2n instead of n+1) — so the two buffers cannot
+        alias.  Banded on the 2n (band_axis=1) axis; see FDE_N_BANDS."""
+        n = self.n
+        shape = (nz, 2 * n, 2 * n)
+        if self._fde_rt is None or self._fde_rt.shape != shape:
+            n_bands = pick_n_bands(shape, np.complex64, band_axis=1,
+                                   min_bands=FDE_N_BANDS)
+            self._fde_rt = BandedPinned(shape, np.complex64,
+                                        n_bands=n_bands, band_axis=1)
+        # Adjoint gather atomicAdds into fde — must start at 0.
+        self._fde_rt.fill(0)
+        return self._fde_rt
 
     def _get_sino(self, nz):
         shape = (self.ntheta, nz, self.n)
         if self._sino is None or self._sino.shape != shape:
             self._sino = alloc_pinned(shape, np.complex64)
         return self._sino
+
+    def _get_obj(self, nz, dtype=np.complex64):
+        """(nz, n, n) buffer for RT output — cast to the caller's input
+        dtype (complex64 for complex sinos, or float32 for real sinos —
+        we return .real for float32 input to mirror TomoReal.RT)."""
+        shape = (nz, self.n, self.n)
+        if (getattr(self, '_obj_rt', None) is None
+                or self._obj_rt.shape != shape
+                or self._obj_rt.dtype != np.dtype(dtype)):
+            self._obj_rt = alloc_pinned(shape, dtype)
+        return self._obj_rt
 
     def obj_buffer(self, nz):
         """Return a pinned (nz, n, n) float32 buffer callers can fill in
@@ -802,7 +344,8 @@ class TomoLargeReal:
     def R(self, obj, chunks):
         """(nz, n, n) REAL float32 obj  →  (ntheta, nz, n) real float32 sino.
 
-        chunks = [CHUNK_N, CHUNK_THETA, CHUNK_XY] — same knobs as TomoLarge.
+        chunks = [CHUNK_N, CHUNK_THETA, CHUNK_XY] — chunk sizes for the
+        1-D FFTs, angle grouping, and gather bin size respectively.
         """
         chunk_n, chunk_theta, chunk_xy = chunks
         nz = obj.shape[0]
@@ -810,14 +353,13 @@ class TomoLargeReal:
         fde  = self._get_fde(nz)
         sino = self._get_sino(nz)
 
-        nel, idx, nx_bins = self._sort_into_chunks(chunk_xy)
+        nel, idx, nx_bins = self._sort_cache        # precomputed in __init__
 
         self._cos_theta_gpu = cp.asarray(self.cos_theta)
         self._sin_theta_gpu = cp.asarray(self.sin_theta)
 
-        # Pipes and per-bin GPU buffers are cached across R() calls — see
-        # TomoLarge.R for the rationale (avoid re-pinning tens of GB of
-        # pipe buffers on every call).
+        # Pipes and per-bin GPU buffers are cached across R() calls to
+        # avoid re-pinning tens of GB of pipe buffers on every call.
         self._pass1_xfft   (obj, fde, chunk_n)
         self._pass2_yfft   (     fde, chunk_n)
         self._pass3_gather (     fde, sino, nel, idx, nx_bins, chunk_xy)
@@ -838,19 +380,8 @@ class TomoLargeReal:
 
         in_shape  = (nz, chunk_n, n)
         out_shape = (nz, chunk_n, n + 1)
-        pin_in  = self._scratch_views('in',  in_shape,  np.float32)
-        pin_out = self._scratch_views('out', out_shape, np.complex64)
-        if (self._pipe1 is None
-                or self._pipe1.in_shape  != in_shape
-                or self._pipe1.out_shape != out_shape
-                or self._pipe1.in_dtype  != np.dtype(np.float32)):
-            self._pipe1 = StreamPipe(in_shape, out_shape,
-                                     np.float32, np.complex64,
-                                     pinned_in=pin_in, pinned_out=pin_out)
-        else:
-            self._pipe1.in_pin  = pin_in
-            self._pipe1.out_pin = pin_out
-        pipe = self._pipe1
+        pipe = self._get_pipe('p1', in_shape, out_shape,
+                              np.float32, np.complex64)
 
         phi_scale = self.phi_scale
         phi1d_gpu = cp.asarray(self.phi1d)                    # (n,) f32
@@ -862,12 +393,17 @@ class TomoLargeReal:
         def compute(k, in_gpu, out_gpu):
             st, end = k * chunk_n, (k + 1) * chunk_n
             phix = phi1d_gpu[st:end]                          # (chunk_n,) f32
-            # Center-place phi*obj in the padded 2n buffer — same convention
-            # as TomoLarge — so the resulting rfft matches the FFT of a
-            # centered signal (X_c[k]).  Left-aligning at [0, n) would give
-            # a spectrum that differs by a (-i)^k phase per sample, which
-            # breaks parity with the complex64 gather.
-            padded = cp.zeros((nz, chunk_n, 2 * n), dtype=cp.float32)
+            # Center-place phi*obj in the padded 2n buffer so the resulting
+            # rfft matches the FFT of a centered signal (X_c[k]).
+            # Left-aligning at [0, n) would give a spectrum that differs
+            # by a (-i)^k phase per sample.
+            need_shape = (nz, chunk_n, 2 * self.n)
+            if (self._pad_scratch is None
+                    or self._pad_scratch.shape != need_shape):
+                self._pad_scratch = cp.zeros(need_shape, dtype=cp.float32)
+            else:
+                self._pad_scratch.fill(0)
+            padded = self._pad_scratch
             # phi[i, j] = phi_scale · phi1d[i] · phi1d[j] — separable factor.
             padded[:, :, n // 2 : n // 2 + n] = (
                 phi_scale * phix[None, :, None] * phi1d_gpu[None, None, :] * in_gpu
@@ -877,11 +413,8 @@ class TomoLargeReal:
         def store(k, src):
             st = k * chunk_n
             # Center-place along Y (offset by n//2) so the obj sits at
-            # fde[:, n//2:3n//2, :] — same convention as TomoLarge's
-            # Pass 1 and TomoReal's padded buffer.  Left-aligning at
-            # [0, n) would leave a (-i)^fy phase in the Y spectrum.
-            # BandedPinned dispatches this axis-1 write to the intersecting
-            # band(s) — chunk_n typically divides band_rows so it lands in one.
+            # fde[:, n//2:3n//2, :] — same convention as TomoReal's
+            # padded buffer.
             fde.copy_from(src, np.s_[:, n // 2 + st : n // 2 + st + chunk_n, :])
 
         pipe.run(load, compute, store, n // chunk_n)
@@ -894,33 +427,16 @@ class TomoLargeReal:
         2n along y, no c2dfftshift (raw fftfreq order).
         """
         n, nz = self.n, fde.shape[0]
-        n_x = n + 1
-        n_chunks = (n_x + chunk_n - 1) // chunk_n   # last chunk may be short
-
-        # Simpler: process a fixed chunk size that divides n, then handle
-        # the tail (the single column at kx = n) separately.  For clean
-        # power-of-2 chunking we round chunk sizes down to a divisor of n.
         assert n % chunk_n == 0, \
             f"CHUNK_N={chunk_n} must divide n={n} (rfft x-axis strips)"
         n_full = n // chunk_n   # strips covering [0, n)
 
         shape = (nz, 2 * n, chunk_n)
-        pin_in  = self._scratch_views('in',  shape, np.complex64)
-        pin_out = self._scratch_views('out', shape, np.complex64)
-        if (self._pipe2 is None
-                or self._pipe2.in_shape != shape
-                or self._pipe2.out_shape != shape):
-            self._pipe2 = StreamPipe(shape, shape, np.complex64, np.complex64,
-                                     pinned_in=pin_in, pinned_out=pin_out)
-        else:
-            self._pipe2.in_pin  = pin_in
-            self._pipe2.out_pin = pin_out
-        pipe = self._pipe2
+        pipe = self._get_pipe('p2', shape, shape,
+                              np.complex64, np.complex64)
 
         def load(k, dst):
             st = k * chunk_n
-            # Full-y stripe crosses all fde bands — copy_to iterates them
-            # into the contiguous scratch dst with no host-side temp.
             fde.copy_to(dst, np.s_[:, :, st:st + chunk_n])
 
         def compute(k, in_gpu, out_gpu):
@@ -941,15 +457,16 @@ class TomoLargeReal:
         fde[:, :, n : n + 1] = tail_col_d.get()
 
     def _pass3_gather(self, fde, sino, nel, idx, nx_bins, chunk_xy):
-        """Pass 3 — NUFFT gather via `gather_kernel_rfft`.
+        """Pass 3 — NUFFT gather via `gather_compact_kernel`.
 
         Bin samples by rk_x (their column in the stored [0, n+1) half-
         spectrum).  For each bin, fetch a FULL-y x-strip
         fde[:, :, stx:endx] — a plain contiguous slice, no synthesis —
         and let the kernel do reflection with conj; because the strip
         covers all 2n rows, the reflected access rk_y = (2n - k1) % 2n
-        is always in-range.  The kernel recomputes (x, y) from full_idx +
-        cos_theta / sin_theta (see gather_kernel_rfft in kernels.py).
+        is always in-range.  Per-bin (theta_idx, x_idx) int32 pairs are
+        decoded once on GPU from the sorted flat idx; the compact
+        kernel reads them per thread instead of doing an int64 divmod.
         """
         n = self.n
         nz = fde.shape[0]
@@ -987,18 +504,24 @@ class TomoLargeReal:
             with gather_pipe.s_comp:
                 fde_d = cp.empty((nz, 2 * n, endx - stx), dtype=cp.complex64)
                 fde.copy_to_gpu(fde_d, np.s_[:, :, stx:endx])
-                fidx_d = cp.asarray(full_idx)                # int64
+                # Compact kernel takes pre-decoded (theta_idx, x_idx)
+                # int32 pairs so it can skip the flat-idx divmod that
+                # gather_kernel_rfft did per thread.
+                fidx_d  = cp.asarray(full_idx)               # int64
+                theta_i = (fidx_d // n).astype(cp.int32)
+                x_i     = (fidx_d %  n).astype(cp.int32)
+                del fidx_d
 
             grid, block = (int(np.ceil(nel_i / 1024)),), (1024,)
 
             def compute(zc, out_gpu,
-                        _nel=nel_i, _fde=fde_d, _fidx=fidx_d,
+                        _nel=nel_i, _fde=fde_d, _ti=theta_i, _xi=x_i,
                         _stx=stx, _endx=endx,
                         _grid=grid, _block=block):
                 out_gpu[:_nel].fill(0)
-                gather_kernel_rfft(_grid, _block,
+                gather_compact_kernel(_grid, _block,
                     (out_gpu[:_nel], _fde[zc],
-                     _fidx, cos_theta_gpu, sin_theta_gpu,
+                     _xi, _ti, cos_theta_gpu, sin_theta_gpu,
                      m, mua, _nel, _stx, _endx, n))
 
             def store(zc, src_pinned, _nel=nel_i, _base=flat_base):
@@ -1010,9 +533,9 @@ class TomoLargeReal:
     def _pass4_ifft(self, sino, chunk_theta):
         """Pass 4 — pipelined r-axis IFFT + normalisation, then .real.
 
-        Same c1dfftshift-based centred-spectrum → centred-sample IFFT as
-        TomoLarge, but the output is copied out as **REAL float32**
-        (imag part ≈ 0 for real obj input, and is discarded).
+        c1dfftshift-based centred-spectrum → centred-sample IFFT; the
+        output is copied out as **REAL float32** (imag part ≈ 0 for real
+        obj input, and is discarded).
         """
         n, ntheta = self.n, self.ntheta
         nz = sino.shape[1]
@@ -1033,19 +556,8 @@ class TomoLargeReal:
 
         in_shape  = (chunk_theta, nz, n)
         out_shape = (chunk_theta, nz, n)
-        pin_in  = self._scratch_views('in',  in_shape,  np.complex64)
-        pin_out = self._scratch_views('out', out_shape, np.float32)
-        if (self._pipe4 is None
-                or self._pipe4.in_shape  != in_shape
-                or self._pipe4.out_shape != out_shape
-                or self._pipe4.out_dtype != np.dtype(np.float32)):
-            self._pipe4 = StreamPipe(in_shape, out_shape,
-                                     np.complex64, np.float32,
-                                     pinned_in=pin_in, pinned_out=pin_out)
-        else:
-            self._pipe4.in_pin  = pin_in
-            self._pipe4.out_pin = pin_out
-        pipe = self._pipe4
+        pipe = self._get_pipe('p4', in_shape, out_shape,
+                              np.complex64, np.float32)
 
         def load(k, dst):
             st = k * chunk_theta
@@ -1065,3 +577,262 @@ class TomoLargeReal:
 
         pipe.run(load, compute, store, ntheta // chunk_theta)
         return sino_real
+
+    # ---------- adjoint Radon (backprojection) ------------------------------
+    def RT(self, sino, chunks):
+        """(ntheta, nz, n) sino → (nz, n, n) obj — adjoint of R().
+
+        chunks = [CHUNK_N, CHUNK_THETA, CHUNK_XY] — same knobs as R().
+        `chunk_xy` here controls the ky-band chunking of the adjoint
+        scatter (see `_passRT2_scatter`); pass `2*n` for a single
+        launch (matches the historical per-slice behaviour at small UPS).
+
+        Four passes in reverse of R (each internally structured like
+        the corresponding forward pass but with reversed I/O and the
+        FFT/gather direction flipped):
+
+          passRT1 — 1-D FFT along the r axis (adjoint of pass4's IFFT).
+          passRT2 — adjoint NUFFT scatter sino → fde (gather dir=1),
+                    chunked along ky at `chunk_xy` rows per launch to
+                    bound GPU peak memory.
+          passRT3 — y-IFFT strips of fde (adjoint of pass2's y-FFT).
+          passRT4 — x-IFFT strips of fde, crop center-n, multiply φ,
+                    store into obj (adjoint of pass1).
+        """
+        chunk_n, chunk_theta, chunk_xy = chunks
+        ntheta = sino.shape[0]
+        nz     = sino.shape[1]
+
+        out_dtype = np.float32 if sino.dtype == np.float32 else np.complex64
+
+        # RT keeps its own (nz, 2n, 2n) c64 fde buffer, distinct from R's
+        # (nz, 2n, n+1) buffer — see `_get_fde_rt`.
+        fde = self._get_fde_rt(nz)                # (nz, 2n, 2n) c64 pinned, zeroed
+        obj = self._get_obj(nz, dtype=out_dtype)
+
+        # Stash chunks so the passes can read them without extra plumbing.
+        self._chunks_rt = list(chunks)
+
+        # Trig tables + per-bin sort not needed here (RT uses gather_kernel
+        # not gather_kernel_rfft), but the theta table is uploaded once per
+        # RT() call for the ychunk scatter kernel.
+        # PassRT1 promotes real sino → complex in-place inside sino_c (own
+        # buffer, since sino input may be real f32).  Allocated lazily.
+        sino_c = self._get_sino(nz)               # (ntheta, nz, n) c64 pinned
+
+        self._passRT1_fft    (sino, sino_c, chunk_theta)
+        # fde must start at 0 — the adjoint gather atomicAdds into it.
+        # `_get_fde_rt` already zeroed it on entry.
+        self._passRT2_scatter(sino_c, fde)
+        self._passRT3_yifft  (         fde, chunk_n)
+        self._passRT4_xifft  (         fde, obj, chunk_n)
+
+        return obj
+
+    def _passRT1_fft(self, sino, sino_c, chunk_theta):
+        """PassRT1 — adjoint of pass4.  For each θ-chunk: read sino
+        (real f32 or complex64) on host, cast + multiply by c1dfftshift,
+        1-D FFT along r, multiply by c1dfftshift and pass4's scale
+        factor, D2H back into sino_c (the complex-c64 buffer scatter
+        reads from).
+        """
+        n, ntheta = self.n, self.ntheta
+        nz = sino.shape[1]
+        c1d_gpu = cp.asarray(self.c1dfftshift)
+        # The forward TomoReal / TomoLarge bakes 1/(n·√(n·ntheta)) into
+        # `phi` at init — the host-chunked variant doesn't, so RT
+        # compensates by removing the /4 that pass4 uses in the forward
+        # direction.  Net scale = 1/(n·√(n·ntheta)).
+        scale   = np.float32(1.0 / (n * np.sqrt(n * ntheta)))
+
+        shape = (chunk_theta, nz, n)
+        # Slot 'pRT1' — distinct from forward 'p4' to avoid dtype clash
+        # (forward 'p4' is (c64 in, f32 out); RT is (c64 in, c64 out)).
+        pipe = self._get_pipe('pRT1', shape, shape,
+                              np.complex64, np.complex64)
+
+        def load(k, dst):
+            st = k * chunk_theta
+            # Cast real f32 sinos to complex64 on the host side; loader
+            # accepts either dtype since pin_in is c64.
+            dst[:] = sino[st:st + chunk_theta]
+
+        def compute(k, in_gpu, out_gpu):
+            cp.multiply(in_gpu, c1d_gpu, out=out_gpu)
+            cufft.fft(out_gpu, axis=-1, overwrite_x=True)   # in-place on innermost
+            out_gpu *= c1d_gpu
+            out_gpu *= scale
+
+        def store(k, src):
+            st = k * chunk_theta
+            sino_c[st:st + chunk_theta] = src
+
+        pipe.run(load, compute, store, ntheta // chunk_theta)
+
+    def _passRT2_scatter(self, sino, fde):
+        """PassRT2 — adjoint of pass3, compact-index scatter with
+        3-stream ping-pong H2D / compute / D2H via StreamPipe.
+
+        Per-band (theta_i, x_i) int32 pairs are pre-decoded in
+        ``_per_band_precompute`` (once at construction) and uploaded
+        per band inside the compute callback — cheap H2D on the
+        compute stream, doesn't block the pipe.
+
+        Per band: pinned_in holds the compact sino slab `(nz, max_nel)`,
+        pinned_out holds one fde slice `(nz, chunk_xy, 2n)`, both
+        double-buffered.  Band N's D2H overlaps with N+1's compute and
+        N+2's H2D.
+        """
+        n        = self.n
+        nz       = fde.shape[0]
+        twon     = 2 * n
+        m, mua   = self.m, self.mua
+        chunk_xy = self._chunks_rt[2]
+
+        theta_gpu = cp.asarray(self.theta)
+        per_band  = self._pb_cache
+        n_bands   = len(per_band)
+        max_nel   = int(max((ti.size for ti, _ in per_band), default=0))
+        if max_nel == 0:
+            return
+        threads = 1024
+
+        pipe = self._get_pipe('pRT2',
+            in_shape=(nz, max_nel),          in_dtype=np.complex64,
+            out_shape=(nz, chunk_xy, twon),  out_dtype=np.complex64)
+
+        def load(b, dst_pinned):
+            theta_i, x_i = per_band[b]
+            nel = theta_i.size
+            if nel == 0:
+                return
+            for z in range(nz):
+                dst_pinned[z, :nel] = sino[theta_i, z, x_i]
+
+        def compute(b, in_gpu, out_gpu):
+            theta_i, x_i = per_band[b]
+            nel = int(theta_i.size)
+            if nel == 0:
+                return
+            y_lo = b * chunk_xy
+            y_hi = min(y_lo + chunk_xy, twon)
+            theta_i_d = cp.asarray(theta_i)
+            x_i_d     = cp.asarray(x_i)
+            out_gpu.fill(0)
+            grid, block = (int(np.ceil(nel / threads)), 1, nz), (threads, 1, 1)
+            scatter_compact_kernel(grid, block,
+                (in_gpu, out_gpu, x_i_d, theta_i_d, theta_gpu,
+                 m, mua, n, nel, nz,
+                 np.int32(y_lo), np.int32(y_hi),
+                 np.int32(max_nel), np.int32(chunk_xy)))
+
+        def store(b, src_pinned):
+            y_lo = b * chunk_xy
+            y_hi = min(y_lo + chunk_xy, twon)
+            fde.copy_from(src_pinned[:, :y_hi - y_lo, :],
+                          np.s_[:, y_lo:y_hi, :])
+
+        pipe.run(load, compute, store, n_bands)
+
+    def _passRT3_yifft(self, fde, chunk_n):
+        """PassRT3 — adjoint of pass2's y-FFT.  For each x-strip of the
+        (nz, 2n, 2n) c64 fde: read on host, multiply by c2dfftshift-in-y
+        and c2dfftshift-in-x, 1-D IFFT along y, mask again, D2H.
+
+        The full-complex layout uses c2dfftshift (both axes centred);
+        pass2 of forward R uses raw fftfreq order (rfft path), but RT's
+        full-complex path stays on the centred layout so its result
+        matches TomoReal.RT.
+        """
+        n, nz = self.n, fde.shape[0]
+        c2d1d_gpu = cp.asarray(self.c2dfftshift1d)
+
+        shape = (nz, 2 * n, chunk_n)
+        # Slot 'pRT3' — separate from forward 'p2' whose ping-pong shape
+        # here (2 * n, chunk_n) happens to match; kept distinct so R's
+        # pipe cache is not disturbed.
+        pipe = self._get_pipe('pRT3', shape, shape,
+                              np.complex64, np.complex64)
+
+        def load(k, dst):
+            st = k * chunk_n
+            fde.copy_to(dst, np.s_[:, :, st:st + chunk_n])
+
+        def compute(k, in_gpu, out_gpu):
+            st, end = k * chunk_n, (k + 1) * chunk_n
+            c2dx = c2d1d_gpu[st:end]
+            cp.multiply(in_gpu, c2d1d_gpu[None, :, None], out=out_gpu)
+            out_gpu *= c2dx[None, None, :]
+            # cufft.overwrite_x is unreliable for non-innermost axes here
+            # — use cp.fft.ifft.
+            out_gpu[...] = cp.fft.ifft(out_gpu, axis=1)
+            out_gpu *= c2d1d_gpu[None, :, None]
+            out_gpu *= c2dx[None, None, :]
+
+        def store(k, src):
+            st = k * chunk_n
+            fde.copy_from(src, np.s_[:, :, st:st + chunk_n])
+
+        pipe.run(load, compute, store, 2 * n // chunk_n)
+
+    def _passRT4_xifft(self, fde, obj, chunk_n):
+        """PassRT4 — adjoint of pass1.  For each z-strip of fde (chunk_n
+        rows of the 2n y-axis): read on host, mask twice, 1-D IFFT along
+        x, mask twice, crop the center-n columns, multiply by
+        phi_scale·phi1d·phi1d (the same separable φ as pass1), D2H the
+        result into obj.  Only the center chunk_n rows of the y-axis
+        contribute — outer rows come out ~0 after the IFFT, so we skip.
+        """
+        n, nz     = self.n, obj.shape[0]
+        phi_scale = self.phi_scale
+        # phi1d is float32 for the forward rfft path; RT still multiplies
+        # a complex intermediate by it — cupy will broadcast the f32 phi
+        # against the c64 buffer without an intermediate promotion.
+        phi1d_gpu = cp.asarray(self.phi1d)                # (n,) f32
+        c2d1d_gpu = cp.asarray(self.c2dfftshift1d)        # (2n,) i8
+
+        # We only need the center-n y-rows for the final obj crop, but
+        # x-IFFT operates on the full 2n columns → we load full-2n
+        # strips like pass1's out_shape.
+        in_shape  = (nz, chunk_n, 2 * n)
+        out_shape = (nz, chunk_n, n)                       # after center crop
+        # Slot 'pRT4' — RT's shape/dtype match forward 'p1' partially but
+        # we keep separate slots to isolate RT's pipe state from R's.
+        pipe = self._get_pipe('pRT4', in_shape, out_shape,
+                              np.complex64, np.complex64)
+
+        # We iterate over the center-n rows of y — the outer half is
+        # zero-padding for pass1 and does not carry object information.
+        n_iter = n // chunk_n
+
+        def load(k, dst):
+            # k-th chunk in the CENTER n rows → y-offset (n//2 + k·chunk_n).
+            st = n // 2 + k * chunk_n
+            fde.copy_to(dst, np.s_[:, st:st + chunk_n, :])
+
+        def compute(k, in_gpu, out_gpu):
+            # k is a chunk index in the CENTER n rows; the pass1 phi row
+            # factor at row (n//2 + k*chunk_n + i) equals phi1d[k*chunk_n + i]
+            # since pass1 wrote `fde[y = n//2 + st + i] = phi1d[st + i] * obj[i]`.
+            st, end = k * chunk_n, (k + 1) * chunk_n
+            c2dx = c2d1d_gpu[n // 2 + st : n // 2 + end]   # (chunk_n,)
+            in_gpu *= c2dx[None, :, None]
+            in_gpu *= c2d1d_gpu[None, None, :]
+            in_gpu[...] = cp.fft.ifft(in_gpu, axis=-1)
+            in_gpu *= c2dx[None, :, None]
+            in_gpu *= c2d1d_gpu[None, None, :]
+            cropped = in_gpu[:, :, n // 2 : n // 2 + n]
+            phiy = phi1d_gpu[st:end]                        # (chunk_n,) f32
+            out_gpu[...] = (phi_scale
+                            * phiy[None, :, None]
+                            * phi1d_gpu[None, None, :]
+                            * cropped)
+
+        def store(k, src):
+            st = k * chunk_n
+            if obj.dtype == np.float32:
+                obj[:, st:st + chunk_n, :] = src.real
+            else:
+                obj[:, st:st + chunk_n, :] = src
+
+        pipe.run(load, compute, store, n_iter)

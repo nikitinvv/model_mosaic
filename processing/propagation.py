@@ -9,16 +9,15 @@ import math
 import cupy as cp
 import cupyx.scipy.fft as cufft
 
-from processing.kernels import pad_fwd_kernel, pad_adj_kernel
+from processing.kernels import pad_fwd_kernel
 
 
 class Propagation:
-    """Fresnel forward/adjoint propagator sized for (ntheta × nz × n)."""
+    """Fresnel forward propagator sized for (ntheta × nz × n)."""
 
     def __init__(self, n, nz, ntheta, ndist, wavelength, voxelsize, distance):
-        self.n       = n
-        self.nz      = nz
-        self._ntheta = ntheta
+        self.n  = n
+        self.nz = nz
 
         # Fresnel kernels on the padded (2n × 2nz) grid.
         fx = cp.fft.fftfreq(2 * n,  d=voxelsize).astype("float32")
@@ -45,18 +44,6 @@ class Propagation:
             (fpad, f, n, nz, ntheta),
         )
 
-    def _adj_pad(self, fpad, f):
-        """Adjoint padding: (ntheta, 2nz, 2n) → f (ntheta, nz, n)."""
-        ntheta = fpad.shape[0]
-        nz     = fpad.shape[1] // 2
-        n      = fpad.shape[2] // 2
-        fpad = cp.ascontiguousarray(fpad)
-        pad_adj_kernel(
-            (math.ceil(n / 32), math.ceil(nz / 32), ntheta),
-            (32, 32, 1),
-            (fpad, f, n, nz, ntheta),
-        )
-
     def D(self, psi, j):
         """Forward Fresnel propagation with the j-th kernel."""
         added_dim = psi.ndim == 2
@@ -74,25 +61,4 @@ class Propagation:
         result = self._buf_big[:ntheta,
                                self.nz // 2 : -self.nz // 2,
                                self.n  // 2 : -self.n  // 2].copy()
-        return result[0] if added_dim else result
-
-    def DT(self, big_psi, j):
-        """Adjoint Fresnel propagator with the conjugate of the j-th kernel."""
-        added_dim = big_psi.ndim == 2
-        if added_dim:
-            big_psi = big_psi[cp.newaxis]
-
-        ntheta = big_psi.shape[0]
-        self._buf_big.fill(0)
-        self._buf_big[:ntheta,
-                      self.nz // 2 : -self.nz // 2,
-                      self.n  // 2 : -self.n  // 2] = big_psi
-        with self._plan_2d:
-            cufft.fft2(self._buf_big, overwrite_x=True)
-        self._buf_big *= self.fker[j].conj()
-        with self._plan_2d:
-            cufft.ifft2(self._buf_big, overwrite_x=True, norm="forward")
-
-        result = cp.zeros_like(big_psi)
-        self._adj_pad(self._buf_big[:ntheta], result)
         return result[0] if added_dim else result

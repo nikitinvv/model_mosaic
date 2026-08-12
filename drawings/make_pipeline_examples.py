@@ -1,5 +1,5 @@
 """Representative example images from each pipeline stage — reads real
-pipeline output produced by tomo_run.sh and writes ONE PNG PER STEP:
+pipeline output produced by tomo_pipeline_run.sh and writes ONE PNG PER STEP:
 
     pipeline_examples_step0_ups{UPS}.png    init.h5           xy + xz
     pipeline_examples_step1_ups{UPS}.png    big{UPS}x.h5      xy + xz

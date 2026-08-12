@@ -9,7 +9,7 @@
 #PBS -j oe
 #
 # End-to-end mosaic-modelling pipeline on Polaris (ALCF).
-# Submit:  qsub polaris_run.sh
+# Submit:  qsub polaris_pipeline_run.sh
 #
 # Writes VDS+banks h5 stores under $PATH_DATA:
 #   init.h5, big{UPS}x.h5, model_big{UPS}x/{proj.h5, data.h5}, mosaic_h5/*
@@ -24,7 +24,7 @@
 # (SAMPLE_D_PX = 2918·UPS, SAMPLE_H_PX = 2972·UPS).
 #
 # For UPS ≥ 4 swap step2_radon.py → step2_radon_large.py (host-chunked
-# TomoLargeReal — rfft/float32) and step3_fresnel.py → step3_fresnel_large.py.
+# TomoLargeReal — rfft/float32) and step3_propagation.py → step3_propagation_large.py.
 
 NNODES=$(wc -l < $PBS_NODEFILE)
 NRANKS=4              # ranks per node (= GPUs per node on Polaris)
@@ -46,16 +46,17 @@ conda activate base
 cd "${SCRIPT_DIR}"
 
 # ================== USER KNOBS ==================
-UPS=2 #${UPS:-1}
+UPS=${UPS:-1}
 PATH_DATA=${PATH_DATA:-/eagle/APS_IRI/vnikitin/mosaic_brain}
 
 NZCHUNK=${NZCHUNK:-32}                       # z-slices per Radon call
 NPROPCHUNK=${NPROPCHUNK:-8}                  # angles per Fresnel batch
 
 NBANKS=${NBANKS:-8}                          # bank files per super-chunk
-BIG_VCHUNKS=${BIG_VCHUNKS:-}
-PROJ_VCHUNKS=${PROJ_VCHUNKS:-}
-DATA_VCHUNKS=${DATA_VCHUNKS:-}
+# Optional --vchunks overrides per step ("C0 C1 C2" as a single string).
+VCHUNKS_STEP1=${VCHUNKS_STEP1:-}
+VCHUNKS_STEP2=${VCHUNKS_STEP2:-}
+VCHUNKS_STEP3=${VCHUNKS_STEP3:-}
 # ================================================
 
 echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$NTOTRANKS  NBANKS=$NBANKS ==="
@@ -77,7 +78,7 @@ for d in "${PATH_DATA}" \
     lfs setstripe -c -1 -S 4M "$d" 2>/dev/null || true
 done
 
-vcarg() { local name="$1"; local val="$2"; [[ -n "$val" ]] && echo "--${name}-vchunks $val"; }
+vcarg() { local val="$1"; [[ -n "$val" ]] && echo "--vchunks $val"; }
 
 # HDF5 file locking is left at the default (enabled).  With the
 # tomo_info() cache + ALLOC_TIME_EARLY preallocation in
@@ -95,7 +96,7 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
 # ---------- 1. init.h5 → big{UPS}x.h5 ------------------------------------
 "${MPIEXEC[@]}" \
     python step1_upsample.py --ups "$UPS" --path "$PATH_DATA" \
-        --nbanks "$NBANKS" $(vcarg big "$BIG_VCHUNKS")
+        --nbanks "$NBANKS" $(vcarg "$VCHUNKS_STEP1")
 
 # ---------- 2. Radon → proj.h5 -------------------------------------------
 # step2_radon.py: GPU-only TomoReal (rfft/float32); fits UPS ≤ 4 on a 40 GB
@@ -104,23 +105,15 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
 "${MPIEXEC[@]}" \
     python step2_radon.py --ups "$UPS" --path "$PATH_DATA" \
         --nzchunk "$NZCHUNK" --nbanks "$NBANKS" \
-        $(vcarg proj "$PROJ_VCHUNKS")
-# UPS ≥ 4 (host-chunked TomoLargeReal; chunks auto-picked from --gpu-budget-gb).
-# "${MPIEXEC[@]}" \
-#     python step2_radon_large.py --ups "$UPS" --path "$PATH_DATA" \
-#         --nzchunk 1 --nbanks "$NBANKS" \
-#         $(vcarg proj "$PROJ_VCHUNKS")
+        $(vcarg "$VCHUNKS_STEP2")
+# For UPS≥4 swap in step2_radon_large.py (see README).
 
 # ---------- 3. Fresnel → data.h5 -----------------------------------------
 "${MPIEXEC[@]}" \
-    python step3_fresnel.py --ups "$UPS" --path "$PATH_DATA" \
+    python step3_propagation.py --ups "$UPS" --path "$PATH_DATA" \
         --npropchunk "$NPROPCHUNK" --nbanks "$NBANKS" \
-        $(vcarg data "$DATA_VCHUNKS")
-# UPS ≥ 4 (host-chunked PropagationLarge; chunks auto-picked from --gpu-budget-gb):
-# "${MPIEXEC[@]}" \
-#     python step3_fresnel_large.py --ups "$UPS" --path "$PATH_DATA" \
-#         --npropchunk "$NPROPCHUNK" --nbanks "$NBANKS" \
-#         $(vcarg data "$DATA_VCHUNKS")
+        $(vcarg "$VCHUNKS_STEP3")
+# For UPS≥4 swap in step3_propagation_large.py (see README).
 
 # ---------- 4. data.h5 → mosaic_h5/{z}_{x}.h5 -----------------------------
 # --z-pad defaults to (NZ - SAMPLE_H_PX)/2 = (4096·UPS - 2720·UPS)/2 = 688·UPS
@@ -128,5 +121,12 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
 # default (transmission of air) for out-of-bounds tile pixels.
 "${MPIEXEC[@]}" \
     python step4_extract.py --ups "$UPS" --path "$PATH_DATA"
+
+# ---------- 5. mosaic_h5 → mosaic_h5_pre  (dezinger + darkflat + FW) ------
+# Per-tile GPU preprocessing.  Tiles are round-robin sharded across ranks;
+# one GPU per rank via set_affinity_gpu_polaris.sh.
+"${MPIEXEC[@]}" \
+    python step5_correct.py --ups "$UPS" --path "$PATH_DATA" \
+        --nzchunk "$NZCHUNK"
 
 echo "=== pipeline done ==="

@@ -51,7 +51,7 @@ import numpy as np
 from multiprocessing import shared_memory
 
 from iohdf5.dxchange_hdf5_chunks import tomo_initx, tomo_readx, tomo_writex
-from utils import MPI, COMM, RANK, SIZE, barrier, rprint, allreduce
+from mpi_utils import MPI, COMM, RANK, SIZE, barrier, rprint, allreduce
 
 
 def _report_stage(label: str, bytes_local: float, time_local: float) -> None:
@@ -361,9 +361,9 @@ def main() -> None:
     _free_shm(shm_b)
     rprint("")
 
-    # ================== STAGE 2 FRESNEL: proj -> data ======================
+    # ================== STAGE 2 PROPAGATION: proj -> data ======================
     rprint("─" * 70)
-    rprint("STAGE 2 FRESNEL  proj.h5 ── read ─▶ data.h5 ── write  (per super-chunk)")
+    rprint("STAGE 2 PROPAGATION  proj.h5 ── read ─▶ data.h5 ── write  (per super-chunk)")
     rprint("─" * 70)
 
     if RANK == 0:
@@ -402,12 +402,12 @@ def main() -> None:
         t_write += time.perf_counter() - t
         bytes_write += int(np.prod(data_vc)) * dtp.itemsize
         if (k % step == 0 or k == my_total) and RANK == 0:
-            print(f"    [rank 0] fresnel {k}/{my_total} (of {total} global)  "
+            print(f"    [rank 0] propagation {k}/{my_total} (of {total} global)  "
                   f"(read={t_read:.1f}s write={t_write:.1f}s)", flush=True)
 
     barrier()
-    _report_stage("fresnel  read",  bytes_read,  t_read)
-    _report_stage("fresnel  write", bytes_write, t_write)
+    _report_stage("propagation  read",  bytes_read,  t_read)
+    _report_stage("propagation  write", bytes_write, t_write)
     _free_shm(shm_p)
     _free_shm(shm_d)
 

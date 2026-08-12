@@ -1,17 +1,13 @@
 #!/usr/bin/env python
 
 import atexit
-import h5py
-import numpy as np
-
 import multiprocessing
+import os
 from functools import partial
 from multiprocessing import shared_memory
 
-import time
-
-import json
-import os
+import h5py
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +104,6 @@ def tomo_info(filename):
                    int(dset.attrs['vchunks_2']))
         info["vchunks"] = vchunks
         info["shape"] = (nproj, ny, nx)
-        info["meta"] = json.loads(dset.attrs['meta'])
         stype = dset.attrs['stype']
         info["stype"] = stype
         # Derive chunks from vchunks + stype — matches what tomo_initx
@@ -166,44 +161,12 @@ def tomo_readx(filename, ntasks=1, shm=None, ivchunk=(0,0,0), vchunks=None):
 
     return data_out if shm_selfmanaged else data
 
-def _create_banking_plan(filename, shape, vchunks=None, nbanks_per_svchunk=1, sitems_idx = 0, meta={}):
+def _create_banking_plan(filename, shape, vchunks=None, nbanks_per_svchunk=1, sitems_idx=0):
     vchunks = vchunks if vchunks is not None else shape
 
-    #sitems_per_bank = (vchunks[sitems_idx] + nbanks - 1) // nbanks
     nchunks = (shape[sitems_idx] + vchunks[sitems_idx] - 1) // vchunks[sitems_idx]
 
-    fstorages = ['']*nbanks_per_svchunk
-
-    if 'infra' in meta: 
-        if meta['infra'] == 'aps25':
-            for ibank in range(nbanks_per_svchunk):
-                if ibank % 3 == 0:
-                    fstorages[ibank] = '/data/scratch/'
-                elif ibank % 3 == 1:
-                    fstorages[ibank] = '/data2/scratch/'
-                else:
-                    fstorages[ibank] = '/data3/scratch/'
-
-        if meta['infra'] == 'aps25_13':
-            for ibank in range(nbanks_per_svchunk):
-                if ibank % 2 == 0:
-                    fstorages[ibank] = '/data/scratch/'
-                else:
-                    fstorages[ibank] = '/data3/scratch/'
-
-        elif meta['infra'] == 'maxiv-aps25':
-            for ibank in range(nbanks_per_svchunk):
-                if ibank % 3 == 0:
-                    fstorages[ibank] = '/scratch/tomo-doe/data/scratch/'
-                elif ibank % 3 == 1:
-                    fstorages[ibank] = '/scratch/tomo-doe/data2/scratch/'
-                else:
-                    fstorages[ibank] = '/scratch/tomo-doe/data3/scratch/'
-
-        elif meta['infra'] in ['',None,[],()]:
-            pass
-        else:
-            raise Exception("Unsupported infrastructure: %s" % (meta['infra'],))
+    fstorages = [''] * nbanks_per_svchunk
 
     # create filename formatter
     basename_no_ext, fext = os.path.splitext(os.path.basename(filename))
@@ -240,7 +203,7 @@ def _create_banking_plan(filename, shape, vchunks=None, nbanks_per_svchunk=1, si
     return banks_filename_path, banks_size, banks_filename_vsrc
             
 def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
-               nbanks=1, meta={}):
+               nbanks=1):
     """Create a VDS master file + all bank files (single-rank).
 
     Fast because each bank file's h5py.File 'w' + create_dataset just
@@ -250,30 +213,19 @@ def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
     banking plan is deterministic in the params).
     """
     nproj, ny, nx = shape
-    stype = 'proj' if stype.lower() == 'proj' or stype.lower() == 'projs' else 'slice'
-    dtp = np.dtype(dtype)
+    stype = 'proj' if stype.lower() in ('proj', 'projs') else 'slice'
     vchunks = vchunks if vchunks is not None else (nproj, ny, nx)
 
     sitems_idx = 0 if stype == 'proj' else 1
 
-    banks_filename_path, banks_size, banks_filename_vsrc = _create_banking_plan(filename=filename,
-                                                                                shape=shape,
-                                                                                vchunks=vchunks,
-                                                                                nbanks_per_svchunk=nbanks,
-                                                                                sitems_idx = sitems_idx,
-                                                                                meta=meta)
+    banks_filename_path, banks_size, banks_filename_vsrc = _create_banking_plan(
+        filename=filename, shape=shape, vchunks=vchunks,
+        nbanks_per_svchunk=nbanks, sitems_idx=sitems_idx)
 
-    # test if VDS present already
-    _test = True
     if os.path.isfile(filename):
         with h5py.File(filename, mode, libver='latest') as fid:
-            try:
-                dset = fid['/exchange/data']
-                _test = False
-            except:
-                pass
-    if not _test:
-        raise Exception("Virtual dataset exists already.")
+            if '/exchange/data' in fid:
+                raise Exception("Virtual dataset exists already.")
 
     # create directory(ies)
     for filepath in banks_filename_path:
@@ -281,56 +233,50 @@ def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
         if fdirname:
             os.makedirs(fdirname, exist_ok=True)
 
-    try:
-        layout = h5py.VirtualLayout(shape=(nproj,ny,nx), dtype=dtype)
-        sitems_per_bank = (vchunks[sitems_idx] + nbanks - 1) // nbanks
-        nchunks = (shape[sitems_idx] + vchunks[sitems_idx] - 1) // vchunks[sitems_idx]
+    layout = h5py.VirtualLayout(shape=(nproj, ny, nx), dtype=dtype)
+    sitems_per_bank = (vchunks[sitems_idx] + nbanks - 1) // nbanks
+    nchunks = (shape[sitems_idx] + vchunks[sitems_idx] - 1) // vchunks[sitems_idx]
 
-        for _ivchunk in range(nchunks):
-            for ibank in range(nbanks):
-                bank_idx = _ivchunk*nbanks + ibank
-                filename_data_file = banks_filename_path[bank_idx]
-                filename_data_vsrc = banks_filename_vsrc[bank_idx]
-                sitems_offset = _ivchunk*vchunks[sitems_idx]
-                sitems_start = sitems_offset + ibank * sitems_per_bank
-                sitems_end = sitems_offset + (ibank+1) * sitems_per_bank
-                sitems_end = sitems_end if (sitems_end - sitems_offset) < vchunks[sitems_idx] else sitems_offset + vchunks[sitems_idx]
-                sitems_end = sitems_end if sitems_end < shape[sitems_idx] else shape[sitems_idx]
-                if sitems_end > sitems_start:
+    for _ivchunk in range(nchunks):
+        for ibank in range(nbanks):
+            bank_idx = _ivchunk * nbanks + ibank
+            filename_data_file = banks_filename_path[bank_idx]
+            filename_data_vsrc = banks_filename_vsrc[bank_idx]
+            sitems_offset = _ivchunk * vchunks[sitems_idx]
+            sitems_start = sitems_offset + ibank * sitems_per_bank
+            sitems_end = sitems_offset + (ibank + 1) * sitems_per_bank
+            sitems_end = min(sitems_end, sitems_offset + vchunks[sitems_idx], shape[sitems_idx])
+            if sitems_end > sitems_start:
+                if stype == 'proj':
+                    vsource = h5py.VirtualSource(filename_data_vsrc, "/exchange/data",
+                                                 shape=(sitems_end - sitems_start, ny, nx))
+                    layout[sitems_start:sitems_end, :, :] = vsource
+                else:
+                    vsource = h5py.VirtualSource(filename_data_vsrc, "/exchange/data",
+                                                 shape=(nproj, sitems_end - sitems_start, nx))
+                    layout[:, sitems_start:sitems_end, :] = vsource
+                with h5py.File(filename_data_file, 'w') as hf_out:
+                    g = hf_out.create_group('/exchange')
                     if stype == 'proj':
-                        vsource = h5py.VirtualSource(filename_data_vsrc, "/exchange/data", shape=(sitems_end-sitems_start,ny,nx))
-                        layout[sitems_start:sitems_end,:,:] = vsource
+                        g.create_dataset('data',
+                                         shape=(sitems_end - sitems_start, ny, nx),
+                                         chunks=(1,) + vchunks[1:],
+                                         dtype=dtype, fillvalue=None)
                     else:
-                        vsource = h5py.VirtualSource(filename_data_vsrc, "/exchange/data", shape=(nproj,sitems_end-sitems_start,nx))
-                        layout[:,sitems_start:sitems_end,:] = vsource
-                    with h5py.File(filename_data_file, 'w') as hf_out:
-                        g = hf_out.create_group('/exchange')
-                        if stype == 'proj':
-                            dset = g.create_dataset(
-                                'data',
-                                shape=(sitems_end-sitems_start, ny, nx),
-                                chunks=(1,) + vchunks[1:],
-                                dtype=dtype, fillvalue=None)
-                        else:
-                            dset = g.create_dataset(
-                                'data',
-                                shape=(nproj, sitems_end-sitems_start, nx),
-                                chunks=(vchunks[0], 1, vchunks[2]),
-                                dtype=dtype, fillvalue=None)
-        # create master file
-        with h5py.File(filename, 'w', libver='latest') as hf:
-            dset = hf.create_virtual_dataset('/exchange/data', layout, fillvalue=-5)
-            dset.attrs['nbanks_per_svchunk'] = nbanks
-            dset.attrs['stype'] = stype
-            dset.attrs['vchunks_0'] = vchunks[0]
-            dset.attrs['vchunks_1'] = vchunks[1]
-            dset.attrs['vchunks_2'] = vchunks[2]
-            dset.attrs['meta'] = json.dumps(meta)
-    finally:
-        pass
+                        g.create_dataset('data',
+                                         shape=(nproj, sitems_end - sitems_start, nx),
+                                         chunks=(vchunks[0], 1, vchunks[2]),
+                                         dtype=dtype, fillvalue=None)
+    # create master file
+    with h5py.File(filename, 'w', libver='latest') as hf:
+        dset = hf.create_virtual_dataset('/exchange/data', layout, fillvalue=-5)
+        dset.attrs['nbanks_per_svchunk'] = nbanks
+        dset.attrs['stype'] = stype
+        dset.attrs['vchunks_0'] = vchunks[0]
+        dset.attrs['vchunks_1'] = vchunks[1]
+        dset.attrs['vchunks_2'] = vchunks[2]
 
-    ctx = {'banks_filename_path': banks_filename_path, 'banks_size': banks_size}
-    return ctx
+    return {'banks_filename_path': banks_filename_path, 'banks_size': banks_size}
     
 def tomo_writex(filename, data, shm=None, ivchunk=(0,0,0), ctx=None):
 
@@ -339,24 +285,18 @@ def tomo_writex(filename, data, shm=None, ivchunk=(0,0,0), ctx=None):
     stype = info['stype']
     shape = info['shape']
     vchunks = info['vchunks']
-    meta = info['meta']
     dtp = info['dtype']
     nbanks_per_svchunk = info['nbanks_per_svchunk']
-    
+
     nproj, ny, nx = shape
     assert data.dtype == dtp
 
     sitems_idx = 0 if stype == 'proj' else 1
 
-    if ctx is None:    
-        banks_filename_path,
-        banks_size,
-        banks_filename_vsrc = _create_banking_plan(filename=filename,
-                                                   shape=shape,
-                                                   vchunks=vchunks,
-                                                   nbanks_per_svchunk=nbanks_per_svchunk,
-                                                   sitems_idx = sitems_idx,
-                                                   meta=meta)
+    if ctx is None:
+        banks_filename_path, banks_size, _ = _create_banking_plan(
+            filename=filename, shape=shape, vchunks=vchunks,
+            nbanks_per_svchunk=nbanks_per_svchunk, sitems_idx=sitems_idx)
         ctx = {'banks_filename_path': banks_filename_path, 'banks_size': banks_size}
     
     if shm is None:
@@ -512,84 +452,3 @@ def _process_write_projs(itask, ntasks, filename, shape, dtype, shm, vchunks, iv
         pass
     return itask
 
-#### Specific I/O
-
-def _process_read_slices(task_meta, fname, vchunksx, sitems_offset, direct_chunk, zerocp, dtype, shm):
-        
-    out = np.ndarray(shape=vchunksx, dtype=np.float32, buffer=shm.buf)
-    buffer = np.empty(vchunksx, dtype=dtype) if not zerocp else None  # intermediate buffer
-    
-    proj_sel = task_meta['proj_sel']
-    
-    with h5py.File(fname, 'r') as hf_in:
-        dset = hf_in['/exchange/data']
-        if direct_chunk:
-            if zerocp:
-                dset.read_direct(out, source_sel=np.s_[proj_sel[0]:proj_sel[1],:,:], dest_sel=np.s_[proj_sel[0]-sitems_offset:proj_sel[1]-sitems_offset,:,:])
-            else:
-                dset.read_direct(buffer, source_sel=np.s_[proj_sel[0]:proj_sel[1],:,:], dest_sel=np.s_[proj_sel[0]-sitems_offset:proj_sel[1]-sitems_offset,:,:])
-                #np.copyto(dst=out, src=buffer)
-                out[proj_sel[0]-sitems_offset:proj_sel[1]-sitems_offset,:,:] = buffer[proj_sel[0]-sitems_offset:proj_sel[1]-sitems_offset,:,:]
-        else:
-            out[proj_sel[0]-sitems_offset:proj_sel[1]-sitems_offset,:,:] = dset[proj_sel[0]:proj_sel[1],:,:]
-            
-    return np.arange(proj_sel[0],proj_sel[1]).tolist()
-     
-def read_projs_vchunkx(fname, shm, ntasks, vchunksx, ivchunkx, shm_ret_meta=None):
-
-    _t = time.time()
-    
-    with h5py.File(fname, 'r') as fid:
-        dset = fid['/exchange/data']
-        shape = dset.shape
-        dset_is_virtual = dset.is_virtual
-        dset_is_float32 = np.dtype(dset.dtype) == np.dtype(np.float32)
-        dtp = dset.dtype
-
-    data = np.ndarray(shape=vchunksx, dtype=np.float32, buffer=shm.buf)
-    
-    sitems_per_task = (vchunksx[0] + ntasks - 1) // ntasks
-    sitems_offset = vchunksx[0] * ivchunkx[0]
-
-    task_meta = []
-    
-    for itask in range(ntasks):
-        sitems_start = sitems_offset + itask * sitems_per_task
-        sitems_end = sitems_offset + (itask+1) * sitems_per_task
-        sitems_end = sitems_end if (sitems_end-sitems_offset) < vchunksx[0] else sitems_offset + vchunksx[0]
-        sitems_end = sitems_end if sitems_end < shape[0] else shape[0]
-        if sitems_end > sitems_start:
-            task_meta.append({'itask': itask, 'proj_sel': (sitems_start, sitems_end)})
-
-    with multiprocessing.Pool(processes=ntasks) as pool:
-        results = pool.map(partial(_process_read_slices, fname=fname, vchunksx=vchunksx, sitems_offset=sitems_offset, direct_chunk=not dset_is_virtual, zerocp=dset_is_float32, dtype=dtp, shm=shm), task_meta)
-    
-    _t = time.time() - _t
- 
-    if shm_ret_meta is not None:
-        ret_meta = np.ndarray(shape=(3,), dtype=np.float64, buffer=shm_ret_meta.buf)
-        ret_meta[0] = _t
-    
-    return data
-
-def write_vchunkx(fname_out, shm, vchunksx, vchunks, ctx, ivchunkx, shm_ret_meta=None):
-    _t = time.time()
-
-    data = np.ndarray(shape=vchunksx, dtype=np.float32, buffer=shm.buf)
-    
-    # vchunksx is larger than vchunks. We have to save it block by block manually with data-copy (i.e. not using shm)
-    nblocks = (vchunksx[1] + vchunks[1] - 1) // vchunks[1]
-    for iblock in range(nblocks):
-        block_start = iblock * vchunks[1]
-        block_end = (iblock+1) * vchunks[1]
-        block_end = block_end if block_end < vchunksx[1] else vchunksx[1]
-        if block_end > block_start:
-            tomo_writex(fname_out, data[:,block_start:block_end,:], shm=None, ivchunk=(ivchunkx[0],iblock,ivchunkx[2]), ctx=ctx)
-            
-    _t = time.time() - _t
- 
-    if shm_ret_meta is not None:
-        ret_meta = np.ndarray(shape=(3,), dtype=np.float64, buffer=shm_ret_meta.buf)
-        ret_meta[2] = _t
-
-    return 0

@@ -18,7 +18,7 @@ step scripts running in the main process.
 Everything the step scripts need lives here, so a step's boilerplate
 stays down to:
 
-    from utils import COMM, RANK, SIZE, barrier, rprint, allreduce
+    from mpi_utils import COMM, RANK, SIZE, barrier, rprint, allreduce
 """
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ if not _IS_WORKER:
     #
     # Opt-out: setting MOSAIC_SKIP_MPI_FINALIZE=1 skips Finalize
     # entirely.  Use this only for launchers where Finalize is known
-    # to misbehave (e.g. tomo_run.sh, when MPI's SM/UCX teardown races
+    # to misbehave (e.g. tomo_pipeline_run.sh, when MPI's SM/UCX teardown races
     # can't be avoided some other way).  Cost: OpenMPI's mpirun then
     # prints an "abnormal termination" warning per run.
     import os as _os
@@ -83,6 +83,26 @@ def rprint(*a, **k) -> None:
         print(*a, **k)
 
 
+def banner(step: str, title: str = "", width: int = 80) -> None:
+    """Print a rank-0-only banner marking the start of a pipeline stage.
+
+    Format: `======== Step <n> ========` centred to `width`, followed by
+    an optional description line.  Kept concise so long run logs stay
+    scannable — earlier versions used a 5-row block-letter STEP header
+    that ate too much vertical space."""
+    if RANK != 0:
+        return
+    label = f" Step {step} "
+    pad   = max(4, (width - len(label)) // 2)
+    line  = "=" * pad + label + "=" * (width - pad - len(label))
+    print("", flush=True)
+    print(line, flush=True)
+    if title:
+        print(title, flush=True)
+    print("=" * width, flush=True)
+    print("", flush=True)
+
+
 def allreduce(val, op):
     """Wrapper for COMM.allreduce.  In a worker (COMM is None) returns
     the local value unchanged — workers should never call this, but
@@ -97,11 +117,11 @@ def run_main(main_func) -> None:
 
     Use as the entry point in every step script:
         if __name__ == "__main__":
-            from utils import run_main
+            from mpi_utils import run_main
             run_main(main)
 
     On clean exit: main() returns, Python exits normally.  We skip
-    MPI.Finalize (see utils.py MPI init), so mpirun/mpiexec may print
+    MPI.Finalize (see mpi_utils.py MPI init), so mpirun/mpiexec may print
     a generic "abnormal termination" warning — that is expected and
     means nothing is wrong.
 
