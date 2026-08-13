@@ -20,19 +20,20 @@ N_GPUS=${N_GPUS:-4}                          # total ranks
 
 # NBANKS = bank files per super-chunk (also = multiprocessing pool size).
 # Total writers on the machine = N_GPUS × NBANKS.
-NBANKS=${NBANKS:-4}
+NBANKS=${NBANKS:-8}
 NTASKS=${NTASKS:-4}
+NZCHUNK=${NZCHUNK:-8}                        # inner z-slab for fbp read loop
 
-INIT_VCHUNKS=${INIT_VCHUNKS:-"32 4096 4096"}
-BIG_VCHUNKS=${BIG_VCHUNKS:-"$((32*UPS)) $((4096*UPS)) $((4096*UPS))"}
-PROJ_VCHUNKS=${PROJ_VCHUNKS:-"128 $((4096*UPS)) $((4096*UPS))"}
-DATA_VCHUNKS=${DATA_VCHUNKS:-"128 $((4096*UPS)) $((4096*UPS))"}
+INIT_VCHUNKS=${INIT_VCHUNKS:-"32 3072 3072"}
+BIG_VCHUNKS=${BIG_VCHUNKS:-"$((32*UPS)) $((3072*UPS)) $((3072*UPS))"}
+PROJ_VCHUNKS=${PROJ_VCHUNKS:-"128 $((3072*UPS)) $((3072*UPS))"}
+DATA_VCHUNKS=${DATA_VCHUNKS:-"128 $((3072*UPS)) $((3072*UPS))"}
+PGN_VCHUNKS=${PGN_VCHUNKS:-"128 $((3072*UPS)) $((3072*UPS))"}
+REC_VCHUNKS=${REC_VCHUNKS:-"$((32*UPS)) $((3072*UPS)) $((3072*UPS))"}
 # ================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Raise FD limit if possible.
-ulimit -n 65536 2>/dev/null || true
 
 # Disable HDF5 POSIX-lock probes so N_GPUS × NBANKS concurrent processes
 # opening the same master VDS + bank files don't race on lock probes.
@@ -40,17 +41,22 @@ export HDF5_USE_FILE_LOCKING=FALSE
 
 mkdir -p "${PATH_DATA}"
 
-echo "=== UPS=${UPS}  PATH_DATA=${PATH_DATA}  N_GPUS=${N_GPUS}  NBANKS=${NBANKS}  NTASKS=${NTASKS} ==="
+echo "=== UPS=${UPS}  PATH_DATA=${PATH_DATA}  N_GPUS=${N_GPUS}  NBANKS=${NBANKS}  NTASKS=${NTASKS}  NZCHUNK=${NZCHUNK} ==="
 echo "    init-vchunks = ${INIT_VCHUNKS}"
 echo "    big-vchunks  = ${BIG_VCHUNKS}"
 echo "    proj-vchunks = ${PROJ_VCHUNKS}"
 echo "    data-vchunks = ${DATA_VCHUNKS}"
+echo "    pgn-vchunks  = ${PGN_VCHUNKS}"
+echo "    rec-vchunks  = ${REC_VCHUNKS}"
 
+cd "${SCRIPT_DIR}"
 mpirun -n "${N_GPUS}" set_affinity_gpu.sh \
-    python "${SCRIPT_DIR}/tests/test_h5_buffer_io.py" \
+    python -m tests.test_h5_buffer_io \
         --path "${PATH_DATA}" --ups "${UPS}" \
-        --nbanks "${NBANKS}" --ntasks "${NTASKS}" \
+        --nbanks "${NBANKS}" --ntasks "${NTASKS}" --nzchunk "${NZCHUNK}" \
         --init-vchunks ${INIT_VCHUNKS} \
         --big-vchunks  ${BIG_VCHUNKS} \
         --proj-vchunks ${PROJ_VCHUNKS} \
-        --data-vchunks ${DATA_VCHUNKS}
+        --data-vchunks ${DATA_VCHUNKS} \
+        --pgn-vchunks  ${PGN_VCHUNKS} \
+        --rec-vchunks  ${REC_VCHUNKS}

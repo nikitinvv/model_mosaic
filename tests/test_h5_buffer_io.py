@@ -47,6 +47,7 @@ import os
 import shutil
 import time
 
+import h5py
 import numpy as np
 from multiprocessing import shared_memory
 
@@ -142,6 +143,9 @@ def _parse_args():
                    help="bank files per super-chunk (parallel POSIX writers)")
     p.add_argument("--ntasks",  type=int, default=8,
                    help="worker processes used by tomo_readx (per stage)")
+    p.add_argument("--nzchunk", type=int, default=8,
+                   help="inner z-slab (== step8_fbp --nzchunk); drives fbp "
+                        "per-iteration sinogram read size")
     p.add_argument("--init-vchunks", type=int, nargs=3, default=None,
                    metavar=("C0","C1","C2"),
                    help="super-chunk for init.h5 (default fits ~ nbanks planes)")
@@ -151,6 +155,12 @@ def _parse_args():
                    metavar=("C0","C1","C2"))
     p.add_argument("--data-vchunks", type=int, nargs=3, default=None,
                    metavar=("C0","C1","C2"))
+    p.add_argument("--pgn-vchunks",  type=int, nargs=3, default=None,
+                   metavar=("C0","C1","C2"),
+                   help="super-chunk for paganin.h5 (default: nbanks, OUT_NZ, N)")
+    p.add_argument("--rec-vchunks",  type=int, nargs=3, default=None,
+                   metavar=("C0","C1","C2"),
+                   help="super-chunk for rec.h5 (default: nbanks, N, N)")
     return p.parse_args()
 
 
@@ -165,15 +175,22 @@ def main() -> None:
     N      = IN_NYX * UPS
     NTHETA = args.ntheta if args.ntheta is not None else 3 * N // 4
 
+    # paganin.h5 has half the angles after 180° stitching (matches step7)
+    N_HALF = NTHETA // 2
+
     init_shape = (IN_NZ,  IN_NYX, IN_NYX)
     big_shape  = (OUT_NZ, N,      N     )
     proj_shape = (NTHETA, OUT_NZ, N     )
     data_shape = (NTHETA, OUT_NZ, N     )
+    pgn_shape  = (N_HALF, OUT_NZ, N     )
+    rec_shape  = (OUT_NZ, N,      N     )
 
     init_vc = tuple(args.init_vchunks) if args.init_vchunks else (args.nbanks, IN_NYX, IN_NYX)
     big_vc  = tuple(args.big_vchunks)  if args.big_vchunks  else (args.nbanks, N,      N     )
     proj_vc = tuple(args.proj_vchunks) if args.proj_vchunks else (args.nbanks, OUT_NZ, N     )
     data_vc = tuple(args.data_vchunks) if args.data_vchunks else (args.nbanks, OUT_NZ, N     )
+    pgn_vc  = tuple(args.pgn_vchunks)  if args.pgn_vchunks  else (args.nbanks, OUT_NZ, N     )
+    rec_vc  = tuple(args.rec_vchunks)  if args.rec_vchunks  else (args.nbanks, N,      N     )
 
     def _validate(name, shape, vc):
         if any(c > s for c, s in zip(vc, shape)):
@@ -185,12 +202,16 @@ def main() -> None:
     _validate(f"big{UPS}x.h5", big_shape,  big_vc)
     _validate("proj.h5",       proj_shape, proj_vc)
     _validate("data.h5",       data_shape, data_vc)
+    _validate("paganin.h5",    pgn_shape,  pgn_vc)
+    _validate("rec.h5",        rec_shape,  rec_vc)
 
     os.makedirs(args.path, exist_ok=True)
     INIT = os.path.join(args.path, "init.h5")
     BIG  = os.path.join(args.path, f"big{UPS}x.h5")
     PROJ = os.path.join(args.path, "proj.h5")
     DATA = os.path.join(args.path, "data.h5")
+    PGN  = os.path.join(args.path, "paganin.h5")
+    REC  = os.path.join(args.path, "rec.h5")
 
     rprint(f"[test_h5_buffer_io]  UPS={UPS}   nbanks={args.nbanks}   "
            f"ntasks={args.ntasks}   MPI ranks={SIZE}")
@@ -201,6 +222,8 @@ def main() -> None:
         _describe(f"big{UPS}x.h5", big_shape,  big_vc,  args.nbanks, 4)
         _describe("proj.h5",       proj_shape, proj_vc, args.nbanks, 4)
         _describe("data.h5",       data_shape, data_vc, args.nbanks, 4)
+        _describe("paganin.h5",    pgn_shape,  pgn_vc,  args.nbanks, 4)
+        _describe("rec.h5",        rec_shape,  rec_vc,  args.nbanks, 4)
     rprint("")
 
     dtype = np.float32
@@ -410,6 +433,125 @@ def main() -> None:
     _report_stage("propagation  write", bytes_write, t_write)
     _free_shm(shm_p)
     _free_shm(shm_d)
+    rprint("")
+
+    # ================== STAGE 3 PAGANIN: data -> paganin ===================
+    rprint("─" * 70)
+    rprint("STAGE 3 PAGANIN     data.h5 ── read ─▶ paganin.h5 ── write  "
+           "(per super-chunk)")
+    rprint("─" * 70)
+    # Mimics step7_paganin.py: reads a θ-slab of pgn_vc[0] angles from a
+    # proj-stored source via plain h5py.File (VDS-transparent, single
+    # reader per rank), then fans a same-shape write across nbanks banks.
+
+    if RANK == 0:
+        _cleanup_h5(PGN)
+        ctx_pgn = tomo_initx(filename=PGN, shape=pgn_shape, dtype=dtype,
+                             vchunks=pgn_vc, stype="proj", nbanks=args.nbanks)
+    else:
+        ctx_pgn = None
+    barrier()
+
+    ctx_pgn = COMM.bcast(ctx_pgn, root=0)
+
+    shm_pg, buf_pg = _alloc_shm(pgn_vc, dtype)
+    rprint(f"  buffer for paganin: {_hb(buf_pg.nbytes)}   ({pgn_vc})")
+
+    pgn_ivchunks = list(_iter_vchunks(pgn_shape, pgn_vc))
+    my_pgn = pgn_ivchunks[RANK::SIZE]
+    total = len(pgn_ivchunks)
+    my_total = len(my_pgn)
+    step = max(1, my_total // 10) if my_total else 1
+    fake_pgn = rng.random(pgn_vc, dtype=np.float32)
+
+    t_read = t_write = 0.0
+    bytes_read = bytes_write = 0
+    for k, ivc in enumerate(my_pgn, start=1):
+        t0_vc = ivc[0] * pgn_vc[0]
+        t1_vc = min(t0_vc + pgn_vc[0], pgn_shape[0])
+
+        t = time.perf_counter()
+        with h5py.File(DATA, "r") as fp:
+            _ = fp["exchange/data"][t0_vc:t1_vc, :pgn_vc[1], :pgn_vc[2]]
+        t_read += time.perf_counter() - t
+        bytes_read += (t1_vc - t0_vc) * pgn_vc[1] * pgn_vc[2] * dtp.itemsize
+
+        buf_pg[:] = fake_pgn
+
+        t = time.perf_counter()
+        tomo_writex(PGN, data=buf_pg, shm=shm_pg, ivchunk=ivc, ctx=ctx_pgn)
+        t_write += time.perf_counter() - t
+        bytes_write += int(np.prod(pgn_vc)) * dtp.itemsize
+        if (k % step == 0 or k == my_total) and RANK == 0:
+            print(f"    [rank 0] paganin {k}/{my_total} (of {total} global)  "
+                  f"(read={t_read:.1f}s write={t_write:.1f}s)", flush=True)
+
+    barrier()
+    _report_stage("paganin  read",  bytes_read,  t_read)
+    _report_stage("paganin  write", bytes_write, t_write)
+    rprint("")
+
+    # ================== STAGE 4 FBP: paganin -> rec ========================
+    rprint("─" * 70)
+    rprint("STAGE 4 FBP        paganin.h5 ── SLICE read ─▶ rec.h5 ── write  "
+           "(per super-chunk)")
+    rprint("─" * 70)
+    # Mimics step8_fbp.py: for each rec.h5 super-chunk of (VZ, N, N),
+    # loops nzchunk-sized z-slabs and reads a sinogram slab
+    # [:, zc0:zc1, :] from proj-stored paganin.h5 — cross-bank access
+    # that stresses VDS resolution (spans every θ-bank of the source).
+
+    if RANK == 0:
+        _cleanup_h5(REC)
+        ctx_rec = tomo_initx(filename=REC, shape=rec_shape, dtype=dtype,
+                             vchunks=rec_vc, stype="proj", nbanks=args.nbanks)
+    else:
+        ctx_rec = None
+    barrier()
+
+    ctx_rec = COMM.bcast(ctx_rec, root=0)
+
+    shm_r, buf_r = _alloc_shm(rec_vc, dtype)
+    rprint(f"  buffer for rec:     {_hb(buf_r.nbytes)}   ({rec_vc})")
+
+    rec_ivchunks = list(_iter_vchunks(rec_shape, rec_vc))
+    my_rec = rec_ivchunks[RANK::SIZE]
+    total = len(rec_ivchunks)
+    my_total = len(my_rec)
+    step = max(1, my_total // 10) if my_total else 1
+    fake_rec = rng.random(rec_vc, dtype=np.float32)
+
+    NZCHUNK = args.nzchunk
+
+    t_read = t_write = 0.0
+    bytes_read = bytes_write = 0
+    for k, ivc in enumerate(my_rec, start=1):
+        z0_vc = ivc[0] * rec_vc[0]
+        z1_vc = min(z0_vc + rec_vc[0], rec_shape[0])
+
+        for zc0 in range(z0_vc, z1_vc, NZCHUNK):
+            zc1 = min(zc0 + NZCHUNK, z1_vc)
+            t = time.perf_counter()
+            with h5py.File(PGN, "r") as fp:
+                _ = fp["exchange/data"][:, zc0:zc1, :]
+            t_read += time.perf_counter() - t
+            bytes_read += pgn_shape[0] * (zc1 - zc0) * pgn_shape[2] * dtp.itemsize
+
+        buf_r[:] = fake_rec
+
+        t = time.perf_counter()
+        tomo_writex(REC, data=buf_r, shm=shm_r, ivchunk=ivc, ctx=ctx_rec)
+        t_write += time.perf_counter() - t
+        bytes_write += int(np.prod(rec_vc)) * dtp.itemsize
+        if (k % step == 0 or k == my_total) and RANK == 0:
+            print(f"    [rank 0] fbp {k}/{my_total} (of {total} global)  "
+                  f"(read={t_read:.1f}s write={t_write:.1f}s)", flush=True)
+
+    barrier()
+    _report_stage("fbp      read",  bytes_read,  t_read)
+    _report_stage("fbp      write", bytes_write, t_write)
+    _free_shm(shm_pg)
+    _free_shm(shm_r)
 
 
 if __name__ == "__main__":

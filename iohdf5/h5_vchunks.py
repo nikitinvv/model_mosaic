@@ -71,7 +71,7 @@ def free_shm(shm) -> None:
 
 
 def initx_and_bcast(path, shape, dtype, vchunks, stype="proj",
-                    nbanks=8, meta=None, rank=0, comm=None):
+                    nbanks=8, rank=0, comm=None):
     """Rank 0 clears any prior master + creates VDS + all bank files.
     Other ranks compute the banking plan locally (deterministic in the
     params, so no bcast is needed).  Barrier at the end ensures the
@@ -79,8 +79,7 @@ def initx_and_bcast(path, shape, dtype, vchunks, stype="proj",
     if rank == 0:
         cleanup_h5(path)
         ctx = _initx(filename=path, shape=shape, dtype=dtype,
-                     vchunks=vchunks, stype=stype, nbanks=nbanks,
-                     meta=meta or {})
+                     vchunks=vchunks, stype=stype, nbanks=nbanks)
     else:
         # Deterministic plan — recompute the paths+sizes without
         # touching the filesystem.
@@ -88,8 +87,7 @@ def initx_and_bcast(path, shape, dtype, vchunks, stype="proj",
         sitems_idx = 0 if stype.lower().startswith("proj") else 1
         banks_filename_path, banks_size, _ = _create_banking_plan(
             filename=path, shape=shape, vchunks=vchunks,
-            nbanks_per_svchunk=nbanks, sitems_idx=sitems_idx,
-            meta=meta or {})
+            nbanks_per_svchunk=nbanks, sitems_idx=sitems_idx)
         ctx = {'banks_filename_path': banks_filename_path,
                'banks_size': banks_size}
     if comm is not None:

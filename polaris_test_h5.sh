@@ -28,11 +28,14 @@ PATH_DATA=/eagle/APS_IRI/vnikitin/iotest_buf_ups${UPS}_mpi
 # Keep it modest to avoid NIC/OST contention within one node.
 NBANKS=4
 NTASKS=4
+NZCHUNK=8                        # inner z-slab for fbp read loop
 
-INIT_VCHUNKS="32 4096 4096"
-BIG_VCHUNKS="$((32*UPS)) $((4096*UPS)) $((4096*UPS))"
-PROJ_VCHUNKS="128 $((4096*UPS)) $((4096*UPS))"
-DATA_VCHUNKS="128 $((4096*UPS)) $((4096*UPS))"
+INIT_VCHUNKS="32 3072 3072"
+BIG_VCHUNKS="$((32*UPS)) $((3072*UPS)) $((3072*UPS))"
+PROJ_VCHUNKS="128 $((3072*UPS)) $((3072*UPS))"
+DATA_VCHUNKS="128 $((3072*UPS)) $((3072*UPS))"
+PGN_VCHUNKS="128 $((3072*UPS)) $((3072*UPS))"
+REC_VCHUNKS="$((32*UPS)) $((3072*UPS)) $((3072*UPS))"
 # ================================================
 
 NNODES=$(wc -l < "$PBS_NODEFILE")
@@ -57,11 +60,13 @@ ulimit -n 65536 2>/dev/null || true
 mkdir -p "${PATH_DATA}"
 lfs setstripe -c -1 -S 4M "${PATH_DATA}" 2>/dev/null || true
 
-echo "=== UPS=${UPS}  PATH_DATA=${PATH_DATA}  NBANKS=${NBANKS}  NTASKS=${NTASKS}  NODES=${NNODES}  NRANKS/node=${NRANKS} ==="
+echo "=== UPS=${UPS}  PATH_DATA=${PATH_DATA}  NBANKS=${NBANKS}  NTASKS=${NTASKS}  NZCHUNK=${NZCHUNK}  NODES=${NNODES}  NRANKS/node=${NRANKS} ==="
 echo "    init-vchunks = ${INIT_VCHUNKS}"
 echo "    big-vchunks  = ${BIG_VCHUNKS}"
 echo "    proj-vchunks = ${PROJ_VCHUNKS}"
 echo "    data-vchunks = ${DATA_VCHUNKS}"
+echo "    pgn-vchunks  = ${PGN_VCHUNKS}"
+echo "    rec-vchunks  = ${REC_VCHUNKS}"
 
 # HDF5 file locking left at the default (enabled).  The tomo_info()
 # cache in iohdf5/dxchange_hdf5_chunks.py eliminates the metadata-read
@@ -69,10 +74,12 @@ echo "    data-vchunks = ${DATA_VCHUNKS}"
 # concurrent metadata opens.
 # --cpu-bind none: each rank's multiprocessing pool needs all cores.
 mpiexec -n "${NTOTRANKS}" --ppn "${NRANKS}" --cpu-bind none \
-    python "${SCRIPT_DIR}/tests/test_h5_buffer_io.py" \
+    python -m tests.test_h5_buffer_io \
         --path "${PATH_DATA}" --ups "${UPS}" \
-        --nbanks "${NBANKS}" --ntasks "${NTASKS}" \
+        --nbanks "${NBANKS}" --ntasks "${NTASKS}" --nzchunk "${NZCHUNK}" \
         --init-vchunks ${INIT_VCHUNKS} \
         --big-vchunks  ${BIG_VCHUNKS} \
         --proj-vchunks ${PROJ_VCHUNKS} \
-        --data-vchunks ${DATA_VCHUNKS}
+        --data-vchunks ${DATA_VCHUNKS} \
+        --pgn-vchunks  ${PGN_VCHUNKS} \
+        --rec-vchunks  ${REC_VCHUNKS}
