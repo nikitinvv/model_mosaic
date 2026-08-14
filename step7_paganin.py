@@ -66,10 +66,19 @@ def _parse_args() -> argparse.Namespace:
                    help="super-chunk for paganin.h5 (default: 8·NPGNCHUNK, NZ, N)")
     p.add_argument("--chunk-order", choices=("sino", "proj"), default="sino",
                    help="HDF5 chunk order inside paganin.h5's bank files.  "
-                        "'sino' (default) = (θ_per_bank, 1, N), what step8's "
-                        "z-slab FBP read wants.  'proj' = (1, NZ, N), the old "
-                        "layout — makes that read touch every chunk to use "
-                        "zslab/NZ of it.  Banking is θ-split either way.")
+                        "'sino' (default) = (θ_per_bank, chunk_z, N), what "
+                        "step8's z-slab FBP read wants.  'proj' = (1, NZ, N), "
+                        "the old layout — makes that read touch every chunk "
+                        "to use zslab/NZ of it.  Banking is θ-split either "
+                        "way.")
+    p.add_argument("--chunk-z", type=int, default=32,
+                   help="z-extent of the sinogram chunk.  Set it equal to "
+                        "step8_fbp's --vchunks C0 (the FBP z-slab): then each "
+                        "bank file serves that read with a single whole-chunk "
+                        "sequential read.  --chunk-z 1 is the pure-sinogram "
+                        "extreme and costs one HDF5 op per z row per bank — "
+                        "latency-bound on Lustre.  Bigger than the FBP z-slab "
+                        "reads parts of chunks back.  Ignored for 'proj'.")
     return p.parse_args()
 
 
@@ -98,12 +107,14 @@ VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8 * NPGNCHUNK, NZ, N)
 # HDF5 chunk shape inside the bank files.  Banking stays θ-split (stype
 # 'proj') because ranks shard on θ and each bank file must have exactly one
 # writer — but the chunks are laid out for the reader.  step8 reads
-# (NTHETA, zslab, N) sinograms, so a chunk spanning one z row and a whole
-# bank's worth of angles is read whole; the old (1, NZ, N) projection chunk
-# was read NZ/zslab-fold over.  θ_per_bank is what tomo_initx's banking plan
-# puts in each bank file, so this covers a chunk exactly.
+# (NTHETA, zslab, N) sinograms, so the chunk covers a whole bank's worth of
+# angles and exactly one FBP z-slab: that read then costs one sequential
+# whole-chunk op per bank file.  θ_per_bank is what tomo_initx's banking
+# plan puts in each bank file, so the θ extent covers a bank exactly.
 THETA_PER_BANK = (VCHUNKS[0] + NBANKS - 1) // NBANKS
-H5CHUNKS = (THETA_PER_BANK, 1, N) if _A.chunk_order == "sino" else (1, NZ, N)
+CHUNK_Z = max(1, min(_A.chunk_z, NZ))
+H5CHUNKS = ((THETA_PER_BANK, CHUNK_Z, N) if _A.chunk_order == "sino"
+            else (1, NZ, N))
 
 
 def main() -> None:

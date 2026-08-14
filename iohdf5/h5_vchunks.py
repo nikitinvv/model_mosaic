@@ -195,6 +195,7 @@ def describe_output(path: str, shape, dtype, vchunks, stype: str,
           flush=True)
     print(f"       → {nsvchunks} super-chunks × {nbanks} banks = "
           f"{total_banks} bank files", flush=True)
+    sino_ordered = h5chunk[0] > 1 and h5chunk[1] < bank_shape[1]
     print(f"       bank shape={bank_shape} ({_hb(bank_bytes)})  "
           f"HDF5 chunk={h5chunk} ({_hb(chunk_bytes)})"
-          f"{'  [sinogram-ordered]' if h5chunk[1] == 1 else ''}", flush=True)
+          f"{'  [sinogram-ordered]' if sino_ordered else ''}", flush=True)

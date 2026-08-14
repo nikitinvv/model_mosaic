@@ -1,10 +1,10 @@
 #!/bin/bash
 #PBS -A 14238
-#PBS -l select=10:system=polaris
+#PBS -l select=2:system=polaris
 #PBS -l place=scatter
 #PBS -l filesystems=home:grand:eagle
-#PBS -l walltime=0:30:00
-#PBS -q debug-scaling
+#PBS -l walltime=0:15:00
+#PBS -q debug
 #PBS -N mosaic_buf_io_mpi
 #PBS -j oe
 #
@@ -28,7 +28,7 @@ PATH_DATA=/eagle/APS_IRI/vnikitin/iotest_buf_ups${UPS}_mpi
 # Keep it modest to avoid NIC/OST contention within one node.s
 NBANKS=4
 NTASKS=4
-NZCHUNK=8                        # inner z-slab for fbp read loop
+NZCHUNK=1                        # inner z-slab for fbp read loop
 
 INIT_VCHUNKS="32 3072 3072"
 BIG_VCHUNKS="$((32*UPS)) $((3072*UPS)) $((3072*UPS))"
@@ -76,7 +76,7 @@ echo "    rec-vchunks  = ${REC_VCHUNKS}"
 mpiexec -n "${NTOTRANKS}" --ppn "${NRANKS}" --cpu-bind none \
     python -m tests.test_h5_buffer_io \
         --path "${PATH_DATA}" --ups "${UPS}" \
-        --nbanks "${NBANKS}" --ntasks "${NTASKS}" --nzchunk "${NZCHUNK}" \
+        --nbanks "${NBANKS}" --ntasks "${NTASKS}" --nzchunk "${NZCHUNK}" --pgn-chunk-order proj   \
         --init-vchunks ${INIT_VCHUNKS} \
         --big-vchunks  ${BIG_VCHUNKS} \
         --proj-vchunks ${PROJ_VCHUNKS} \
