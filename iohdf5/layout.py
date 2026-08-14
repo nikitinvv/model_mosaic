@@ -234,44 +234,39 @@ def plan_chunks(bank_shape, order, itemsize, chunk_bytes,
     if dim0_one:
         limit[0] = 1
 
-    def grow(ordr, clamp_z):
-        chunk = [1, 1, 1]
-        for ax in _PRIORITY[ordr]:
-            lim, tile = limit[ax], bank_shape[ax]
-            # z is the one axis a consumer granule can bind, and only once θ
-            # has actually grown past 1 -- with chunk[0] == 1 the z range is
-            # the outermost non-trivial axis, so any contiguous z sub-range
-            # is one contiguous run and a fatter chunk is strictly better.
-            # (Held unconditionally, this clamp collapses the chunk to
-            # 384 KB at UPS>=8: the sino:1 failure mode from the last sweep.)
-            if ax == 1 and clamp_z and chunk[0] > 1 \
-                    and z_granule and int(z_granule) > 0:
-                lim = min(lim, int(z_granule))
-                tile = gcd(tile, int(z_granule))
-            rest = itemsize
-            for a in range(3):
-                if a != ax:
-                    rest *= chunk[a]
-            room = max(1, cap // rest)
-            chunk[ax] = _largest_divisor_le(tile, min(lim, room))
-        n = itemsize
-        for c in chunk:
-            n *= c
-        return tuple(chunk), n
+    chunk = [1, 1, 1]
+    for ax in _PRIORITY[order]:
+        lim, tile = limit[ax], bank_shape[ax]
+        # z is the one axis a consumer granule can bind, and only once θ
+        # has actually grown past 1 -- with chunk[0] == 1 the z range is
+        # the outermost non-trivial axis, so any contiguous z sub-range is
+        # one contiguous run and a fatter chunk is strictly better.
+        if ax == 1 and chunk[0] > 1 and z_granule and int(z_granule) > 0:
+            lim = min(lim, int(z_granule))
+            tile = gcd(tile, int(z_granule))
+        rest = itemsize
+        for a in range(3):
+            if a != ax:
+                rest *= chunk[a]
+        room = max(1, cap // rest)
+        chunk[ax] = _largest_divisor_le(tile, min(lim, room))
+    nbytes = itemsize
+    for c in chunk:
+        nbytes *= c
 
-    chunk, nbytes = grow(order, clamp_z=True)
-
-    # The z clamp buys whole-chunk reads only while the chunk stays a
-    # sensible op size.  At high UPS the FBP z-slab shrinks faster than the
-    # θ extent grows -- UPS=8 gives (2, 24, 24576) = 4.5 MB -- and a chunk
-    # that small is back on the per-op latency wall the sino order exists
-    # to avoid.  When the clamped chunk lands under half the target, take
-    # the unclamped proj-ordered shape instead: chunk[0] == 1 there, so the
-    # consumer's z sub-range is one contiguous run per chunk anyway.
-    if order == "sino" and nbytes * 2 < cap:
-        alt, alt_bytes = grow("proj", clamp_z=False)
-        if alt_bytes > nbytes:
-            chunk, nbytes = alt, alt_bytes
+    # No fallback to the projection order when the clamped sino chunk comes
+    # out under the byte target.  It is tempting -- chunk[0] == 1 there, so
+    # the consumer's z sub-range is one contiguous run and the chunk itself
+    # can be much fatter -- but the run is only z_granule*N*itemsize long
+    # and there is one PER θ, where the sino order pays one op per (bank,
+    # z-chunk).  Measured at UPS=2 / 32 ranks, FBP read:
+    #     (18, 96, 6144)  40.5 MB sino  ->  3.55 GB/s   (64 ops of 40.5 MB)
+    #     (1, 6144, 6144) 144  MB proj  ->  0.25 GB/s   (576 ops of 4.7 MB)
+    # A clamped sino chunk is already the largest shape that keeps the FBP
+    # read whole-chunk (θ full within the bank, z = the granule, x full), so
+    # when it lands small there is nothing better to grow into.  Where the
+    # bank holds a single θ (UPS=32 at a 64 GiB budget) chunk[0] is 1 anyway
+    # and the order degenerates to proj on its own.
 
     if nbytes > HDF5_MAX_CHUNK_BYTES:      # unreachable; cheap to assert
         raise ValueError(f"planned chunk {tuple(chunk)} is {nbytes} B, "

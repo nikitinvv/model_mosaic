@@ -115,13 +115,29 @@ def test_chunk_bytes_stay_near_the_target():
     """The point of the policy: chunk BYTES are roughly constant while the
     shape follows N.  The old full-plane default was 36 MB at UPS=1 and
     9 GB at UPS=16.  The floor is loose because a small bank extent can
-    cap the chunk (e.g. init.h5 at nbanks=1), the ceiling is not."""
+    cap the chunk (e.g. init.h5 at nbanks=1), the ceiling is not.
+
+    A sinogram-ordered chunk is exempt from the floor.  It is capped by
+    theta_bank * z_granule * N -- the whole of that bank file's share of
+    one FBP read, and so the largest shape that keeps the read
+    whole-chunk.  When that lands under the target there is nothing
+    better to grow into, so assert instead that the chunk really is that
+    clamped maximum."""
     for ups, nbanks, p in _all_plans():
         where = f"ups={ups} nbanks<={nbanks} {p.name}"
         assert p.chunk_bytes <= CHUNK_BYTES, \
             f"{where}: {p.chunk_bytes} B > target {CHUNK_BYTES} B"
-        assert p.chunk_bytes >= CHUNK_BYTES // 8, \
+        if p.chunk_bytes >= CHUNK_BYTES // 8:
+            continue
+        assert p.effective_order == "sino", \
             f"{where}: chunk {p.chunks} is only {p.chunk_bytes} B"
+        bank = p.bank_shape
+        assert p.chunks[0] == bank[0] and p.chunks[2] == bank[2], \
+            f"{where}: sino chunk {p.chunks} is short of the bank {bank} " \
+            f"on theta or x, so the granule clamp is not what capped it"
+        assert p.z_granule and p.z_granule % p.chunks[1] == 0, \
+            f"{where}: sino cz {p.chunks[1]} does not divide the FBP " \
+            f"z-slab {p.z_granule}"
 
 
 def test_every_buffer_fits_the_budget():
@@ -160,9 +176,9 @@ def test_paganin_z_divides_the_fbp_slab_when_sino_ordered():
     """The one place a consumer granule binds: step8 reads (all θ, zslab,
     N) out of paganin.h5.  With chunk[0] > 1 a z sub-range inside a chunk
     is chunk[0] separate runs, so cz must divide the slab exactly.  With
-    chunk[0] == 1 it is one contiguous run and a fatter chunk is strictly
-    better — which is why the policy falls back to proj order at high UPS
-    rather than shrinking the chunk to 4.5 MB."""
+    chunk[0] == 1 — which is where the sino order lands on its own once a
+    bank holds a single θ — the z range is the outermost non-trivial axis,
+    so it is one contiguous run and a fatter chunk is strictly better."""
     for ups in UPS_LIST:
         for nbanks in NBANKS_LIST:
             plans = plan_pipeline(ups, nbanks=nbanks, budget=BUDGET,
