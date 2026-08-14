@@ -25,7 +25,7 @@ PATH_DATA=/eagle/APS_IRI/vnikitin/iotest_buf_ups${UPS}_mpi
 
 # NBANKS = bank files per super-chunk (also = multiprocessing pool size).
 # With NRANKS=4 per node, total writers/node = NRANKS × NBANKS = 16.
-# Keep it modest to avoid NIC/OST contention within one node.
+# Keep it modest to avoid NIC/OST contention within one node.s
 NBANKS=4
 NTASKS=4
 NZCHUNK=8                        # inner z-slab for fbp read loop
