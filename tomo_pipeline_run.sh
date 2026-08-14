@@ -40,6 +40,8 @@ NPROPCHUNK=${NPROPCHUNK:-8}                  # angles per Fresnel batch
 # and a single local disk backend saturates at ~8-16 concurrent writers.
 # On Lustre (Polaris, `-c -1`) you can push NBANKS=8 since each stripe = one OST.
 NBANKS=${NBANKS:-8}                          # bank files per super-chunk
+NTASKS=${NTASKS:-8}                          # parallel workers for read_{projs,slices}_vchunkx
+                                             # (steps 3, 7, 8 prefetch reads via VDS+banks pool)
 # Optional --vchunks overrides per step ("C0 C1 C2" as a single string);
 # leave empty for each step's default.
 VCHUNKS_STEP1=${VCHUNKS_STEP1:-}   # step1 big.h5  default (8·UPS, OUT_NYX, OUT_NYX)
@@ -68,7 +70,7 @@ export HDF5_USE_FILE_LOCKING=FALSE
 # EXCEPTION traceback would appear above the warning).
 export MOSAIC_SKIP_MPI_FINALIZE=1
 
-echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$N_GPUS  NBANKS=$NBANKS  DISTANCE=${DISTANCE}m ==="
+echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$N_GPUS  NBANKS=$NBANKS  NTASKS=$NTASKS  DISTANCE=${DISTANCE}m ==="
 
 # helper: turn an optional "C0 C1 C2" string into --vchunks args, or nothing.
 vcarg() { local val="$1"; [[ -n "$val" ]] && echo "--vchunks $val"; }
@@ -97,7 +99,7 @@ mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
 mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
     python step3_propagation.py --ups "$UPS" --path "$PATH_DATA" \
         --distance "$DISTANCE" \
-        --npropchunk "$NPROPCHUNK" --nbanks "$NBANKS" \
+        --npropchunk "$NPROPCHUNK" --nbanks "$NBANKS" --ntasks "$NTASKS" \
         $(vcarg "$VCHUNKS_STEP3")
 # For UPS≥4 swap in step3_propagation_large.py (see README).
 
@@ -132,7 +134,7 @@ mpirun --quiet -n "$N_GPUS" \
 mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
     python step7_paganin.py --ups "$UPS" --path "$PATH_DATA" \
         --distance "$DISTANCE" \
-        --npgnchunk "$NPROPCHUNK" --nbanks "$NBANKS"
+        --npgnchunk "$NPROPCHUNK" --nbanks "$NBANKS" --ntasks "$NTASKS"
 # For UPS≥8 swap in step7_paganin_large.py (see README).
 
 # 8. paganin.h5 → rec.h5   (filtered backprojection, default filter=shepp).
@@ -141,7 +143,7 @@ mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
 #    4 reversed passes: r-FFT → adj scatter → y-IFFT → x-IFFT+phi+crop).
 mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
     python step8_fbp.py --ups "$UPS" --path "$PATH_DATA" \
-        --nzchunk "$NZCHUNK" --nbanks "$NBANKS" --filter ramp
+        --nzchunk "$NZCHUNK" --nbanks "$NBANKS" --ntasks "$NTASKS" --filter ramp
 # For UPS≥4 swap in step8_fbp_large.py (see README).
 
 echo "=== pipeline done ==="

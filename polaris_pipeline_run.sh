@@ -63,13 +63,15 @@ NZCHUNK=${NZCHUNK:-32}                       # z-slices per Radon / FBP call
 NPROPCHUNK=${NPROPCHUNK:-8}                  # angles per Fresnel / Paganin batch
 
 NBANKS=${NBANKS:-8}                          # bank files per super-chunk
+NTASKS=${NTASKS:-8}                          # parallel workers for read_{projs,slices}_vchunkx
+                                             # (steps 3, 7, 8 prefetch reads via VDS+banks pool)
 # Optional --vchunks overrides per step ("C0 C1 C2" as a single string).
 VCHUNKS_STEP1=${VCHUNKS_STEP1:-}
 VCHUNKS_STEP2=${VCHUNKS_STEP2:-}
 VCHUNKS_STEP3=${VCHUNKS_STEP3:-}
 # ================================================
 
-echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$NTOTRANKS  NBANKS=$NBANKS  DISTANCE=${DISTANCE}m ==="
+echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$NTOTRANKS  NBANKS=$NBANKS  NTASKS=$NTASKS  DISTANCE=${DISTANCE}m ==="
 
 # Lustre striping (all OSTs, 4 MB stripes) on every dir that will hold
 # bank files or plain-HDF5 tile files.  New files inherit this.
@@ -123,7 +125,7 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
 "${MPIEXEC[@]}" \
     python step3_propagation.py --ups "$UPS" --path "$PATH_DATA" \
         --distance "$DISTANCE" \
-        --npropchunk "$NPROPCHUNK" --nbanks "$NBANKS" \
+        --npropchunk "$NPROPCHUNK" --nbanks "$NBANKS" --ntasks "$NTASKS" \
         $(vcarg "$VCHUNKS_STEP3")
 # For UPS≥4 swap in step3_propagation_large.py (see README).
 
@@ -152,7 +154,7 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
 "${MPIEXEC[@]}" \
     python step7_paganin.py --ups "$UPS" --path "$PATH_DATA" \
         --distance "$DISTANCE" \
-        --npgnchunk "$NPROPCHUNK" --nbanks "$NBANKS"
+        --npgnchunk "$NPROPCHUNK" --nbanks "$NBANKS" --ntasks "$NTASKS"
 # For UPS≥8 swap in step7_paganin_large.py (see README).
 
 # ---------- 8. paganin.h5 → rec.h5 (filtered backprojection) -------------
@@ -161,7 +163,7 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
 # TomoLargeReal.RT), or drop NZCHUNK for step8 only.
 "${MPIEXEC[@]}" \
     python step8_fbp.py --ups "$UPS" --path "$PATH_DATA" \
-        --nzchunk "$NZCHUNK" --nbanks "$NBANKS" --filter ramp
+        --nzchunk "$NZCHUNK" --nbanks "$NBANKS" --ntasks "$NTASKS" --filter ramp
 # For UPS≥4 swap in step8_fbp_large.py (see README).
 
 echo "=== pipeline done ==="
