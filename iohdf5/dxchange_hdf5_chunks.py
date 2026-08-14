@@ -84,6 +84,18 @@ def _shutdown_pools():
 _INFO_CACHE = {}
 
 
+def _norm_stype(stype):
+    """Normalise the stype attr (str / bytes / numpy.str_) to 'proj'|'slice'."""
+    if isinstance(stype, bytes):
+        stype = stype.decode()
+    stype = str(stype).lower()
+    if stype.startswith("proj"):
+        return "proj"
+    if stype.startswith("slice"):
+        return "slice"
+    raise Exception(f"Storage type {stype!r} is neither projection nor slice.")
+
+
 def tomo_info(filename):
     cached = _INFO_CACHE.get(filename)
     if cached is not None:
@@ -106,12 +118,19 @@ def tomo_info(filename):
         info["shape"] = (nproj, ny, nx)
         stype = dset.attrs['stype']
         info["stype"] = stype
-        # Derive chunks from vchunks + stype — matches what tomo_initx
-        # used when creating the bank files.  Deriving here avoids
-        # opening a bank file (which caused BlockingIOError under
-        # concurrent tomo_info calls from multiple ranks/workers).
-        if (isinstance(stype, str) and stype.lower().startswith("proj")) \
-           or stype == b"proj" or stype == "proj":
+        # Chunks: tomo_initx records the HDF5 chunk shape it used on the
+        # master, because it is no longer derivable from stype alone —
+        # see the `chunks=` override there (sinogram-ordered chunks on a
+        # θ-banked file).  Older files predate the attrs, so fall back to
+        # the historical derivation.  Either way we avoid opening a bank
+        # file, which caused BlockingIOError under concurrent tomo_info
+        # calls from multiple ranks/workers.
+        if 'chunks_0' in dset.attrs:
+            info["chunks"] = (int(dset.attrs['chunks_0']),
+                              int(dset.attrs['chunks_1']),
+                              int(dset.attrs['chunks_2']))
+        elif (isinstance(stype, str) and stype.lower().startswith("proj")) \
+                or stype == b"proj" or stype == "proj":
             info["chunks"] = (1,) + vchunks[1:]
         else:
             info["chunks"] = (vchunks[0], 1, vchunks[2])
@@ -126,12 +145,11 @@ def tomo_readx(filename, ntasks=1, shm=None, ivchunk=(0,0,0), vchunks=None):
     nproj, ny, nx, dtp, chunks = info['nproj'], info['ny'], info['nx'], info['dtype'], info['chunks']
     vchunks = vchunks if vchunks is not None else (nproj, ny, nx)
     ivchunk = ivchunk if ivchunk is not None else (0,0,0)
-    if chunks[0] == 1:
-        stype = 'proj'
-    elif chunks[1] == 1:
-        stype = 'slice'
-    else:
-        raise Exception("Storage type is neither projection or slice.")
+    # stype describes how the BANKS are split (θ for 'proj', z for 'slice'),
+    # which is what decides how work is sharded here.  It is no longer
+    # inferable from the chunk shape: with the `chunks=` override a
+    # θ-banked file can carry sinogram-ordered (nt, 1, nx) chunks.
+    stype = _norm_stype(info['stype'])
     if shm is None:
         # pre-allocated data
         shm = shared_memory.SharedMemory(create=True, size=np.prod(vchunks)*dtp.itemsize)
@@ -203,7 +221,7 @@ def _create_banking_plan(filename, shape, vchunks=None, nbanks_per_svchunk=1, si
     return banks_filename_path, banks_size, banks_filename_vsrc
             
 def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
-               nbanks=1):
+               nbanks=1, chunks=None):
     """Create a VDS master file + all bank files (single-rank).
 
     Fast because each bank file's h5py.File 'w' + create_dataset just
@@ -211,6 +229,22 @@ def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
     allocation means no per-chunk storage is reserved until writes.
     Call from rank 0; broadcast or recompute ctx on other ranks (the
     banking plan is deterministic in the params).
+
+    `stype` picks which axis the BANK FILES are split along — θ for
+    'proj', z for 'slice'.  That is a correctness constraint, not a
+    performance one: ranks shard their work along the same axis, so
+    banking on that axis is what keeps every bank file owned by exactly
+    one writer.  Never change it just to speed up a downstream read.
+
+    `chunks` overrides the HDF5 chunk shape inside those bank files,
+    which IS purely a performance knob and is independent of the
+    banking.  Default follows stype: (1, ny, nx) projection-ordered for
+    'proj', (nproj, 1, nx) sinogram-ordered for 'slice'.  Passing e.g.
+    (nt_per_bank, 1, nx) on a θ-banked file gives sinogram-ordered
+    chunks with θ-split banks — the layout paganin.h5 wants, because it
+    is written a θ-slab at a time (so banking must be on θ) but read a
+    z-slab at a time (so chunks must be on z).  Without it, an FBP
+    z-slab read touches every (1, ny, nx) chunk to use ny/zslab of it.
     """
     nproj, ny, nx = shape
     stype = 'proj' if stype.lower() in ('proj', 'projs') else 'slice'
@@ -237,6 +271,21 @@ def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
     sitems_per_bank = (vchunks[sitems_idx] + nbanks - 1) // nbanks
     nchunks = (shape[sitems_idx] + vchunks[sitems_idx] - 1) // vchunks[sitems_idx]
 
+    # Nominal (non-ragged) bank shape, used to clamp the chunk shape and to
+    # record it on the master.  A short trailing bank gets its own clamp
+    # below; tomo_info reports this nominal one.
+    if stype == 'proj':
+        nominal_bank = (sitems_per_bank, ny, nx)
+        default_chunks = (1,) + tuple(vchunks[1:])
+    else:
+        nominal_bank = (nproj, sitems_per_bank, nx)
+        default_chunks = (vchunks[0], 1, vchunks[2])
+    want_chunks = tuple(int(c) for c in chunks) if chunks is not None \
+        else default_chunks
+    if len(want_chunks) != 3 or any(c < 1 for c in want_chunks):
+        raise ValueError(f"chunks must be 3 positive ints, got {want_chunks}")
+    nominal_chunks = tuple(min(c, s) for c, s in zip(want_chunks, nominal_bank))
+
     for _ivchunk in range(nchunks):
         for ibank in range(nbanks):
             bank_idx = _ivchunk * nbanks + ibank
@@ -255,18 +304,17 @@ def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
                     vsource = h5py.VirtualSource(filename_data_vsrc, "/exchange/data",
                                                  shape=(nproj, sitems_end - sitems_start, nx))
                     layout[:, sitems_start:sitems_end, :] = vsource
+                if stype == 'proj':
+                    bank_shape = (sitems_end - sitems_start, ny, nx)
+                else:
+                    bank_shape = (nproj, sitems_end - sitems_start, nx)
+                bank_chunks = tuple(min(c, s)
+                                    for c, s in zip(want_chunks, bank_shape))
                 with h5py.File(filename_data_file, 'w') as hf_out:
                     g = hf_out.create_group('/exchange')
-                    if stype == 'proj':
-                        g.create_dataset('data',
-                                         shape=(sitems_end - sitems_start, ny, nx),
-                                         chunks=(1,) + vchunks[1:],
-                                         dtype=dtype, fillvalue=None)
-                    else:
-                        g.create_dataset('data',
-                                         shape=(nproj, sitems_end - sitems_start, nx),
-                                         chunks=(vchunks[0], 1, vchunks[2]),
-                                         dtype=dtype, fillvalue=None)
+                    g.create_dataset('data', shape=bank_shape,
+                                     chunks=bank_chunks,
+                                     dtype=dtype, fillvalue=None)
     # create master file
     with h5py.File(filename, 'w', libver='latest') as hf:
         dset = hf.create_virtual_dataset('/exchange/data', layout, fillvalue=-5)
@@ -275,6 +323,9 @@ def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
         dset.attrs['vchunks_0'] = vchunks[0]
         dset.attrs['vchunks_1'] = vchunks[1]
         dset.attrs['vchunks_2'] = vchunks[2]
+        dset.attrs['chunks_0'] = nominal_chunks[0]
+        dset.attrs['chunks_1'] = nominal_chunks[1]
+        dset.attrs['chunks_2'] = nominal_chunks[2]
 
     return {'banks_filename_path': banks_filename_path, 'banks_size': banks_size}
     
@@ -327,9 +378,9 @@ def tomo_writex(filename, data, shm=None, ivchunk=(0,0,0), ctx=None):
 
 def _process_read_projs(itask, ntasks, filename, shm, vchunks, ivchunk, direct_chunk=False):
     info = tomo_info(filename)
-    nproj, ny, nx, dtp, chunks = info['nproj'], info['ny'], info['nx'], info['dtype'], info['chunks']
-    assert chunks == (1,) + vchunks[1:]
-    
+    nproj, ny, nx, dtp = info['nproj'], info['ny'], info['nx'], info['dtype']
+    assert _norm_stype(info['stype']) == 'proj'
+
     projs_per_task = (vchunks[0] + ntasks - 1) // ntasks
     projs_offset = ivchunk[0]*vchunks[0]
     projs_start = projs_offset + itask * projs_per_task
@@ -359,9 +410,9 @@ def _process_read_projs(itask, ntasks, filename, shm, vchunks, ivchunk, direct_c
 
 def _process_read_slices(itask, ntasks, filename, shm, vchunks, ivchunk, direct_chunk=False):
     info = tomo_info(filename)
-    nproj, ny, nx, dtp, chunks = info['nproj'], info['ny'], info['nx'], info['dtype'], info['chunks']
-    assert chunks == (vchunks[0], 1, vchunks[2])
-    
+    nproj, ny, nx, dtp = info['nproj'], info['ny'], info['nx'], info['dtype']
+    assert _norm_stype(info['stype']) == 'slice'
+
     slices_offset = ivchunk[1]*vchunks[1]
     slices_per_task = (vchunks[1] + ntasks - 1) // ntasks
     slices_start = slices_offset + itask * slices_per_task
@@ -458,10 +509,11 @@ def _process_write_projs(itask, ntasks, filename, shape, dtype, shm, vchunks, iv
 #
 # Two use cases:
 #   (a) READ  — a big θ- or z-slab, split across parallel workers each doing
-#               its own fancy-slice on the VDS master.  On proj-stored files
-#               θ-slab reads are chunk-aligned (fast), z-slab reads are
-#               cross-axis (amp per worker = NZ/slab, but wall-clock scales
-#               with parallel workers so still much faster than serial h5py).
+#               its own fancy-slice on the VDS master.  Cost is set by the
+#               file's HDF5 chunk shape, not by the slab shape: a slab is
+#               cheap when it covers whole chunks and expensive when it
+#               clips them (reading a z-slab out of (1, ny, nx) projection
+#               chunks touches every chunk to keep zslab/ny of it).
 #   (b) WRITE — dice a big vchunkx buffer into vchunk-sized pieces and fan
 #               each piece through tomo_writex (aligned parallel bank writes).
 #
@@ -469,110 +521,160 @@ def _process_write_projs(itask, ntasks, filename, shape, dtype, shm, vchunks, iv
 # ---------------------------------------------------------------------------
 
 
-def _process_read_projs_vchunkx(task_meta, filename, vchunksx, sitems_offset,
-                                direct_chunk, dtype, shm):
-    """Worker: read one θ-shard [proj_sel[0]:proj_sel[1], :, :] from the VDS
-    master into the shm buffer at the correct dest_sel position."""
+def _process_read_box(task_meta, filename, vchunksx, dtype, shm):
+    """Worker: read one sub-box of a vchunkx from the VDS master straight
+    into its slot in the shm buffer.
+
+    read_direct (rather than `out[...] = dset[...]`) matters here: the
+    latter makes HDF5 materialise the whole shard as a fresh array before
+    numpy copies it into shm, which on a full-size shard is a spare
+    multi-hundred-MB allocation per worker per call.
+    """
     out = np.ndarray(shape=vchunksx, dtype=dtype, buffer=shm.buf)
-    proj_sel = task_meta['proj_sel']
+    (t0, t1), (z0, z1), (x0, x1) = task_meta['src']
+    dt, dz, dx = task_meta['dst']
     with h5py.File(filename, 'r') as hf_in:
-        dset = hf_in['/exchange/data']
-        if direct_chunk:
-            dset.read_direct(
-                out,
-                source_sel=np.s_[proj_sel[0]:proj_sel[1], :, :],
-                dest_sel=np.s_[proj_sel[0] - sitems_offset:proj_sel[1] - sitems_offset, :, :])
-        else:
-            out[proj_sel[0] - sitems_offset:proj_sel[1] - sitems_offset, :, :] = \
-                dset[proj_sel[0]:proj_sel[1], :, :]
+        hf_in['/exchange/data'].read_direct(
+            out,
+            source_sel=np.s_[t0:t1, z0:z1, x0:x1],
+            dest_sel=np.s_[dt:dt + (t1 - t0),
+                           dz:dz + (z1 - z0),
+                           dx:dx + (x1 - x0)])
     return task_meta['itask']
 
 
-def _process_read_slices_vchunkx(task_meta, filename, vchunksx, sitems_offset,
-                                 direct_chunk, dtype, shm):
-    """Worker: read one z-shard [:, z_sel[0]:z_sel[1], :] from the VDS master
-    into the shm buffer at the correct dest_sel position."""
-    out = np.ndarray(shape=vchunksx, dtype=dtype, buffer=shm.buf)
-    z_sel = task_meta['z_sel']
-    with h5py.File(filename, 'r') as hf_in:
-        dset = hf_in['/exchange/data']
-        if direct_chunk:
-            dset.read_direct(
-                out,
-                source_sel=np.s_[:, z_sel[0]:z_sel[1], :],
-                dest_sel=np.s_[:, z_sel[0] - sitems_offset:z_sel[1] - sitems_offset, :])
-        else:
-            out[:, z_sel[0] - sitems_offset:z_sel[1] - sitems_offset, :] = \
-                dset[:, z_sel[0]:z_sel[1], :]
-    return task_meta['itask']
+def _bank_axis(filename):
+    """Axis the file's bank files are split along: 0 (θ) when proj-banked,
+    1 (z) when slice-banked.  None if the file carries no tomo_initx attrs.
+
+    Sharding a read's worker pool on this axis is what keeps each worker
+    on a disjoint set of bank files.  Shard on the other axis and every
+    worker opens every bank file and strides through it, which costs both
+    the file handles and the sequentiality.
+    """
+    try:
+        return 0 if _norm_stype(tomo_info(filename)['stype']) == 'proj' else 1
+    except Exception:
+        return None
 
 
-def read_projs_vchunkx(filename, shm, ntasks, vchunksx, ivchunkx):
+def _split(lo, hi, ntasks, align=1):
+    """Split [lo, hi) into at most ntasks contiguous non-empty ranges.
+
+    `align` rounds the per-task extent up to a multiple of the HDF5 chunk
+    extent along the split axis, so a chunk is never straddled by two
+    workers.  Two workers sharing a chunk each issue a strided sub-chunk
+    read, and the kernel's readahead then pulls the whole chunk in for
+    each of them -- measured as a clean 2x on the sinogram layout, whose
+    chunk spans all theta in a bank.  Fewer, whole-chunk tasks beat more,
+    partial-chunk ones; if align is coarse enough that fewer than ntasks
+    ranges come out, that is the correct answer, not a bug.
+    """
+    span = hi - lo
+    per = (span + ntasks - 1) // ntasks
+    if align > 1:
+        per = ((per + align - 1) // align) * align
+    per = max(per, 1)
+    out = []
+    for itask in range(ntasks):
+        s0 = lo + itask * per
+        s1 = min(s0 + per, hi)
+        if s1 > s0:
+            out.append((itask, s0, s1))
+    return out
+
+
+def _chunk_extent(info, axis):
+    """Chunk extent along `axis`, for aligning a read's task split to it."""
+    try:
+        return max(1, int(info['chunks'][axis]))
+    except Exception:
+        return 1
+
+
+def read_projs_vchunkx(filename, shm, ntasks, vchunksx, ivchunkx,
+                       shard_axis=None):
     """Read a θ-slab vchunkx (vchunksx[0], NZ, N) from a VDS+banks file
     with ntasks parallel workers, each doing a fancy-slice through the
-    VDS master.  Aligned for proj-stored files.
+    VDS master.
 
     Returns a numpy view of the shm buffer with shape=vchunksx.
     """
-    with h5py.File(filename, 'r') as fid:
-        dset = fid['/exchange/data']
-        shape = dset.shape
-        dset_is_virtual = dset.is_virtual
-        dtp = dset.dtype
-
+    info = tomo_info(filename)
+    shape, dtp = info['shape'], info['dtype']
     data = np.ndarray(shape=vchunksx, dtype=dtp, buffer=shm.buf)
 
-    sitems_per_task = (vchunksx[0] + ntasks - 1) // ntasks
-    sitems_offset   = vchunksx[0] * ivchunkx[0]
+    t_off = vchunksx[0] * ivchunkx[0]
+    t_hi  = min(t_off + vchunksx[0], shape[0])
+    nz    = min(vchunksx[1], shape[1])
+    nx    = min(vchunksx[2], shape[2])
+
+    if shard_axis is None:
+        shard_axis = _bank_axis(filename)
+        shard_axis = 0 if shard_axis is None else shard_axis
 
     task_meta = []
-    for itask in range(ntasks):
-        s0 = sitems_offset + itask * sitems_per_task
-        s1 = sitems_offset + (itask + 1) * sitems_per_task
-        s1 = min(s1, sitems_offset + vchunksx[0], shape[0])
-        if s1 > s0:
-            task_meta.append({'itask': itask, 'proj_sel': (s0, s1)})
+    if shard_axis == 0:
+        for itask, s0, s1 in _split(t_off, t_hi, ntasks,
+                                    align=_chunk_extent(info, 0)):
+            task_meta.append({'itask': itask,
+                              'src': ((s0, s1), (0, nz), (0, nx)),
+                              'dst': (s0 - t_off, 0, 0)})
+    else:
+        for itask, s0, s1 in _split(0, nz, ntasks,
+                                    align=_chunk_extent(info, 1)):
+            task_meta.append({'itask': itask,
+                              'src': ((t_off, t_hi), (s0, s1), (0, nx)),
+                              'dst': (0, s0, 0)})
 
     pool = _get_pool(ntasks)
-    pool.map(partial(_process_read_projs_vchunkx, filename=filename,
-                     vchunksx=vchunksx, sitems_offset=sitems_offset,
-                     direct_chunk=not dset_is_virtual, dtype=dtp, shm=shm),
-             task_meta)
+    pool.map(partial(_process_read_box, filename=filename,
+                     vchunksx=vchunksx, dtype=dtp, shm=shm), task_meta)
     return data
 
 
-def read_slices_vchunkx(filename, shm, ntasks, vchunksx, ivchunkx):
+def read_slices_vchunkx(filename, shm, ntasks, vchunksx, ivchunkx,
+                        shard_axis=None):
     """Read a z-slab vchunkx (NTHETA, vchunksx[1], N) from a VDS+banks file
     with ntasks parallel workers, each doing a fancy-slice through the
-    VDS master.  Cross-axis on proj-stored files (amp per worker =
-    NZ/vchunksx[1]), aligned on slice-stored files.
+    VDS master.
+
+    Workers are sharded along the file's bank axis (see _bank_axis), so on
+    the θ-banked, sinogram-chunked paganin.h5 that step7 writes each worker
+    streams whole chunks out of its own quarter of the bank files.
 
     Returns a numpy view of the shm buffer with shape=vchunksx.
     """
-    with h5py.File(filename, 'r') as fid:
-        dset = fid['/exchange/data']
-        shape = dset.shape
-        dset_is_virtual = dset.is_virtual
-        dtp = dset.dtype
-
+    info = tomo_info(filename)
+    shape, dtp = info['shape'], info['dtype']
     data = np.ndarray(shape=vchunksx, dtype=dtp, buffer=shm.buf)
 
-    sitems_per_task = (vchunksx[1] + ntasks - 1) // ntasks
-    sitems_offset   = vchunksx[1] * ivchunkx[1]
+    z_off = vchunksx[1] * ivchunkx[1]
+    z_hi  = min(z_off + vchunksx[1], shape[1])
+    ntheta = min(vchunksx[0], shape[0])
+    nx     = min(vchunksx[2], shape[2])
+
+    if shard_axis is None:
+        shard_axis = _bank_axis(filename)
+        shard_axis = 1 if shard_axis is None else shard_axis
 
     task_meta = []
-    for itask in range(ntasks):
-        s0 = sitems_offset + itask * sitems_per_task
-        s1 = sitems_offset + (itask + 1) * sitems_per_task
-        s1 = min(s1, sitems_offset + vchunksx[1], shape[1])
-        if s1 > s0:
-            task_meta.append({'itask': itask, 'z_sel': (s0, s1)})
+    if shard_axis == 0:
+        for itask, s0, s1 in _split(0, ntheta, ntasks,
+                                    align=_chunk_extent(info, 0)):
+            task_meta.append({'itask': itask,
+                              'src': ((s0, s1), (z_off, z_hi), (0, nx)),
+                              'dst': (s0, 0, 0)})
+    else:
+        for itask, s0, s1 in _split(z_off, z_hi, ntasks,
+                                    align=_chunk_extent(info, 1)):
+            task_meta.append({'itask': itask,
+                              'src': ((0, ntheta), (s0, s1), (0, nx)),
+                              'dst': (0, s0 - z_off, 0)})
 
     pool = _get_pool(ntasks)
-    pool.map(partial(_process_read_slices_vchunkx, filename=filename,
-                     vchunksx=vchunksx, sitems_offset=sitems_offset,
-                     direct_chunk=not dset_is_virtual, dtype=dtp, shm=shm),
-             task_meta)
+    pool.map(partial(_process_read_box, filename=filename,
+                     vchunksx=vchunksx, dtype=dtp, shm=shm), task_meta)
     return data
 
 

@@ -81,14 +81,19 @@ def _hb(b: float) -> str:
     return f"{b:.2f} PB"
 
 
-def _describe(name, shape, vchunks, nbanks, dtype_bytes):
+def _describe(name, shape, vchunks, nbanks, dtype_bytes, chunks=None):
     total = int(np.prod(shape)) * dtype_bytes
     per_vc = int(np.prod(vchunks)) * dtype_bytes
     n_vc = int(np.prod([-(-s // c) for s, c in zip(shape, vchunks)]))
     n_files = n_vc * nbanks + 1  # bank files + master VDS
+    if chunks is None:
+        chunks = (1,) + tuple(vchunks[1:])
     print(f"  {name:14s}  shape={tuple(shape)}   dtype=f32  total={_hb(total)}")
     print(f"  {name:14s}  vchunk={tuple(vchunks)}   buffer={_hb(per_vc)}   "
           f"nvchunks={n_vc}   nbanks={nbanks}   files~{n_files}")
+    print(f"  {name:14s}  h5chunk={tuple(chunks)} "
+          f"({_hb(int(np.prod(chunks)) * dtype_bytes)})"
+          f"{'   [sinogram-ordered]' if chunks[1] == 1 else ''}")
 
 
 def _cleanup_h5(path: str) -> None:
@@ -164,6 +169,13 @@ def _parse_args():
     p.add_argument("--rec-vchunks",  type=int, nargs=3, default=None,
                    metavar=("C0","C1","C2"),
                    help="super-chunk for rec.h5 (default: nbanks, N, N)")
+    p.add_argument("--pgn-chunk-order", choices=("sino", "proj"),
+                   default="sino",
+                   help="HDF5 chunk order inside paganin.h5's bank files "
+                        "(matches step7 --chunk-order).  'sino' = "
+                        "(θ_per_bank, 1, N), aligned with the stage-4 FBP "
+                        "z-slab read.  'proj' = (1, NZ, N), the old layout — "
+                        "use it to A/B the stage-4 read.")
     return p.parse_args()
 
 
@@ -195,6 +207,16 @@ def main() -> None:
     pgn_vc  = tuple(args.pgn_vchunks)  if args.pgn_vchunks  else (args.nbanks, OUT_NZ, N     )
     rec_vc  = tuple(args.rec_vchunks)  if args.rec_vchunks  else (args.nbanks, N,      N     )
 
+    # paganin.h5 is θ-banked (ranks shard on θ, one writer per bank file) but
+    # sinogram-chunked, so stage 4's (NTHETA, zslab, N) read covers whole
+    # chunks.  Under the old (1, NZ, N) projection chunks that read clipped
+    # every chunk to zslab/NZ of it — NZ/rec_vc[0] = 192× amplification at
+    # the default sizes, which is what made stage-4 read ~60× slower than
+    # every other read in this benchmark.
+    pgn_theta_per_bank = (pgn_vc[0] + args.nbanks - 1) // args.nbanks
+    pgn_chunks = ((pgn_theta_per_bank, 1, N) if args.pgn_chunk_order == "sino"
+                  else (1, pgn_vc[1], pgn_vc[2]))
+
     def _validate(name, shape, vc):
         if any(c > s for c, s in zip(vc, shape)):
             axes = ", ".join(f"axis{i}: vchunk {c} > shape {s}"
@@ -225,7 +247,8 @@ def main() -> None:
         _describe(f"big{UPS}x.h5", big_shape,  big_vc,  args.nbanks, 4)
         _describe("proj.h5",       proj_shape, proj_vc, args.nbanks, 4)
         _describe("data.h5",       data_shape, data_vc, args.nbanks, 4)
-        _describe("paganin.h5",    pgn_shape,  pgn_vc,  args.nbanks, 4)
+        _describe("paganin.h5",    pgn_shape,  pgn_vc,  args.nbanks, 4,
+                  chunks=pgn_chunks)
         _describe("rec.h5",        rec_shape,  rec_vc,  args.nbanks, 4)
     rprint("")
 
@@ -451,7 +474,8 @@ def main() -> None:
     if RANK == 0:
         _cleanup_h5(PGN)
         ctx_pgn = tomo_initx(filename=PGN, shape=pgn_shape, dtype=dtype,
-                             vchunks=pgn_vc, stype="proj", nbanks=args.nbanks)
+                             vchunks=pgn_vc, stype="proj", nbanks=args.nbanks,
+                             chunks=pgn_chunks)
     else:
         ctx_pgn = None
     barrier()
@@ -507,9 +531,13 @@ def main() -> None:
     # Mimics step8_fbp.py: for each rec.h5 super-chunk of (VZ, N, N),
     # PREFETCHES the full (NTHETA, VZ, N) sinogram slab via
     # read_slices_vchunkx (ntasks parallel workers), then the inner
-    # nzchunk-sized loop just slices from RAM.  Amp per prefetch ≈
-    # NZ/VZ (cross-axis on proj-stored paganin.h5), vs the OLD amp of
-    # NZ/NZCHUNK per plain-h5py inner read.
+    # nzchunk-sized loop just slices from RAM.
+    #
+    # This is the stage the paganin.h5 chunk order decides.  With
+    # --pgn-chunk-order sino the slab covers whole (θ_per_bank, 1, N)
+    # chunks and each worker streams its own quarter of the bank files;
+    # with proj it clips every (1, NZ, N) chunk to VZ/NZ of it, which is
+    # the 192× amplification this benchmark was built to expose.
 
     if RANK == 0:
         _cleanup_h5(REC)

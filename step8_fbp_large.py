@@ -124,8 +124,7 @@ def main() -> None:
             f"paganin.h5 shape {src_shape} incompatible with (NZ={NZ}, N={N})")
     theta_rad = np.deg2rad(theta_deg).astype(np.float32)
 
-    CHUNK_N, CHUNK_THETA, CHUNK_XY = _pick_chunks(NTHETA)
-    _validate_chunks(NTHETA, CHUNK_N, CHUNK_THETA, CHUNK_XY)
+    _validate_chunks(NTHETA)
 
     dev_id   = cp.cuda.runtime.getDevice()
     dev_name = cp.cuda.runtime.getDeviceProperties(dev_id)['name'].decode()

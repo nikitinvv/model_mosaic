@@ -71,15 +71,20 @@ def free_shm(shm) -> None:
 
 
 def initx_and_bcast(path, shape, dtype, vchunks, stype="proj",
-                    nbanks=8, rank=0, comm=None):
+                    nbanks=8, rank=0, comm=None, chunks=None):
     """Rank 0 clears any prior master + creates VDS + all bank files.
     Other ranks compute the banking plan locally (deterministic in the
     params, so no bcast is needed).  Barrier at the end ensures the
-    master + all bank files exist on the FS before any rank returns."""
+    master + all bank files exist on the FS before any rank returns.
+
+    `chunks` overrides the HDF5 chunk shape inside the bank files without
+    touching the banking — see tomo_initx.  It does not affect the
+    banking plan, so the non-root branch below stays chunk-agnostic."""
     if rank == 0:
         cleanup_h5(path)
         ctx = _initx(filename=path, shape=shape, dtype=dtype,
-                     vchunks=vchunks, stype=stype, nbanks=nbanks)
+                     vchunks=vchunks, stype=stype, nbanks=nbanks,
+                     chunks=chunks)
     else:
         # Deterministic plan — recompute the paths+sizes without
         # touching the filesystem.
@@ -160,7 +165,7 @@ def describe_input(path: str) -> None:
 
 
 def describe_output(path: str, shape, dtype, vchunks, stype: str,
-                    nbanks: int) -> None:
+                    nbanks: int, chunks=None) -> None:
     """Print planned shape / vchunks / bank layout / HDF5 chunk for an
     output file about to be created via initx_and_bcast.  Call from
     rank 0 only.  Pure math — does not touch the filesystem."""
@@ -174,13 +179,16 @@ def describe_output(path: str, shape, dtype, vchunks, stype: str,
     bank_shape[sitems_idx] = sitems_per_bank
     bank_shape = tuple(bank_shape)
 
-    if stype.lower().startswith("proj"):
+    if chunks is not None:
+        h5chunk = tuple(min(c, s) for c, s in zip(chunks, bank_shape))
+    elif stype.lower().startswith("proj"):
         h5chunk = (1,) + tuple(vchunks[1:])
     else:
         h5chunk = (vchunks[0], 1, vchunks[2])
 
     total = int(np.prod(shape)) * dtp.itemsize
     bank_bytes = int(np.prod(bank_shape)) * dtp.itemsize
+    chunk_bytes = int(np.prod(h5chunk)) * dtp.itemsize
     print(f"  OUT: {path}", flush=True)
     print(f"       shape={tuple(shape)} {dtp}  total={_hb(total)}", flush=True)
     print(f"       vchunks={tuple(vchunks)}  stype={stype}  nbanks={nbanks}",
@@ -188,4 +196,5 @@ def describe_output(path: str, shape, dtype, vchunks, stype: str,
     print(f"       → {nsvchunks} super-chunks × {nbanks} banks = "
           f"{total_banks} bank files", flush=True)
     print(f"       bank shape={bank_shape} ({_hb(bank_bytes)})  "
-          f"HDF5 chunk={h5chunk}", flush=True)
+          f"HDF5 chunk={h5chunk} ({_hb(chunk_bytes)})"
+          f"{'  [sinogram-ordered]' if h5chunk[1] == 1 else ''}", flush=True)

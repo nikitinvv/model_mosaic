@@ -64,6 +64,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk for paganin.h5 (default: 8·NPGNCHUNK, NZ, N)")
+    p.add_argument("--chunk-order", choices=("sino", "proj"), default="sino",
+                   help="HDF5 chunk order inside paganin.h5's bank files.  "
+                        "'sino' (default) = (θ_per_bank, 1, N), what step8's "
+                        "z-slab FBP read wants.  'proj' = (1, NZ, N), the old "
+                        "layout — makes that read touch every chunk to use "
+                        "zslab/NZ of it.  Banking is θ-split either way.")
     return p.parse_args()
 
 
@@ -88,6 +94,16 @@ NPGNCHUNK   = _A.npgnchunk
 NBANKS      = _A.nbanks
 NTASKS      = _A.ntasks
 VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8 * NPGNCHUNK, NZ, N)
+
+# HDF5 chunk shape inside the bank files.  Banking stays θ-split (stype
+# 'proj') because ranks shard on θ and each bank file must have exactly one
+# writer — but the chunks are laid out for the reader.  step8 reads
+# (NTHETA, zslab, N) sinograms, so a chunk spanning one z row and a whole
+# bank's worth of angles is read whole; the old (1, NZ, N) projection chunk
+# was read NZ/zslab-fold over.  θ_per_bank is what tomo_initx's banking plan
+# puts in each bank file, so this covers a chunk exactly.
+THETA_PER_BANK = (VCHUNKS[0] + NBANKS - 1) // NBANKS
+H5CHUNKS = (THETA_PER_BANK, 1, N) if _A.chunk_order == "sino" else (1, NZ, N)
 
 
 def main() -> None:
@@ -141,12 +157,12 @@ def main() -> None:
     if RANK == 0:
         describe_input(SRC_H5)
         describe_output(DST_H5, (N_HALF, NZ, N), np.float32,
-                        VCHUNKS, "proj", NBANKS)
+                        VCHUNKS, "proj", NBANKS, chunks=H5CHUNKS)
 
     ctx = initx_and_bcast(DST_H5, shape=(N_HALF, NZ, N),
                           dtype=np.float32, vchunks=VCHUNKS,
                           stype="proj", nbanks=NBANKS,
-                          rank=RANK, comm=COMM)
+                          rank=RANK, comm=COMM, chunks=H5CHUNKS)
     if RANK == 0:
         with h5py.File(DST_H5, "r+") as f:
             if "exchange/theta" in f:
