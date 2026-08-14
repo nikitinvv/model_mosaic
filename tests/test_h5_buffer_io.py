@@ -173,9 +173,16 @@ def _parse_args():
                    default="sino",
                    help="HDF5 chunk order inside paganin.h5's bank files "
                         "(matches step7 --chunk-order).  'sino' = "
-                        "(θ_per_bank, 1, N), aligned with the stage-4 FBP "
-                        "z-slab read.  'proj' = (1, NZ, N), the old layout — "
-                        "use it to A/B the stage-4 read.")
+                        "(θ_per_bank, pgn_chunk_z, N), aligned with the "
+                        "stage-4 FBP z-slab read.  'proj' = (1, NZ, N), the "
+                        "old layout — use it to A/B the stage-4 read.")
+    p.add_argument("--pgn-chunk-z", type=int, default=0,
+                   help="z-extent of the sinogram chunk (matches step7 "
+                        "--chunk-z).  0 (default) = the stage-4 FBP z-slab, "
+                        "rec-vchunks C0, which makes that read one whole-"
+                        "chunk sequential op per bank file.  Set 1 for the "
+                        "pure-sinogram extreme (one HDF5 op per z row per "
+                        "bank — latency-bound on Lustre) to A/B it.")
     return p.parse_args()
 
 
@@ -209,12 +216,22 @@ def main() -> None:
 
     # paganin.h5 is θ-banked (ranks shard on θ, one writer per bank file) but
     # sinogram-chunked, so stage 4's (NTHETA, zslab, N) read covers whole
-    # chunks.  Under the old (1, NZ, N) projection chunks that read clipped
-    # every chunk to zslab/NZ of it — NZ/rec_vc[0] = 192× amplification at
-    # the default sizes, which is what made stage-4 read ~60× slower than
-    # every other read in this benchmark.
+    # chunks.  Both chunk extents matter and they fail differently:
+    #   θ  — θ_per_bank, so a chunk never straddles two bank files and the
+    #        read's θ-sharded workers each get whole chunks.
+    #   z  — the FBP z-slab (rec_vc[0]).  At z-extent 1 the read is correct
+    #        and unamplified but costs rec_vc[0] HDF5 ops per bank file
+    #        instead of 1, and on Lustre that per-op latency is the whole
+    #        cost.  Matching the slab turns stage 4 into one sequential
+    #        whole-chunk read per bank file.
+    # The old (1, NZ, N) projection chunk is the 'proj' branch: same bytes
+    # off disk (HDF5 does partial-chunk I/O on unfiltered datasets) but
+    # strided NZ·N·4 apart, which is what made stage 4 the slowest read here.
     pgn_theta_per_bank = (pgn_vc[0] + args.nbanks - 1) // args.nbanks
-    pgn_chunks = ((pgn_theta_per_bank, 1, N) if args.pgn_chunk_order == "sino"
+    pgn_chunk_z = args.pgn_chunk_z if args.pgn_chunk_z > 0 else rec_vc[0]
+    pgn_chunk_z = max(1, min(pgn_chunk_z, pgn_vc[1]))
+    pgn_chunks = ((pgn_theta_per_bank, pgn_chunk_z, N)
+                  if args.pgn_chunk_order == "sino"
                   else (1, pgn_vc[1], pgn_vc[2]))
 
     def _validate(name, shape, vc):
@@ -533,9 +550,10 @@ def main() -> None:
     # read_slices_vchunkx (ntasks parallel workers), then the inner
     # nzchunk-sized loop just slices from RAM.
     #
-    # This is the stage the paganin.h5 chunk order decides.  With
-    # --pgn-chunk-order sino the slab covers whole (θ_per_bank, 1, N)
-    # chunks and each worker streams its own quarter of the bank files;
+    # This is the stage the paganin.h5 chunk shape decides.  With
+    # --pgn-chunk-order sino and --pgn-chunk-z == VZ the slab is exactly
+    # one whole chunk per bank file and each worker streams its own
+    # quarter of the bank files sequentially;
     # with proj it clips every (1, NZ, N) chunk to VZ/NZ of it, which is
     # the 192× amplification this benchmark was built to expose.
 
