@@ -26,7 +26,7 @@ import numpy as np
 import cupy as cp
 
 from processing.propagation import Propagation
-from iohdf5.dxchange_hdf5_chunks import tomo_writex
+from iohdf5.dxchange_hdf5_chunks import tomo_writex, read_projs_vchunkx
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
@@ -57,6 +57,8 @@ def _parse_args() -> argparse.Namespace:
                    help="angles per Fresnel batch")
     p.add_argument("--nbanks",     type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
+    p.add_argument("--ntasks",     type=int, default=8,
+                   help="parallel workers for read_projs_vchunkx (proj prefetch)")
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk for data.h5 (default: 8·NPROPCHUNK, NZ, N)")
@@ -85,6 +87,7 @@ DISTANCE   = _A.distance
 
 NPROPCHUNK = _A.npropchunk
 NBANKS      = _A.nbanks
+NTASKS      = _A.ntasks
 VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8 * NPROPCHUNK, NZ, N)
 
 
@@ -186,61 +189,68 @@ def main() -> None:
     my_ivchunks = ivchunks[RANK::SIZE]
     shm, buf = alloc_shm(VCHUNKS, np.float32)
 
+    # Prefetch shm for the vchunkx proj-slab (VCHUNKS[0], NZ, N).
+    # read_projs_vchunkx fans the read across NTASKS workers (each doing
+    # its own θ-shard slice on the VDS master) instead of one plain-h5py
+    # handle.  proj.h5 is slice-stored so the read is still cross-axis
+    # (amp per worker ≈ NTHETA/VCHUNKS[0]), but parallel wall-time.
+    proj_slab_shape = (VCHUNKS[0], NZ, N)
+    shm_slab, proj_slab_buf = alloc_shm(proj_slab_shape, np.float32)
+
     try:
-        with h5py.File(PROJ_H5, "r") as fp:
-            proj_dset = fp["exchange/data"]
+        for k, ivc in enumerate(my_ivchunks, start=1):
+            t0_vc = ivc[0] * VCHUNKS[0]
+            t1_vc = min(t0_vc + VCHUNKS[0], NTHETA)
+            buf.fill(0)
 
-            for k, ivc in enumerate(my_ivchunks, start=1):
-                t0_vc = ivc[0] * VCHUNKS[0]
-                t1_vc = min(t0_vc + VCHUNKS[0], NTHETA)
-                buf.fill(0)
+            t0 = time.perf_counter()
+            read_projs_vchunkx(PROJ_H5, shm_slab, ntasks=NTASKS,
+                               vchunksx=proj_slab_shape,
+                               ivchunkx=(ivc[0], 0, 0))
+            proj_slab_h = proj_slab_buf
+            t_read += time.perf_counter() - t0
+            b_read += (t1_vc - t0_vc) * NZ * N * 4
 
-                t0 = time.perf_counter()
-                proj_slab_h = proj_dset[t0_vc:t1_vc, :, :]  # (K, NZ, N)
-                t_read += time.perf_counter() - t0
-                b_read += (t1_vc - t0_vc) * NZ * N * 4
-
-                for tb0 in range(t0_vc, t1_vc, NPROPCHUNK):
-                    tb1 = min(tb0 + NPROPCHUNK, t1_vc)
-                    b   = tb1 - tb0
-
-                    t0 = time.perf_counter()
-                    proj_d = cp.asarray(proj_slab_h[tb0 - t0_vc : tb1 - t0_vc])
-                    psi_d = _psi_from_proj(proj_d, inv_norm, inv_beta_ratio)
-                    del proj_d
-
-                    prop_d = cl_prop.D(psi_d, 0)
-                    del psi_d
-                    intens_d = _abs2_c64_to_f32(prop_d)
-                    del prop_d
-                    data_batch_h = cp.asnumpy(intens_d[:b])
-                    del intens_d
-                    cp.get_default_memory_pool().free_all_blocks()
-                    t_prop += time.perf_counter() - t0
-
-                    d_min = min(d_min, float(data_batch_h.min()))
-                    d_max = max(d_max, float(data_batch_h.max()))
-                    d_sum += float(data_batch_h.sum())
-                    d_cnt += b * NZ * N
-                    if np.isnan(data_batch_h).any():
-                        d_has_nan = True
-
-                    buf[tb0 - t0_vc : tb1 - t0_vc] = data_batch_h
-                    del data_batch_h
-
-                del proj_slab_h
+            for tb0 in range(t0_vc, t1_vc, NPROPCHUNK):
+                tb1 = min(tb0 + NPROPCHUNK, t1_vc)
+                b   = tb1 - tb0
 
                 t0 = time.perf_counter()
-                tomo_writex(DATA_H5, data=buf, shm=shm, ivchunk=ivc, ctx=ctx)
-                t_write += time.perf_counter() - t0
-                b_write += (t1_vc - t0_vc) * NZ * N * 4
+                proj_d = cp.asarray(proj_slab_h[tb0 - t0_vc : tb1 - t0_vc])
+                psi_d = _psi_from_proj(proj_d, inv_norm, inv_beta_ratio)
+                del proj_d
 
-                print(f"  [rank {RANK}] vchunk {k}/{len(my_ivchunks)}  "
-                      f"θ=[{t0_vc},{t1_vc})  "
-                      f"(read={t_read:.1f}s prop={t_prop:.1f}s "
-                      f"write={t_write:.1f}s)", flush=True)
+                prop_d = cl_prop.D(psi_d, 0)
+                del psi_d
+                intens_d = _abs2_c64_to_f32(prop_d)
+                del prop_d
+                data_batch_h = cp.asnumpy(intens_d[:b])
+                del intens_d
+                cp.get_default_memory_pool().free_all_blocks()
+                t_prop += time.perf_counter() - t0
+
+                d_min = min(d_min, float(data_batch_h.min()))
+                d_max = max(d_max, float(data_batch_h.max()))
+                d_sum += float(data_batch_h.sum())
+                d_cnt += b * NZ * N
+                if np.isnan(data_batch_h).any():
+                    d_has_nan = True
+
+                buf[tb0 - t0_vc : tb1 - t0_vc] = data_batch_h
+                del data_batch_h
+
+            t0 = time.perf_counter()
+            tomo_writex(DATA_H5, data=buf, shm=shm, ivchunk=ivc, ctx=ctx)
+            t_write += time.perf_counter() - t0
+            b_write += (t1_vc - t0_vc) * NZ * N * 4
+
+            print(f"  [rank {RANK}] vchunk {k}/{len(my_ivchunks)}  "
+                  f"θ=[{t0_vc},{t1_vc})  "
+                  f"(read={t_read:.1f}s prop={t_prop:.1f}s "
+                  f"write={t_write:.1f}s)", flush=True)
     finally:
         free_shm(shm)
+        free_shm(shm_slab)
 
     d_min     = allreduce(d_min,     MPI.MIN)
     d_max     = allreduce(d_max,     MPI.MAX)

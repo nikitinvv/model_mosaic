@@ -447,8 +447,150 @@ def _process_write_projs(itask, ntasks, filename, shape, dtype, shm, vchunks, iv
             with h5py.File(filename_path, 'r+') as hf_out:
                 dset = hf_out['/exchange/data']
                 dset.write_direct(data, source_sel=np.s_[projs_start-projs_offset:projs_end-projs_offset,:y_end-y_start,:x_end-x_start],
-                                  dest_sel=np.s_[0:projs_end-projs_start,y_start:y_end,x_start:x_end])  
+                                  dest_sel=np.s_[0:projs_end-projs_start,y_start:y_end,x_start:x_end])
     finally:
         pass
     return itask
+
+
+# ---------------------------------------------------------------------------
+# vchunkx: "super-vchunk" — buffers larger than the file's on-disk vchunks.
+#
+# Two use cases:
+#   (a) READ  — a big θ- or z-slab, split across parallel workers each doing
+#               its own fancy-slice on the VDS master.  On proj-stored files
+#               θ-slab reads are chunk-aligned (fast), z-slab reads are
+#               cross-axis (amp per worker = NZ/slab, but wall-clock scales
+#               with parallel workers so still much faster than serial h5py).
+#   (b) WRITE — dice a big vchunkx buffer into vchunk-sized pieces and fan
+#               each piece through tomo_writex (aligned parallel bank writes).
+#
+# Ported (with small tweaks) from doe-maxiv/dxchange_hdf5_chunks.py.
+# ---------------------------------------------------------------------------
+
+
+def _process_read_projs_vchunkx(task_meta, filename, vchunksx, sitems_offset,
+                                direct_chunk, dtype, shm):
+    """Worker: read one θ-shard [proj_sel[0]:proj_sel[1], :, :] from the VDS
+    master into the shm buffer at the correct dest_sel position."""
+    out = np.ndarray(shape=vchunksx, dtype=dtype, buffer=shm.buf)
+    proj_sel = task_meta['proj_sel']
+    with h5py.File(filename, 'r') as hf_in:
+        dset = hf_in['/exchange/data']
+        if direct_chunk:
+            dset.read_direct(
+                out,
+                source_sel=np.s_[proj_sel[0]:proj_sel[1], :, :],
+                dest_sel=np.s_[proj_sel[0] - sitems_offset:proj_sel[1] - sitems_offset, :, :])
+        else:
+            out[proj_sel[0] - sitems_offset:proj_sel[1] - sitems_offset, :, :] = \
+                dset[proj_sel[0]:proj_sel[1], :, :]
+    return task_meta['itask']
+
+
+def _process_read_slices_vchunkx(task_meta, filename, vchunksx, sitems_offset,
+                                 direct_chunk, dtype, shm):
+    """Worker: read one z-shard [:, z_sel[0]:z_sel[1], :] from the VDS master
+    into the shm buffer at the correct dest_sel position."""
+    out = np.ndarray(shape=vchunksx, dtype=dtype, buffer=shm.buf)
+    z_sel = task_meta['z_sel']
+    with h5py.File(filename, 'r') as hf_in:
+        dset = hf_in['/exchange/data']
+        if direct_chunk:
+            dset.read_direct(
+                out,
+                source_sel=np.s_[:, z_sel[0]:z_sel[1], :],
+                dest_sel=np.s_[:, z_sel[0] - sitems_offset:z_sel[1] - sitems_offset, :])
+        else:
+            out[:, z_sel[0] - sitems_offset:z_sel[1] - sitems_offset, :] = \
+                dset[:, z_sel[0]:z_sel[1], :]
+    return task_meta['itask']
+
+
+def read_projs_vchunkx(filename, shm, ntasks, vchunksx, ivchunkx):
+    """Read a θ-slab vchunkx (vchunksx[0], NZ, N) from a VDS+banks file
+    with ntasks parallel workers, each doing a fancy-slice through the
+    VDS master.  Aligned for proj-stored files.
+
+    Returns a numpy view of the shm buffer with shape=vchunksx.
+    """
+    with h5py.File(filename, 'r') as fid:
+        dset = fid['/exchange/data']
+        shape = dset.shape
+        dset_is_virtual = dset.is_virtual
+        dtp = dset.dtype
+
+    data = np.ndarray(shape=vchunksx, dtype=dtp, buffer=shm.buf)
+
+    sitems_per_task = (vchunksx[0] + ntasks - 1) // ntasks
+    sitems_offset   = vchunksx[0] * ivchunkx[0]
+
+    task_meta = []
+    for itask in range(ntasks):
+        s0 = sitems_offset + itask * sitems_per_task
+        s1 = sitems_offset + (itask + 1) * sitems_per_task
+        s1 = min(s1, sitems_offset + vchunksx[0], shape[0])
+        if s1 > s0:
+            task_meta.append({'itask': itask, 'proj_sel': (s0, s1)})
+
+    pool = _get_pool(ntasks)
+    pool.map(partial(_process_read_projs_vchunkx, filename=filename,
+                     vchunksx=vchunksx, sitems_offset=sitems_offset,
+                     direct_chunk=not dset_is_virtual, dtype=dtp, shm=shm),
+             task_meta)
+    return data
+
+
+def read_slices_vchunkx(filename, shm, ntasks, vchunksx, ivchunkx):
+    """Read a z-slab vchunkx (NTHETA, vchunksx[1], N) from a VDS+banks file
+    with ntasks parallel workers, each doing a fancy-slice through the
+    VDS master.  Cross-axis on proj-stored files (amp per worker =
+    NZ/vchunksx[1]), aligned on slice-stored files.
+
+    Returns a numpy view of the shm buffer with shape=vchunksx.
+    """
+    with h5py.File(filename, 'r') as fid:
+        dset = fid['/exchange/data']
+        shape = dset.shape
+        dset_is_virtual = dset.is_virtual
+        dtp = dset.dtype
+
+    data = np.ndarray(shape=vchunksx, dtype=dtp, buffer=shm.buf)
+
+    sitems_per_task = (vchunksx[1] + ntasks - 1) // ntasks
+    sitems_offset   = vchunksx[1] * ivchunkx[1]
+
+    task_meta = []
+    for itask in range(ntasks):
+        s0 = sitems_offset + itask * sitems_per_task
+        s1 = sitems_offset + (itask + 1) * sitems_per_task
+        s1 = min(s1, sitems_offset + vchunksx[1], shape[1])
+        if s1 > s0:
+            task_meta.append({'itask': itask, 'z_sel': (s0, s1)})
+
+    pool = _get_pool(ntasks)
+    pool.map(partial(_process_read_slices_vchunkx, filename=filename,
+                     vchunksx=vchunksx, sitems_offset=sitems_offset,
+                     direct_chunk=not dset_is_virtual, dtype=dtp, shm=shm),
+             task_meta)
+    return data
+
+
+def write_vchunkx(filename, shm, vchunksx, vchunks, ctx, ivchunkx):
+    """Write a big vchunkx buffer (in shm, shape=vchunksx) to a VDS+banks
+    file by splitting along the z axis (axis 1) into vchunks-sized pieces
+    and calling tomo_writex for each piece.  Ivchunkx is the position of
+    the wide vchunkx; each piece gets ivchunk=(ivchunkx[0], iblock,
+    ivchunkx[2]).
+    """
+    dtp = np.dtype(np.float32)
+    data = np.ndarray(shape=vchunksx, dtype=dtp, buffer=shm.buf)
+
+    nblocks = (vchunksx[1] + vchunks[1] - 1) // vchunks[1]
+    for iblock in range(nblocks):
+        b0 = iblock * vchunks[1]
+        b1 = min(b0 + vchunks[1], vchunksx[1])
+        if b1 > b0:
+            tomo_writex(filename, data[:, b0:b1, :], shm=None,
+                        ivchunk=(ivchunkx[0], iblock, ivchunkx[2]), ctx=ctx)
 

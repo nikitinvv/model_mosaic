@@ -39,14 +39,6 @@ Example:
         --big-vchunks  32 5488 5488 \\
         --proj-vchunks 128 32 5488 \\
         --data-vchunks 128 5120 5488
-
-Add --pgn-slice to switch STAGE 3 into "Option B" mode:
-  · paganin.h5 becomes a plain slice-stored HDF5 (chunks per z-row)
-  · θ-slab writes go through HDF5 read-modify-write
-  · ranks serialize writes to avoid concurrent RMW on the same chunk
-  · STAGE 4 FBP then hits ALIGNED z-row reads (1× amp vs 365×)
-This mirrors step7_paganin_slice.py.  A/B compare by running with and
-without the flag.
 """
 from __future__ import annotations
 
@@ -169,12 +161,6 @@ def _parse_args():
     p.add_argument("--rec-vchunks",  type=int, nargs=3, default=None,
                    metavar=("C0","C1","C2"),
                    help="super-chunk for rec.h5 (default: nbanks, N, N)")
-    p.add_argument("--pgn-slice", action="store_true",
-                   help="Option B: write paganin.h5 as a plain slice-stored "
-                        "HDF5 file (chunks per z-row) with serialized "
-                        "partial-θ writes across ranks.  Mirrors "
-                        "step7_paganin_slice.py.  STAGE 4 FBP then reads "
-                        "aligned z-row chunks (1× amp instead of 365×).")
     return p.parse_args()
 
 
@@ -451,39 +437,22 @@ def main() -> None:
 
     # ================== STAGE 3 PAGANIN: data -> paganin ===================
     rprint("─" * 70)
-    mode_tag = "SLICE-STORED (Option B)" if args.pgn_slice else "PROJ-STORED (OLD)"
-    rprint(f"STAGE 3 PAGANIN     data.h5 ── read ─▶ paganin.h5 ── write  "
-           f"[{mode_tag}]")
+    rprint("STAGE 3 PAGANIN     data.h5 ── read ─▶ paganin.h5 ── write  "
+           "(per super-chunk)")
     rprint("─" * 70)
-    # OLD    : mimics step7_paganin.py — proj-stored VDS+banks, aligned writes.
-    # Option B: mimics step7_paganin_slice.py — plain HDF5 slice-stored
-    #           (chunks per z-row), θ-slab writes go through HDF5 RMW.
-    #           Multiple ranks cannot RMW the same chunk concurrently, so
-    #           writes are serialized across ranks per iteration.
+    # Mimics step7_paganin.py: reads a θ-slab of pgn_vc[0] angles from a
+    # proj-stored source via plain h5py.File (VDS-transparent, single
+    # reader per rank), then fans a same-shape write across nbanks banks.
 
-    if args.pgn_slice:
-        # Plain slice-stored HDF5 file (no VDS+banks)
-        if RANK == 0:
-            _cleanup_h5(PGN)
-            with h5py.File(PGN, "w") as fp:
-                g = fp.create_group("exchange")
-                g.create_dataset(
-                    "data",
-                    shape=pgn_shape, dtype=dtype,
-                    chunks=(pgn_shape[0], 1, pgn_shape[2]),   # (N_HALF, 1, N)
-                )
-        ctx_pgn = None
+    if RANK == 0:
+        _cleanup_h5(PGN)
+        ctx_pgn = tomo_initx(filename=PGN, shape=pgn_shape, dtype=dtype,
+                             vchunks=pgn_vc, stype="proj", nbanks=args.nbanks)
     else:
-        if RANK == 0:
-            _cleanup_h5(PGN)
-            ctx_pgn = tomo_initx(filename=PGN, shape=pgn_shape, dtype=dtype,
-                                 vchunks=pgn_vc, stype="proj", nbanks=args.nbanks)
-        else:
-            ctx_pgn = None
+        ctx_pgn = None
     barrier()
 
-    if not args.pgn_slice:
-        ctx_pgn = COMM.bcast(ctx_pgn, root=0)
+    ctx_pgn = COMM.bcast(ctx_pgn, root=0)
 
     shm_pg, buf_pg = _alloc_shm(pgn_vc, dtype)
     rprint(f"  buffer for paganin: {_hb(buf_pg.nbytes)}   ({pgn_vc})")
@@ -510,17 +479,7 @@ def main() -> None:
         buf_pg[:] = fake_pgn
 
         t = time.perf_counter()
-        if args.pgn_slice:
-            # Serialized partial-θ write to slice-stored plain HDF5.
-            # Each rank writes its own θ-slab; ranks take turns to avoid
-            # concurrent RMW on the same z-row chunks.
-            for r in range(SIZE):
-                if r == RANK:
-                    with h5py.File(PGN, "r+") as fp:
-                        fp["exchange/data"][t0_vc:t1_vc, :, :] = buf_pg
-                barrier()
-        else:
-            tomo_writex(PGN, data=buf_pg, shm=shm_pg, ivchunk=ivc, ctx=ctx_pgn)
+        tomo_writex(PGN, data=buf_pg, shm=shm_pg, ivchunk=ivc, ctx=ctx_pgn)
         t_write += time.perf_counter() - t
         bytes_write += int(np.prod(pgn_vc)) * dtp.itemsize
         if (k % step == 0 or k == my_total) and RANK == 0:
