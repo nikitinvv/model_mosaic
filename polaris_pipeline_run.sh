@@ -117,7 +117,7 @@ python step0_schematic.py --ups "$UPS" --path "$PATH_DATA"
 # chunked; halved host fde vs the old complex64 TomoLarge).
 "${MPIEXEC[@]}" \
     python step2_radon.py --ups "$UPS" --path "$PATH_DATA" \
-        --nzchunk "$NZCHUNK" --nbanks "$NBANKS" \
+        --nzchunk "$NZCHUNK" --nbanks "$NBANKS" --ntasks "$NTASKS" \
         $(vcarg "$VCHUNKS_STEP2")
 # For UPS≥4 swap in step2_radon_large.py (see README).
 

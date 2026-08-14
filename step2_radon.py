@@ -33,7 +33,7 @@ import numpy as np
 import cupy as cp
 
 from processing.tomo import TomoReal
-from iohdf5.dxchange_hdf5_chunks import tomo_writex
+from iohdf5.dxchange_hdf5_chunks import tomo_writex, read_projs_vchunkx
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
@@ -54,6 +54,8 @@ def _parse_args() -> argparse.Namespace:
                    help="z-slices per Radon call")
     p.add_argument("--nbanks",  type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
+    p.add_argument("--ntasks",  type=int, default=8,
+                   help="parallel workers for read_projs_vchunkx (big-vol prefetch)")
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk for proj.h5 (default: NTHETA, "
@@ -77,6 +79,7 @@ ANG_MAX = np.pi          # tomo needs 180°; step4 synthesises the 360° tile-sc
                          # via the tomo identity proj(θ,x) = proj(θ+π, N-1-x)
 NZCHUNK = _A.nzchunk
 NBANKS  = _A.nbanks
+NTASKS  = _A.ntasks
 VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (NTHETA, 8 * NZCHUNK, N)
 
 
@@ -148,58 +151,68 @@ def main() -> None:
     my_ivchunks = ivchunks[RANK::SIZE]
     shm, buf = alloc_shm(VCHUNKS, np.float32)
 
+    # Prefetch shm for the vchunkx z-slab from big{UPS}x.h5 (aligned along
+    # its axis 0 = z).  One read_projs_vchunkx per output vchunk with
+    # NTASKS parallel workers; inner NZCHUNK loop slices from RAM.
+    big_slab_shape = (VCHUNKS[1], N, N)
+    shm_slab, big_slab_buf = alloc_shm(big_slab_shape, np.float32)
+
+    t_read = t_radon = t_write = 0.0
+    b_read = b_write = 0
     try:
-        with h5py.File(SRC_H5, "r") as fsrc:
-            src_dset = fsrc["exchange/data"]
-            t_read = t_radon = t_write = 0.0
-            b_read = b_write = 0
-            for k, ivc in enumerate(my_ivchunks, start=1):
-                z0_vc = ivc[1] * VCHUNKS[1]
-                z1_vc = min(z0_vc + VCHUNKS[1], NZ)
-                buf.fill(0)
+        for k, ivc in enumerate(my_ivchunks, start=1):
+            z0_vc = ivc[1] * VCHUNKS[1]
+            z1_vc = min(z0_vc + VCHUNKS[1], NZ)
+            buf.fill(0)
 
-                for z0 in range(z0_vc, z1_vc, NZCHUNK):
-                    z1 = min(z0 + NZCHUNK, NZ)
-                    kz = z1 - z0
+            t0 = time.perf_counter()
+            read_projs_vchunkx(SRC_H5, shm_slab, ntasks=NTASKS,
+                               vchunksx=big_slab_shape,
+                               ivchunkx=(ivc[1], 0, 0))
+            t_read += time.perf_counter() - t0
+            b_read += (z1_vc - z0_vc) * N * N * 4
 
-                    t0 = time.perf_counter()
-                    chunk_h = load_chunk(src_dset, z0, z1)
-                    if kz < NZCHUNK:
-                        pad = np.zeros((NZCHUNK, N, N), dtype=np.float32)
-                        pad[:kz] = chunk_h
-                        chunk_h = pad
-                    t_read += time.perf_counter() - t0
-                    b_read += kz * N * N * 4
+            for z0 in range(z0_vc, z1_vc, NZCHUNK):
+                z1 = min(z0 + NZCHUNK, NZ)
+                kz = z1 - z0
 
-                    t0 = time.perf_counter()
-                    # TomoReal takes float32 obj directly (no complex64
-                    # wrapping) and returns float32 sino (no .real / astype
-                    # dance).
-                    vol_d = cp.asarray(chunk_h)
-                    proj_d = cl_tomo.R(vol_d)      # (NTHETA, NZCHUNK, N) f32
-                    del vol_d
-
-                    proj_chunk_h = cp.asnumpy(proj_d[:, :kz])
-                    del proj_d
-                    cp.get_default_memory_pool().free_all_blocks()
-                    t_radon += time.perf_counter() - t0
-
-                    buf[:, z0 - z0_vc : z1 - z0_vc, :] = proj_chunk_h
-                    proj_min = min(proj_min, float(proj_chunk_h.min()))
-                    proj_max = max(proj_max, float(proj_chunk_h.max()))
-                    del proj_chunk_h
+                # Slice from the pre-fetched RAM buffer — free.
+                chunk_h = big_slab_buf[z0 - z0_vc : z0 - z0_vc + kz]
+                if kz < NZCHUNK:
+                    pad = np.zeros((NZCHUNK, N, N), dtype=np.float32)
+                    pad[:kz] = chunk_h
+                    chunk_h = pad
 
                 t0 = time.perf_counter()
-                tomo_writex(PROJ_H5, data=buf, shm=shm, ivchunk=ivc, ctx=ctx)
-                t_write += time.perf_counter() - t0
-                b_write += NTHETA * (z1_vc - z0_vc) * N * 4
+                # TomoReal takes float32 obj directly (no complex64
+                # wrapping) and returns float32 sino (no .real / astype
+                # dance).
+                vol_d = cp.asarray(chunk_h)
+                proj_d = cl_tomo.R(vol_d)      # (NTHETA, NZCHUNK, N) f32
+                del vol_d
 
-                print(f"  [rank {RANK}] vchunk {k}/{len(my_ivchunks)}  "
-                      f"z=[{z0_vc},{z1_vc})  "
-                      f"(read={t_read:.1f}s radon={t_radon:.1f}s "
-                      f"write={t_write:.1f}s)", flush=True)
+                proj_chunk_h = cp.asnumpy(proj_d[:, :kz])
+                del proj_d
+                cp.get_default_memory_pool().free_all_blocks()
+                t_radon += time.perf_counter() - t0
+
+                buf[:, z0 - z0_vc : z1 - z0_vc, :] = proj_chunk_h
+                proj_min = min(proj_min, float(proj_chunk_h.min()))
+                proj_max = max(proj_max, float(proj_chunk_h.max()))
+                del proj_chunk_h
+
+            t0 = time.perf_counter()
+            tomo_writex(PROJ_H5, data=buf, shm=shm, ivchunk=ivc, ctx=ctx)
+            t_write += time.perf_counter() - t0
+            b_write += NTHETA * (z1_vc - z0_vc) * N * 4
+
+            print(f"  [rank {RANK}] vchunk {k}/{len(my_ivchunks)}  "
+                  f"z=[{z0_vc},{z1_vc})  "
+                  f"(read={t_read:.1f}s radon={t_radon:.1f}s "
+                  f"write={t_write:.1f}s)", flush=True)
     finally:
         free_shm(shm)
+        free_shm(shm_slab)
         del cl_tomo
         cp.get_default_memory_pool().free_all_blocks()
     barrier()

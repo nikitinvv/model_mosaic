@@ -34,7 +34,7 @@ import numpy as np
 import cupy as cp
 
 from processing.propagation_large import PropagationLarge
-from iohdf5.dxchange_hdf5_chunks import tomo_writex
+from iohdf5.dxchange_hdf5_chunks import tomo_writex, read_projs_vchunkx
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
@@ -59,6 +59,8 @@ def _parse_args() -> argparse.Namespace:
                    help="sample → detector distance, meters")
     p.add_argument("--nbanks",     type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
+    p.add_argument("--ntasks",     type=int, default=8,
+                   help="parallel workers for read_projs_vchunkx (proj prefetch)")
     p.add_argument("--chunk-nz",   type=int, default=768,
                    help="pass1/3 z-strip depth")
     p.add_argument("--chunk-2n",   type=int, default=768,
@@ -89,6 +91,7 @@ VOXELSIZE  = _A.voxelsize
 DISTANCE   = _A.distance
 
 NBANKS       = _A.nbanks
+NTASKS       = _A.ntasks
 VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8, NZ, N)
 
 CHUNK_NZ = _A.chunk_nz
@@ -181,20 +184,24 @@ def main() -> None:
     my_ivchunks = ivchunks[RANK::SIZE]
     shm, buf = alloc_shm(VCHUNKS, np.float32)
 
+    # Prefetch shm for the vchunkx proj-slab (VCHUNKS[0], NZ, N).
+    # read_projs_vchunkx fans the read across NTASKS parallel workers
+    # (each opens+reads+closes its own θ-shard), so VDS source FDs are
+    # released per worker call — no EMFILE with NVRTC kernel compiles.
+    proj_slab_shape = (VCHUNKS[0], NZ, N)
+    shm_slab, proj_slab_buf = alloc_shm(proj_slab_shape, np.float32)
+
     try:
         for k, ivc in enumerate(my_ivchunks, start=1):
             t0_vc = ivc[0] * VCHUNKS[0]
             t1_vc = min(t0_vc + VCHUNKS[0], NTHETA)
             buf.fill(0)
 
-            # Open proj.h5 inside the vchunk loop so its VDS source FDs
-            # (one per bank file — 3072 for a (NTHETA, 1, N) bank layout)
-            # are released before the propagate/write phase.  Otherwise
-            # cupy's mid-run kernel compile races those FDs and hits
-            # EMFILE on `open('.../.cubin.cu')` inside NVRTC.
             t0 = time.perf_counter()
-            with h5py.File(PROJ_H5, "r") as fp:
-                proj_slab_h = fp["exchange/data"][t0_vc:t1_vc, :, :]  # (K, NZ, N)
+            read_projs_vchunkx(PROJ_H5, shm_slab, ntasks=NTASKS,
+                               vchunksx=proj_slab_shape,
+                               ivchunkx=(ivc[0], 0, 0))
+            proj_slab_h = proj_slab_buf
             t_read += time.perf_counter() - t0
             b_read += (t1_vc - t0_vc) * NZ * N * 4
 
@@ -253,6 +260,7 @@ def main() -> None:
                   f"write={t_write:.1f}s)", flush=True)
     finally:
         free_shm(shm)
+        free_shm(shm_slab)
 
     d_min     = allreduce(d_min,     MPI.MIN)
     d_max     = allreduce(d_max,     MPI.MAX)

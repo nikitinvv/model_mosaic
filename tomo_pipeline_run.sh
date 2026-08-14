@@ -91,7 +91,7 @@ mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
 
 mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
     python step2_radon.py --ups "$UPS" --path "$PATH_DATA" \
-        --nzchunk "$NZCHUNK" --nbanks "$NBANKS" \
+        --nzchunk "$NZCHUNK" --nbanks "$NBANKS" --ntasks "$NTASKS" \
         $(vcarg "$VCHUNKS_STEP2")
 # For UPS≥4 swap in step2_radon_large.py (see README).
 

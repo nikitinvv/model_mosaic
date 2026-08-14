@@ -26,7 +26,7 @@ import cupy as cp
 
 from processing.tomo_large import TomoLargeReal
 from processing.fbp_filter import FBPFilter
-from iohdf5.dxchange_hdf5_chunks import tomo_writex
+from iohdf5.dxchange_hdf5_chunks import tomo_writex, read_slices_vchunkx
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
@@ -54,6 +54,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--chunk-xy",    type=int, default=768,
                    help="RT-scatter ky-band size")
     p.add_argument("--nbanks",      type=int, default=8)
+    p.add_argument("--ntasks",      type=int, default=8,
+                   help="parallel workers for read_slices_vchunkx (sino prefetch)")
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk for rec.h5 (default: 8·NZCHUNK, N, N)")
@@ -77,6 +79,7 @@ CHUNK_N     = _A.chunk_n
 CHUNK_THETA = _A.chunk_theta
 CHUNK_XY    = _A.chunk_xy
 NBANKS      = _A.nbanks
+NTASKS      = _A.ntasks
 VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8 * NZCHUNK, N, N)
 
 
@@ -174,21 +177,32 @@ def main() -> None:
     my_ivchunks = ivchunks[RANK::SIZE]
     shm, buf = alloc_shm(VCHUNKS, np.float32)
 
+    # Prefetch shm for the sinogram vchunkx (NTHETA, VCHUNKS[0], N).
+    # One read_slices_vchunkx per rec vchunk (NTASKS parallel workers)
+    # replaces NZCHUNK-many per-inner plain-h5py reads.
+    sino_shape = (NTHETA, VCHUNKS[0], N)
+    shm_sino, sino_buf = alloc_shm(sino_shape, np.float32)
+
     try:
         for k, ivc in enumerate(my_ivchunks, start=1):
             z0_vc = ivc[0] * VCHUNKS[0]
             z1_vc = min(z0_vc + VCHUNKS[0], NZ)
             buf.fill(0)
 
+            # Vchunkx read: all sinogram data for this rec vchunk in one shot.
+            t0 = time.perf_counter()
+            read_slices_vchunkx(SRC_H5, shm_sino, ntasks=NTASKS,
+                                vchunksx=sino_shape,
+                                ivchunkx=(0, ivc[0], 0))
+            t_read += time.perf_counter() - t0
+            b_read += NTHETA * (z1_vc - z0_vc) * N * 4
+
             for zc0 in range(z0_vc, z1_vc, NZCHUNK):
                 zc1 = min(zc0 + NZCHUNK, z1_vc)
                 b   = zc1 - zc0
 
-                t0 = time.perf_counter()
-                with h5py.File(SRC_H5, "r") as fp:
-                    sino_h = fp["exchange/data"][:, zc0:zc1, :]  # (NTHETA, b, N) f32
-                t_read += time.perf_counter() - t0
-                b_read += NTHETA * b * N * 4
+                # Slice from the pre-fetched RAM buffer — free.
+                sino_h = sino_buf[:, zc0 - z0_vc : zc1 - z0_vc, :]
 
                 # Filter via filter_host — chunks the H2D → GPU-filter
                 # → D2H roundtrip by FBPFilter.batch_chunk (default 256
@@ -225,6 +239,7 @@ def main() -> None:
                   f"write={t_write:.1f}s)", flush=True)
     finally:
         free_shm(shm)
+        free_shm(shm_sino)
 
     r_min     = allreduce(r_min,     MPI.MIN)
     r_max     = allreduce(r_max,     MPI.MAX)

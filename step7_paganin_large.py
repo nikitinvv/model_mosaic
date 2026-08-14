@@ -30,7 +30,7 @@ import numpy as np
 import cupy as cp
 
 from processing.paganin_large import PaganinLarge
-from iohdf5.dxchange_hdf5_chunks import tomo_writex
+from iohdf5.dxchange_hdf5_chunks import tomo_writex, read_projs_vchunkx
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
@@ -59,6 +59,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--chunk-n",    type=int, default=768,
                    help="pass2 y-strip width")
     p.add_argument("--nbanks",     type=int, default=8)
+    p.add_argument("--ntasks",     type=int, default=8,
+                   help="parallel workers for read_projs_vchunkx (stitched prefetch)")
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk for paganin.h5 (default: 8·NPGNCHUNK, NZ, N)")
@@ -84,6 +86,7 @@ ALPHA      = _A.alpha
 
 NPGNCHUNK   = _A.npgnchunk
 NBANKS      = _A.nbanks
+NTASKS      = _A.ntasks
 VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8 * NPGNCHUNK, NZ, N)
 
 CHUNK_NZ = _A.chunk_nz
@@ -186,6 +189,11 @@ def main() -> None:
     my_ivchunks = ivchunks[RANK::SIZE]
     shm, buf = alloc_shm(VCHUNKS, np.float32)
 
+    # Prefetch shm for the vchunkx θ-slab (VCHUNKS[0], NZ, N) — aligned
+    # read on proj-stored stitched.h5 via NTASKS parallel workers.
+    stitched_slab_shape = (VCHUNKS[0], NZ, N)
+    shm_slab, stitched_slab_buf = alloc_shm(stitched_slab_shape, np.float32)
+
     try:
         for k, ivc in enumerate(my_ivchunks, start=1):
             t0_vc = ivc[0] * VCHUNKS[0]
@@ -193,8 +201,10 @@ def main() -> None:
             buf.fill(0)
 
             t0 = time.perf_counter()
-            with h5py.File(SRC_H5, "r") as fp:
-                slab_h = fp["exchange/data"][t0_vc:t1_vc, :, :]  # (K, NZ, N) f32
+            read_projs_vchunkx(SRC_H5, shm_slab, ntasks=NTASKS,
+                               vchunksx=stitched_slab_shape,
+                               ivchunkx=(ivc[0], 0, 0))
+            slab_h = stitched_slab_buf
             t_read += time.perf_counter() - t0
             b_read += (t1_vc - t0_vc) * NZ * N * 4
 
@@ -238,6 +248,7 @@ def main() -> None:
                   f"write={t_write:.1f}s)", flush=True)
     finally:
         free_shm(shm)
+        free_shm(shm_slab)
 
     p_min     = allreduce(p_min,     MPI.MIN)
     p_max     = allreduce(p_max,     MPI.MAX)
