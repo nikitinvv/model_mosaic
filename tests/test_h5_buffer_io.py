@@ -51,7 +51,10 @@ import h5py
 import numpy as np
 from multiprocessing import shared_memory
 
-from iohdf5.dxchange_hdf5_chunks import tomo_initx, tomo_readx, tomo_writex
+from iohdf5.dxchange_hdf5_chunks import (
+    tomo_initx, tomo_readx, tomo_writex,
+    read_projs_vchunkx, read_slices_vchunkx,
+)
 from mpi_utils import MPI, COMM, RANK, SIZE, barrier, rprint, allreduce
 
 
@@ -441,8 +444,9 @@ def main() -> None:
            "(per super-chunk)")
     rprint("─" * 70)
     # Mimics step7_paganin.py: reads a θ-slab of pgn_vc[0] angles from a
-    # proj-stored source via plain h5py.File (VDS-transparent, single
-    # reader per rank), then fans a same-shape write across nbanks banks.
+    # proj-stored source via read_projs_vchunkx (parallel workers, each
+    # doing its own θ-shard slice on the VDS master), then fans a same-
+    # shape write across nbanks banks.
 
     if RANK == 0:
         _cleanup_h5(PGN)
@@ -456,6 +460,10 @@ def main() -> None:
 
     shm_pg, buf_pg = _alloc_shm(pgn_vc, dtype)
     rprint(f"  buffer for paganin: {_hb(buf_pg.nbytes)}   ({pgn_vc})")
+
+    # Prefetch shm for read_projs_vchunkx (θ-slab of pgn_vc[0] angles).
+    pgn_read_vc = (pgn_vc[0], pgn_shape[1], pgn_shape[2])
+    shm_pg_read, _pg_read_buf = _alloc_shm(pgn_read_vc, dtype)
 
     pgn_ivchunks = list(_iter_vchunks(pgn_shape, pgn_vc))
     my_pgn = pgn_ivchunks[RANK::SIZE]
@@ -471,8 +479,8 @@ def main() -> None:
         t1_vc = min(t0_vc + pgn_vc[0], pgn_shape[0])
 
         t = time.perf_counter()
-        with h5py.File(DATA, "r") as fp:
-            _ = fp["exchange/data"][t0_vc:t1_vc, :pgn_vc[1], :pgn_vc[2]]
+        read_projs_vchunkx(DATA, shm_pg_read, ntasks=args.ntasks,
+                           vchunksx=pgn_read_vc, ivchunkx=(ivc[0], 0, 0))
         t_read += time.perf_counter() - t
         bytes_read += (t1_vc - t0_vc) * pgn_vc[1] * pgn_vc[2] * dtp.itemsize
 
@@ -497,9 +505,11 @@ def main() -> None:
            "(per super-chunk)")
     rprint("─" * 70)
     # Mimics step8_fbp.py: for each rec.h5 super-chunk of (VZ, N, N),
-    # loops nzchunk-sized z-slabs and reads a sinogram slab
-    # [:, zc0:zc1, :] from proj-stored paganin.h5 — cross-bank access
-    # that stresses VDS resolution (spans every θ-bank of the source).
+    # PREFETCHES the full (NTHETA, VZ, N) sinogram slab via
+    # read_slices_vchunkx (ntasks parallel workers), then the inner
+    # nzchunk-sized loop just slices from RAM.  Amp per prefetch ≈
+    # NZ/VZ (cross-axis on proj-stored paganin.h5), vs the OLD amp of
+    # NZ/NZCHUNK per plain-h5py inner read.
 
     if RANK == 0:
         _cleanup_h5(REC)
@@ -513,6 +523,12 @@ def main() -> None:
 
     shm_r, buf_r = _alloc_shm(rec_vc, dtype)
     rprint(f"  buffer for rec:     {_hb(buf_r.nbytes)}   ({rec_vc})")
+
+    # Prefetch shm for the sinogram vchunkx (NTHETA, rec_vc[0], N).  One
+    # read_slices_vchunkx call per rec vchunk replaces NZCHUNK-many
+    # per-inner plain-h5py reads.  Amp drops from NZ/NZCHUNK to NZ/rec_vc[0].
+    sino_read_vc = (pgn_shape[0], rec_vc[0], pgn_shape[2])
+    shm_sino, _sino_buf = _alloc_shm(sino_read_vc, dtype)
 
     rec_ivchunks = list(_iter_vchunks(rec_shape, rec_vc))
     my_rec = rec_ivchunks[RANK::SIZE]
@@ -529,13 +545,18 @@ def main() -> None:
         z0_vc = ivc[0] * rec_vc[0]
         z1_vc = min(z0_vc + rec_vc[0], rec_shape[0])
 
+        # One parallel prefetch of the whole vchunk's sino slab.
+        t = time.perf_counter()
+        read_slices_vchunkx(PGN, shm_sino, ntasks=args.ntasks,
+                            vchunksx=sino_read_vc, ivchunkx=(0, ivc[0], 0))
+        t_read += time.perf_counter() - t
+        bytes_read += pgn_shape[0] * (z1_vc - z0_vc) * pgn_shape[2] * dtp.itemsize
+
+        # Inner nzchunk loop kept for parity with step8_fbp — but reads are
+        # now RAM slices from _sino_buf (free), not h5py calls.
         for zc0 in range(z0_vc, z1_vc, NZCHUNK):
             zc1 = min(zc0 + NZCHUNK, z1_vc)
-            t = time.perf_counter()
-            with h5py.File(PGN, "r") as fp:
-                _ = fp["exchange/data"][:, zc0:zc1, :]
-            t_read += time.perf_counter() - t
-            bytes_read += pgn_shape[0] * (zc1 - zc0) * pgn_shape[2] * dtp.itemsize
+            _ = _sino_buf[:, zc0 - z0_vc : zc1 - z0_vc, :]
 
         buf_r[:] = fake_rec
 
@@ -551,7 +572,9 @@ def main() -> None:
     _report_stage("fbp      read",  bytes_read,  t_read)
     _report_stage("fbp      write", bytes_write, t_write)
     _free_shm(shm_pg)
+    _free_shm(shm_pg_read)
     _free_shm(shm_r)
+    _free_shm(shm_sino)
 
 
 if __name__ == "__main__":
