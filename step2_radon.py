@@ -38,6 +38,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
 )
+from iohdf5.layout import add_layout_args, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
@@ -58,8 +59,9 @@ def _parse_args() -> argparse.Namespace:
                    help="parallel workers for read_projs_vchunkx (big-vol prefetch)")
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
-                   help="super-chunk for proj.h5 (default: NTHETA, "
-                        "8·NZCHUNK, N).  RAM buffer = C0·C1·C2·4 bytes/rank.")
+                   help="super-chunk for proj.h5; default comes from "
+                        "iohdf5.layout (--mem-budget / --chunk-bytes)")
+    add_layout_args(p)
     return p.parse_args()
 
 
@@ -77,10 +79,22 @@ N     = IN_N  * UPS
 NTHETA  = _A.ntheta if _A.ntheta is not None else 3 * N // 4
 ANG_MAX = np.pi          # tomo needs 180°; step4 synthesises the 360° tile-scan
                          # via the tomo identity proj(θ,x) = proj(θ+π, N-1-x)
-NZCHUNK = _A.nzchunk
-NBANKS  = _A.nbanks
 NTASKS  = _A.ntasks
-VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (NTHETA, 8 * NZCHUNK, N)
+
+# Layout from the shared byte-budget policy.  The old default,
+# (NTHETA, 8·NZCHUNK, N), is 2.3 GB at UPS=1 but 9.7 TB at UPS=8: it counts
+# z-slices when what has to stay bounded is bytes, and one z-sinogram alone
+# is 7.2 GB at UPS=16.  NZCHUNK follows the plan's alignment -- the Radon
+# loop can run in smaller pieces, so it bends rather than pushing the
+# super-chunk over the RAM budget.
+_PLAN   = resolve_step("proj", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
+                       ntheta=NTHETA, nbanks=_A.nbanks,
+                       mem_budget_gb=_A.mem_budget, chunk_mb=_A.chunk_bytes,
+                       nzchunk=_A.nzchunk, vchunks=_A.vchunks, nranks=SIZE)
+NBANKS   = _PLAN.nbanks
+VCHUNKS  = _PLAN.vchunks
+H5CHUNKS = _PLAN.chunks
+NZCHUNK  = _PLAN.align
 
 
 def load_chunk(src_dset, z_start: int, z_end: int) -> np.ndarray:
@@ -124,11 +138,13 @@ def main() -> None:
     if RANK == 0:
         describe_input(SRC_H5)
         describe_output(PROJ_H5, (NTHETA, NZ, N), np.float32,
-                        VCHUNKS, "slice", NBANKS)
+                        VCHUNKS, "slice", NBANKS, chunks=H5CHUNKS,
+                        read_granule=_PLAN.read_granule,
+                        companion_bytes=VCHUNKS[1] * N * N * 4)
 
     ctx = initx_and_bcast(PROJ_H5, shape=(NTHETA, NZ, N),
                           dtype=np.float32, vchunks=VCHUNKS,
-                          stype="slice", nbanks=NBANKS,
+                          stype="slice", nbanks=NBANKS, chunks=H5CHUNKS,
                           rank=RANK, comm=COMM)
     if RANK == 0:
         with h5py.File(PROJ_H5, "r+") as f:

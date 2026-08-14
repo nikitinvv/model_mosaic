@@ -10,7 +10,7 @@
 # are the direct crop; the second N_HALF are the mirror crop with an
 # h-flip, per proj(θ, x) = proj(θ+π, N-1-x).
 # 
-# step5_stitch reduces back to a 180° big projection of shape
+# step6_stitch reduces back to a 180° big projection of shape
 # (N_HALF, NZ, N):
 #   for each output θ in [0, N_HALF):
 #     place tile[θ]              at (z_center, x_center)      no flip

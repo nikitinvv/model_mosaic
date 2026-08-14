@@ -38,6 +38,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
 )
+from iohdf5.layout import add_layout_args, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
@@ -58,9 +59,11 @@ def _parse_args() -> argparse.Namespace:
                    help="NUFFT gather bin edge")
     p.add_argument("--nbanks", type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
+    add_layout_args(p)
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
-                   help="super-chunk for proj.h5 (default: NTHETA, 8·NZCHUNK, N)")
+                   help="super-chunk for proj.h5; default comes from "
+                        "iohdf5.layout (--mem-budget / --chunk-bytes)")
     return p.parse_args()
 
 
@@ -79,12 +82,20 @@ NTHETA  = _A.ntheta if _A.ntheta is not None else 3 * N // 4
 ANG_MAX = np.pi          # tomo needs 180°; step4 synthesises the 360° tile-scan
                          # via the tomo identity proj(θ,x) = proj(θ+π, N-1-x)
 
-NZCHUNK     = _A.nzchunk
 CHUNK_N     = _A.chunk_n
 CHUNK_THETA = _A.chunk_theta
 CHUNK_XY    = _A.chunk_xy
-NBANKS      = _A.nbanks
-VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (NTHETA, 8 * NZCHUNK, N)
+# Layout from the shared byte-budget policy -- same plan step2_radon uses,
+# so the host-chunked twin writes an identically-laid-out proj.h5.
+_PLAN    = resolve_step("proj", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
+                        ntheta=NTHETA, nbanks=_A.nbanks,
+                        mem_budget_gb=_A.mem_budget,
+                        chunk_mb=_A.chunk_bytes, nzchunk=_A.nzchunk,
+                        vchunks=_A.vchunks, nranks=SIZE)
+NBANKS      = _PLAN.nbanks
+VCHUNKS     = _PLAN.vchunks
+H5CHUNKS    = _PLAN.chunks
+NZCHUNK     = _PLAN.align
 
 
 def _validate_chunks() -> None:
@@ -144,11 +155,13 @@ def main() -> None:
     if RANK == 0:
         describe_input(SRC_H5)
         describe_output(PROJ_H5, (NTHETA, NZ, N), np.float32,
-                        VCHUNKS, "slice", NBANKS)
+                        VCHUNKS, "slice", NBANKS, chunks=H5CHUNKS,
+                        read_granule=_PLAN.read_granule,
+                        companion_bytes=VCHUNKS[1] * N * N * 4)
 
     ctx = initx_and_bcast(PROJ_H5, shape=(NTHETA, NZ, N),
                           dtype=np.float32, vchunks=VCHUNKS,
-                          stype="slice", nbanks=NBANKS,
+                          stype="slice", nbanks=NBANKS, chunks=H5CHUNKS,
                           rank=RANK, comm=COMM)
     if RANK == 0:
         with h5py.File(PROJ_H5, "r+") as f:

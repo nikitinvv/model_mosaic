@@ -37,6 +37,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
 )
+from iohdf5.layout import add_layout_args, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
@@ -63,7 +64,8 @@ def _parse_args() -> argparse.Namespace:
                    help="parallel workers for read_projs_vchunkx (stitched prefetch)")
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
-                   help="super-chunk for paganin.h5 (default: 8·NPGNCHUNK, NZ, N)")
+                   help="super-chunk for paganin.h5; default comes from "
+                        "iohdf5.layout (--mem-budget / --chunk-bytes)")
     p.add_argument("--chunk-order", choices=("sino", "proj"), default="sino",
                    help="HDF5 chunk order inside paganin.h5's bank files.  "
                         "'sino' (default) = (θ_per_bank, chunk_z, N), what "
@@ -71,14 +73,16 @@ def _parse_args() -> argparse.Namespace:
                         "the old layout — makes that read touch every chunk "
                         "to use zslab/NZ of it.  Banking is θ-split either "
                         "way.")
-    p.add_argument("--chunk-z", type=int, default=32,
-                   help="z-extent of the sinogram chunk.  Set it equal to "
-                        "step8_fbp's --vchunks C0 (the FBP z-slab): then each "
-                        "bank file serves that read with a single whole-chunk "
-                        "sequential read.  --chunk-z 1 is the pure-sinogram "
-                        "extreme and costs one HDF5 op per z row per bank — "
-                        "latency-bound on Lustre.  Bigger than the FBP z-slab "
-                        "reads parts of chunks back.  Ignored for 'proj'.")
+    p.add_argument("--chunk-z", type=int, default=0,
+                   help="z-extent of the sinogram chunk.  0 (default) takes "
+                        "it from iohdf5.layout, which derives step8's FBP "
+                        "z-slab from the same policy — so each bank file "
+                        "serves that read with one whole-chunk sequential "
+                        "op and there is nothing for the run scripts to keep "
+                        "in sync.  --chunk-z 1 is the pure-sinogram extreme "
+                        "and costs one HDF5 op per z row per bank, which is "
+                        "latency-bound on Lustre.  Ignored for 'proj'.")
+    add_layout_args(p)
     return p.parse_args()
 
 
@@ -99,22 +103,33 @@ VOXELSIZE  = _A.voxelsize
 DISTANCE   = _A.distance
 ALPHA      = _A.alpha
 
-NPGNCHUNK   = _A.npgnchunk
-NBANKS      = _A.nbanks
 NTASKS      = _A.ntasks
-VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8 * NPGNCHUNK, NZ, N)
 
-# HDF5 chunk shape inside the bank files.  Banking stays θ-split (stype
+# Layout from the shared byte-budget policy.  Banking stays θ-split (stype
 # 'proj') because ranks shard on θ and each bank file must have exactly one
 # writer — but the chunks are laid out for the reader.  step8 reads
 # (NTHETA, zslab, N) sinograms, so the chunk covers a whole bank's worth of
-# angles and exactly one FBP z-slab: that read then costs one sequential
-# whole-chunk op per bank file.  θ_per_bank is what tomo_initx's banking
-# plan puts in each bank file, so the θ extent covers a bank exactly.
-THETA_PER_BANK = (VCHUNKS[0] + NBANKS - 1) // NBANKS
-CHUNK_Z = max(1, min(_A.chunk_z, NZ))
-H5CHUNKS = ((THETA_PER_BANK, CHUNK_Z, N) if _A.chunk_order == "sino"
-            else (1, NZ, N))
+# angles and exactly one FBP z-slab, and that read costs one sequential
+# whole-chunk op per bank file.  The policy derives step8's z-slab from the
+# same function, so --chunk-z no longer has to be kept in sync by hand.
+#
+# It also drops back to projection order once θ_per_bank hits 1: with a
+# single angle per bank the sinogram chunk is (1, chunk_z, N), which is all
+# cost and no benefit — at UPS=8 that was a 4.5 MB chunk.
+_PLAN     = resolve_step("paganin", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
+                         nbanks=_A.nbanks, mem_budget_gb=_A.mem_budget,
+                         chunk_mb=_A.chunk_bytes, npgnchunk=_A.npgnchunk,
+                         vchunks=_A.vchunks, order=_A.chunk_order,
+                         nranks=SIZE)
+NBANKS    = _PLAN.nbanks
+VCHUNKS   = _PLAN.vchunks
+NPGNCHUNK = _PLAN.align
+H5CHUNKS  = _PLAN.chunks
+if _A.chunk_z:                      # explicit override of the z extent only
+    H5CHUNKS = (H5CHUNKS[0], max(1, min(_A.chunk_z, _PLAN.bank_shape[1])),
+                H5CHUNKS[2])
+THETA_PER_BANK = _PLAN.bank_shape[0]
+CHUNK_Z = H5CHUNKS[1]
 
 
 def main() -> None:
@@ -168,7 +183,9 @@ def main() -> None:
     if RANK == 0:
         describe_input(SRC_H5)
         describe_output(DST_H5, (N_HALF, NZ, N), np.float32,
-                        VCHUNKS, "proj", NBANKS, chunks=H5CHUNKS)
+                        VCHUNKS, "proj", NBANKS, chunks=H5CHUNKS,
+                        read_granule=_PLAN.read_granule,
+                        companion_bytes=VCHUNKS[0] * NZ * N * 4)
 
     ctx = initx_and_bcast(DST_H5, shape=(N_HALF, NZ, N),
                           dtype=np.float32, vchunks=VCHUNKS,

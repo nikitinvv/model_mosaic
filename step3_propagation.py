@@ -31,6 +31,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
 )
+from iohdf5.layout import add_layout_args, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
@@ -61,7 +62,9 @@ def _parse_args() -> argparse.Namespace:
                    help="parallel workers for read_projs_vchunkx (proj prefetch)")
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
-                   help="super-chunk for data.h5 (default: 8·NPROPCHUNK, NZ, N)")
+                   help="super-chunk for data.h5; default comes from "
+                        "iohdf5.layout (--mem-budget / --chunk-bytes)")
+    add_layout_args(p)
     return p.parse_args()
 
 
@@ -85,10 +88,22 @@ ENERGY     = _A.energy
 VOXELSIZE  = _A.voxelsize
 DISTANCE   = _A.distance
 
-NPROPCHUNK = _A.npropchunk
-NBANKS      = _A.nbanks
 NTASKS      = _A.ntasks
-VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8 * NPROPCHUNK, NZ, N)
+
+# Layout from the shared byte-budget policy.  Two buffers are live here --
+# the (C0, NZ, N) data vchunk and the (C0, NZ, N) proj prefetch slab -- so
+# the true cost per θ is 2·NZ·N·4, which the old 8·NPROPCHUNK literal never
+# accounted for.  NPROPCHUNK follows the plan's alignment: the Fresnel loop
+# can run in smaller batches rather than inflate the super-chunk.
+_PLAN   = resolve_step("data", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
+                       ntheta=NTHETA, nbanks=_A.nbanks,
+                       mem_budget_gb=_A.mem_budget, chunk_mb=_A.chunk_bytes,
+                       npropchunk=_A.npropchunk, vchunks=_A.vchunks,
+                       nranks=SIZE)
+NBANKS      = _PLAN.nbanks
+VCHUNKS     = _PLAN.vchunks
+H5CHUNKS    = _PLAN.chunks
+NPROPCHUNK  = _PLAN.align
 
 
 _psi_from_proj = cp.ElementwiseKernel(
@@ -155,11 +170,13 @@ def main() -> None:
     if RANK == 0:
         describe_input(PROJ_H5)
         describe_output(DATA_H5, (NTHETA, NZ, N), np.float32,
-                        VCHUNKS, "proj", NBANKS)
+                        VCHUNKS, "proj", NBANKS, chunks=H5CHUNKS,
+                        read_granule=_PLAN.read_granule,
+                        companion_bytes=VCHUNKS[0] * NZ * N * 4)
 
     ctx = initx_and_bcast(DATA_H5, shape=(NTHETA, NZ, N),
                           dtype=np.float32, vchunks=VCHUNKS,
-                          stype="proj", nbanks=NBANKS,
+                          stype="proj", nbanks=NBANKS, chunks=H5CHUNKS,
                           rank=RANK, comm=COMM)
     if RANK == 0:
         with h5py.File(DATA_H5, "r+") as f:

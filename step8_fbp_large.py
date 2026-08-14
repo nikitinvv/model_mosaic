@@ -31,6 +31,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
 )
+from iohdf5.layout import add_layout_args, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
@@ -56,9 +57,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--nbanks",      type=int, default=8)
     p.add_argument("--ntasks",      type=int, default=8,
                    help="parallel workers for read_slices_vchunkx (sino prefetch)")
+    add_layout_args(p)
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
-                   help="super-chunk for rec.h5 (default: 8·NZCHUNK, N, N)")
+                   help="super-chunk for rec.h5; default comes from "
+                        "iohdf5.layout (--mem-budget / --chunk-bytes)")
     return p.parse_args()
 
 
@@ -74,13 +77,21 @@ IN_NZ = IN_N = 3072            # init.h5 dims after step00; UPS scales from here
 NZ    = IN_NZ * UPS
 N     = IN_N  * UPS
 FILTER     = _A.filter
-NZCHUNK     = _A.nzchunk
 CHUNK_N     = _A.chunk_n
 CHUNK_THETA = _A.chunk_theta
 CHUNK_XY    = _A.chunk_xy
-NBANKS      = _A.nbanks
 NTASKS      = _A.ntasks
-VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8 * NZCHUNK, N, N)
+
+# Layout from the shared byte-budget policy -- same plan step8_fbp uses,
+# so the host-chunked twin writes an identically-laid-out rec.h5.
+_PLAN       = resolve_step("rec", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
+                           nbanks=_A.nbanks, mem_budget_gb=_A.mem_budget,
+                           chunk_mb=_A.chunk_bytes, nzchunk=_A.nzchunk,
+                           vchunks=_A.vchunks, nranks=SIZE)
+NBANKS      = _PLAN.nbanks
+VCHUNKS     = _PLAN.vchunks
+H5CHUNKS    = _PLAN.chunks
+NZCHUNK     = _PLAN.align
 
 
 def _validate_chunks(NTHETA: int) -> None:
@@ -144,11 +155,12 @@ def main() -> None:
     if RANK == 0:
         describe_input(SRC_H5)
         describe_output(DST_H5, (NZ, N, N), np.float32,
-                        VCHUNKS, "proj", NBANKS)
+                        VCHUNKS, "proj", NBANKS, chunks=H5CHUNKS,
+                        companion_bytes=NTHETA * VCHUNKS[0] * N * 4)
 
     ctx = initx_and_bcast(DST_H5, shape=(NZ, N, N),
                           dtype=np.float32, vchunks=VCHUNKS,
-                          stype="proj", nbanks=NBANKS,
+                          stype="proj", nbanks=NBANKS, chunks=H5CHUNKS,
                           rank=RANK, comm=COMM)
     if RANK == 0:
         with h5py.File(DST_H5, "r+") as f:

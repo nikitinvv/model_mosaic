@@ -39,6 +39,7 @@ from iohdf5.h5_vchunks import (
     describe_input, describe_output,
     vchunk_bytes,
 )
+from iohdf5.layout import add_layout_args, resolve_step
 from mpi_utils import COMM, RANK, SIZE, barrier, rprint, report_stage
 
 
@@ -63,8 +64,11 @@ def _parse_args() -> argparse.Namespace:
                    help="bank files per super-chunk (parallel POSIX writers)")
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
-                   help="super-chunk shape for big{UPS}x.h5 (default: "
-                        "8·UPS, OUT_NYX, OUT_NYX; RAM buffer = C0·C1·C2·4 bytes)")
+                   help="super-chunk shape for big{UPS}x.h5 — overrides the "
+                        "budget-derived default from iohdf5.layout.  C0 a "
+                        "multiple of UPS avoids re-reading input planes at "
+                        "the vchunk seams, but is not required")
+    add_layout_args(p)
     return p.parse_args()
 
 
@@ -106,8 +110,17 @@ if IN_NZ != _nz_disk or IN_NYX != _ny_disk:
 OUT_NZ  = IN_NZ  * UPS
 OUT_NYX = IN_NYX * UPS
 N_READ  = _A.n_read
-NBANKS  = _A.nbanks
-VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8 * UPS, OUT_NYX, OUT_NYX)
+
+# Layout comes from the shared byte-budget policy rather than a literal:
+# (8·UPS, OUT_NYX, OUT_NYX) is 27 GB at UPS=1 but 1.2 TB at UPS=8, and the
+# default (1, ny, nx) chunk crosses HDF5's 4 GiB limit at UPS=16.
+_PLAN   = resolve_step("big", ups=UPS, in_nz=IN_NZ, in_nyx=IN_NYX,
+                       nbanks=_A.nbanks, mem_budget_gb=_A.mem_budget,
+                       chunk_mb=_A.chunk_bytes, vchunks=_A.vchunks,
+                       nranks=SIZE)
+NBANKS   = _PLAN.nbanks
+VCHUNKS  = _PLAN.vchunks
+H5CHUNKS = _PLAN.chunks
 
 
 # --------------------- GPU backend ---------------------------------------
@@ -140,19 +153,36 @@ def _blend_and_pull(up_curr_d, up_next_d, r: int) -> np.ndarray:
 
 # --------------------- main -----------------------------------------------
 def main() -> None:
-    if VCHUNKS[0] % UPS != 0:
-        raise SystemExit(
-            f"--vchunks C0={VCHUNKS[0]} must be a multiple of "
-            f"UPS={UPS} so vchunk boundaries align with input planes.")
+    # C0 not a multiple of UPS is legal, just not free.  The z-blend below
+    # is indexed by ABSOLUTE output z (z0_in = z0_out // UPS, and the
+    # `z0_out <= out_z < z1_out` guard drops the rest), so a vchunk edge
+    # falling inside an input interval gives a bit-identical result — it
+    # only makes this vchunk re-read and re-upsample the input plane pair
+    # it straddles.  Each vchunk costs ~2 input reads + 2 xy-zooms no
+    # matter how thin it is, so the overhead is the vchunk count ratio.
+    #
+    # It is worth allowing because the alternative is not running: one
+    # output plane is 9.7 GB at UPS=16 and 38.7 GB at UPS=32, so forcing
+    # C0 to a multiple of UPS forces a 144 GB / 1.1 TB buffer where 8
+    # resp. 2 planes fit a 96 GiB budget.  iohdf5.layout therefore treats
+    # UPS as a preference and only drops below it when the budget bites.
+    if RANK == 0 and VCHUNKS[0] % UPS != 0:
+        redundancy = UPS / VCHUNKS[0] if VCHUNKS[0] < UPS else 1.0
+        rprint(f"NOTE: vchunk C0={VCHUNKS[0]} is not a multiple of UPS={UPS} "
+               f"(the budget would not fit {UPS} output planes).  Output is "
+               f"unchanged; input planes at the seams are read and upsampled "
+               f"~{redundancy:.0f}× more often.")
 
     if RANK == 0:
         describe_input(SRC_H5)
         describe_output(DST_H5, (OUT_NZ, OUT_NYX, OUT_NYX), np.float32,
-                        VCHUNKS, "proj", NBANKS)
+                        VCHUNKS, "proj", NBANKS, chunks=H5CHUNKS,
+                        read_granule=_PLAN.read_granule,
+                        companion_bytes=N_READ * IN_NYX * IN_NYX * 4)
 
     ctx = initx_and_bcast(DST_H5, shape=(OUT_NZ, OUT_NYX, OUT_NYX),
                           dtype=np.float32, vchunks=VCHUNKS,
-                          stype="proj", nbanks=NBANKS,
+                          stype="proj", nbanks=NBANKS, chunks=H5CHUNKS,
                           rank=RANK, comm=COMM)
 
     buf_gb = vchunk_bytes(VCHUNKS, np.float32) / 1e9

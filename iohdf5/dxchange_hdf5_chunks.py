@@ -83,6 +83,83 @@ def _shutdown_pools():
 # B-tree / addr-overflow corruption bugs on Lustre).
 _INFO_CACHE = {}
 
+# Per-worker cache of open read handles on VDS masters.
+#
+# Reopening the master per task is never just one open(): HDF5 then
+# reopens every bank file the selection touches, and holds them only for
+# as long as the dataset stays open.  A stage-4 FBP read at nbanks=4 /
+# ntasks=4 spans 36 bank files, so `with h5py.File(...)` per task costs
+# ~150 Lustre opens per read.  Once the chunk shape stopped being the
+# bottleneck that open storm was what remained: rank 0's steady-state
+# read sat at ~0.45 s for 452 MB (~1 GB/s) while the same ranks read
+# 12-54 GB/s in every other stage.
+#
+# Pool workers are persistent (see _get_pool), so hold the handles open
+# across tasks instead.  Keyed on the master's identity so a recreated
+# file is not served from a stale handle; see _drop_read_handle for the
+# case the stat check cannot catch.
+_RD_HANDLES = {}
+
+
+# Chunk cache for the read handles.  h5py's default is 1 MB / 521 slots,
+# so with the byte-budget chunk policy (~48 MB/chunk) every single chunk
+# is larger than the whole cache and HDF5 bypasses it -- a partial-chunk
+# read that touches the same chunk twice pays for it twice.  Size the
+# cache from the actual chunk shape instead, with 521 -> a larger prime
+# (HDF5 hashes chunk index % nslots, so a prime well above the number of
+# chunks in flight keeps collisions rare).
+_RDCC_MIN_BYTES = 128 * 1024 * 1024
+_RDCC_NSLOTS = 8191
+
+
+def _rdcc_for(filename):
+    """(rdcc_nbytes, rdcc_nslots) sized to hold a few chunks of this file.
+
+    Reads the chunk shape off the master's attrs via tomo_info, which is
+    cached and never opens a bank file."""
+    try:
+        info = tomo_info(filename)
+        chunk_bytes = int(np.prod(info['chunks'])) * info['dtype'].itemsize
+    except Exception:
+        chunk_bytes = 0
+    return max(4 * chunk_bytes, _RDCC_MIN_BYTES), _RDCC_NSLOTS
+
+
+def _read_dset(filename):
+    """Cached '/exchange/data' handle for a read-only worker."""
+    st = os.stat(filename)
+    key = (st.st_ino, st.st_mtime_ns, st.st_size)
+    hit = _RD_HANDLES.get(filename)
+    if hit is not None:
+        if hit[0] == key:
+            return hit[2]
+        _drop_read_handle(filename)
+    rdcc_nbytes, rdcc_nslots = _rdcc_for(filename)
+    hf = h5py.File(filename, 'r', rdcc_nbytes=rdcc_nbytes,
+                   rdcc_nslots=rdcc_nslots)
+    _RD_HANDLES[filename] = (key, hf, hf['/exchange/data'])
+    return _RD_HANDLES[filename][2]
+
+
+def _drop_read_handle(filename=None):
+    """Close cached read handles (all of them when filename is None).
+
+    The write workers call this on the master before touching a bank
+    file underneath it: writes go to the banks, so the master's mtime
+    and size do not move and the stat check in _read_dset cannot see
+    that the data changed.  Invalidating just that master keeps the
+    other files' handles warm, which matters because the write pool and
+    the read pool are the same processes whenever nbanks == ntasks.
+    """
+    names = list(_RD_HANDLES) if filename is None else [filename]
+    for fn in names:
+        entry = _RD_HANDLES.pop(fn, None)
+        if entry is not None:
+            try:
+                entry[1].close()
+            except Exception:
+                pass
+
 
 def _norm_stype(stype):
     """Normalise the stype attr (str / bytes / numpy.str_) to 'proj'|'slice'."""
@@ -168,7 +245,7 @@ def tomo_readx(filename, ntasks=1, shm=None, ivchunk=(0,0,0), vchunks=None):
         raise Exception("Storage type is neither projection or slice.")
     try:
         pool = _get_pool(ntasks)
-        results = pool.map(partial(_process, ntasks=ntasks, filename=filename, direct_chunk=~info['is_virtual'],
+        results = pool.map(partial(_process, ntasks=ntasks, filename=filename,
                                   vchunks=vchunks, ivchunk=ivchunk, shm=shm), list(np.arange(ntasks)))
         if shm_selfmanaged:
             data_out = data.copy()
@@ -286,6 +363,19 @@ def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
         raise ValueError(f"chunks must be 3 positive ints, got {want_chunks}")
     nominal_chunks = tuple(min(c, s) for c, s in zip(want_chunks, nominal_bank))
 
+    # HDF5 stores a chunk's size in a uint32, so a chunk must stay under
+    # 4 GiB.  The default (1, ny, nx) crosses that at N >= 32768 (UPS 16),
+    # and HDF5's own error is a bare "unable to create dataset" from deep
+    # inside H5Dcreate.  See iohdf5.layout.plan_chunks for shapes that
+    # hold the chunk near a byte target instead of growing with N.
+    _cb = int(np.prod(nominal_chunks)) * np.dtype(dtype).itemsize
+    if _cb >= 2**32:
+        raise ValueError(
+            f"chunk {nominal_chunks} of {np.dtype(dtype)} is "
+            f"{_cb / 2**30:.2f} GiB, over HDF5's 4 GiB per-chunk limit "
+            f"(bank shape {nominal_bank}).  Bound the middle dimension, "
+            f"e.g. iohdf5.layout.plan_chunks(...).")
+
     for _ivchunk in range(nchunks):
         for ibank in range(nbanks):
             bank_idx = _ivchunk * nbanks + ibank
@@ -310,7 +400,12 @@ def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
                     bank_shape = (nproj, sitems_end - sitems_start, nx)
                 bank_chunks = tuple(min(c, s)
                                     for c, s in zip(want_chunks, bank_shape))
-                with h5py.File(filename_data_file, 'w') as hf_out:
+                # libver='latest' (the master already uses it): with fixed
+                # dims and no filters HDF5 then indexes chunks with a
+                # fixed array instead of a v1 B-tree -- O(1) address lookup
+                # and no interior nodes to read.  Matters now that a bank
+                # holds hundreds of chunks rather than one.
+                with h5py.File(filename_data_file, 'w', libver='latest') as hf_out:
                     g = hf_out.create_group('/exchange')
                     g.create_dataset('data', shape=bank_shape,
                                      chunks=bank_chunks,
@@ -376,7 +471,7 @@ def tomo_writex(filename, data, shm=None, ivchunk=(0,0,0), ctx=None):
             shm.close()
             shm.unlink()
 
-def _process_read_projs(itask, ntasks, filename, shm, vchunks, ivchunk, direct_chunk=False):
+def _process_read_projs(itask, ntasks, filename, shm, vchunks, ivchunk):
     info = tomo_info(filename)
     nproj, ny, nx, dtp = info['nproj'], info['ny'], info['nx'], info['dtype']
     assert _norm_stype(info['stype']) == 'proj'
@@ -398,17 +493,14 @@ def _process_read_projs(itask, ntasks, filename, shm, vchunks, ivchunk, direct_c
     
     if projs_end > projs_start:
         out = np.ndarray(shape=vchunks, dtype=dtp, buffer=shm.buf)
-        with h5py.File(filename, 'r') as hf_in:
-            dset = hf_in['/exchange/data']
-            if direct_chunk:
-                dset.read_direct(out, source_sel=np.s_[projs_start:projs_end,y_start:y_end,x_start:x_end],
-                                 dest_sel=np.s_[projs_start-projs_offset:projs_end-projs_offset,:y_end-y_start,:x_end-x_start])
-            else:
-                out[projs_start-projs_offset:projs_end-projs_offset,:y_end-y_start,:x_end-x_start] = ...
-                dset[projs_start:projs_end,y_start:y_end,x_start:x_end]
+        dset = _read_dset(filename)
+        # read_direct fills the shm buffer in place -- no temporary, which
+        # matters when a vchunk is tens of GB.
+        dset.read_direct(out, source_sel=np.s_[projs_start:projs_end,y_start:y_end,x_start:x_end],
+                         dest_sel=np.s_[projs_start-projs_offset:projs_end-projs_offset,:y_end-y_start,:x_end-x_start])
     return itask
 
-def _process_read_slices(itask, ntasks, filename, shm, vchunks, ivchunk, direct_chunk=False):
+def _process_read_slices(itask, ntasks, filename, shm, vchunks, ivchunk):
     info = tomo_info(filename)
     nproj, ny, nx, dtp = info['nproj'], info['ny'], info['nx'], info['dtype']
     assert _norm_stype(info['stype']) == 'slice'
@@ -430,14 +522,9 @@ def _process_read_slices(itask, ntasks, filename, shm, vchunks, ivchunk, direct_
     
     out = np.ndarray(shape=vchunks, dtype=dtp, buffer=shm.buf)
     if slices_end > slices_start:
-        with h5py.File(filename, 'r') as hf_in:
-            dset = hf_in['/exchange/data']
-            if direct_chunk:
-                dset.read_direct(out, source_sel=np.s_[projs_start:projs_end,slices_start:slices_end,x_start:x_end],
-                                 dest_sel=np.s_[:projs_end-projs_start,slices_start-slices_offset:slices_end-slices_offset,:x_end-x_start])
-            else:
-                out[:projs_end-projs_start,slices_start-slices_offset:slices_end-slices_offset,:x_end-x_start] = ...
-                dset[projs_start:projs_end,slices_start:slices_end,x_start:x_end]
+        dset = _read_dset(filename)
+        dset.read_direct(out, source_sel=np.s_[projs_start:projs_end,slices_start:slices_end,x_start:x_end],
+                         dest_sel=np.s_[:projs_end-projs_start,slices_start-slices_offset:slices_end-slices_offset,:x_end-x_start])
     return itask
 
 def _process_write_slices(itask, ntasks, filename, shape, dtype, shm, vchunks, ivchunk, ctx):
@@ -463,6 +550,10 @@ def _process_write_slices(itask, ntasks, filename, shape, dtype, shm, vchunks, i
     
     try:
         if slices_end > slices_start:
+            # A cached read handle on the master would not see this write:
+            # the bytes land in a bank file, so the master's mtime/size
+            # never move.  Drop it before writing.
+            _drop_read_handle(filename)
             filename_path = ctx['banks_filename_path'][ivchunk[1]*ntasks+itask]
             with h5py.File(filename_path, 'r+') as hf_out:
                 dset = hf_out['/exchange/data']
@@ -494,6 +585,9 @@ def _process_write_projs(itask, ntasks, filename, shape, dtype, shm, vchunks, iv
     data = np.ndarray(shape=vchunks, dtype=dtype, buffer=shm.buf)
     try:
         if projs_end > projs_start:
+            # See _process_write_slices: the master's stat does not move
+            # when a bank underneath it is written.
+            _drop_read_handle(filename)
             filename_path = ctx['banks_filename_path'][ivchunk[0]*ntasks+itask]
             with h5py.File(filename_path, 'r+') as hf_out:
                 dset = hf_out['/exchange/data']
@@ -529,17 +623,19 @@ def _process_read_box(task_meta, filename, vchunksx, dtype, shm):
     latter makes HDF5 materialise the whole shard as a fresh array before
     numpy copies it into shm, which on a full-size shard is a spare
     multi-hundred-MB allocation per worker per call.
+
+    The handle comes from _read_dset, which keeps the master (and the
+    bank files HDF5 opens under it) open across tasks.
     """
     out = np.ndarray(shape=vchunksx, dtype=dtype, buffer=shm.buf)
     (t0, t1), (z0, z1), (x0, x1) = task_meta['src']
     dt, dz, dx = task_meta['dst']
-    with h5py.File(filename, 'r') as hf_in:
-        hf_in['/exchange/data'].read_direct(
-            out,
-            source_sel=np.s_[t0:t1, z0:z1, x0:x1],
-            dest_sel=np.s_[dt:dt + (t1 - t0),
-                           dz:dz + (z1 - z0),
-                           dx:dx + (x1 - x0)])
+    _read_dset(filename).read_direct(
+        out,
+        source_sel=np.s_[t0:t1, z0:z1, x0:x1],
+        dest_sel=np.s_[dt:dt + (t1 - t0),
+                       dz:dz + (z1 - z0),
+                       dx:dx + (x1 - x0)])
     return task_meta['itask']
 
 

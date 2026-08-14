@@ -165,10 +165,21 @@ def describe_input(path: str) -> None:
 
 
 def describe_output(path: str, shape, dtype, vchunks, stype: str,
-                    nbanks: int, chunks=None) -> None:
+                    nbanks: int, chunks=None, read_granule=None,
+                    companion_bytes: int = 0) -> None:
     """Print planned shape / vchunks / bank layout / HDF5 chunk for an
     output file about to be created via initx_and_bcast.  Call from
-    rank 0 only.  Pure math — does not touch the filesystem."""
+    rank 0 only.  Pure math — does not touch the filesystem.
+
+    `read_granule` is the (t, z, x) slab the *next* step will read back.
+    Given it, this also prints how many HDF5 ops that read costs per bank
+    file and how big each one is — the number the Polaris sweep is
+    actually comparing, so the log carries it next to the timing instead
+    of leaving it to be reconstructed from the chunk shape afterwards.
+
+    `companion_bytes` is the step's other large buffer (the prefetched
+    input slab).  Reporting only the vchunk buffer is what let step8 look
+    like it needed 9.7 GB when it really needed 11.5."""
     dtp = np.dtype(dtype)
     sitems_idx = 0 if stype.lower().startswith("proj") else 1
     sitems_per_bank = (vchunks[sitems_idx] + nbanks - 1) // nbanks
@@ -196,6 +207,61 @@ def describe_output(path: str, shape, dtype, vchunks, stype: str,
     print(f"       → {nsvchunks} super-chunks × {nbanks} banks = "
           f"{total_banks} bank files", flush=True)
     sino_ordered = h5chunk[0] > 1 and h5chunk[1] < bank_shape[1]
+    nchunks_bank = int(np.prod([-(-b // c)
+                                for b, c in zip(bank_shape, h5chunk)]))
     print(f"       bank shape={bank_shape} ({_hb(bank_bytes)})  "
           f"HDF5 chunk={h5chunk} ({_hb(chunk_bytes)})"
+          f"  × {nchunks_bank}/bank"
           f"{'  [sinogram-ordered]' if sino_ordered else ''}", flush=True)
+
+    buf = int(np.prod(vchunks)) * dtp.itemsize
+    print(f"       per-rank buffers: vchunk={_hb(buf)}"
+          + (f" + companion={_hb(companion_bytes)}"
+             f" = {_hb(buf + companion_bytes)}" if companion_bytes else ""),
+          flush=True)
+
+    if read_granule is not None:
+        nops, per_op = _read_cost(bank_shape, h5chunk, read_granule,
+                                  dtp.itemsize)
+        print(f"       next-step read {tuple(read_granule)} → "
+              f"{nops} op(s)/bank × {_hb(per_op)}", flush=True)
+
+
+def _read_cost(bank_shape, chunk, granule, itemsize):
+    """(ops per bank file, bytes per op) for reading `granule` out of one
+    bank file laid out with `chunk`.
+
+    Inside a chunk the layout is plain C-order, so a sub-box is one
+    contiguous run iff every axis inside some axis k is taken in full.
+    Let k be the outermost axis whose successors are all full; the read
+    then costs prod(extent_i) for i < k separate runs per chunk, times the
+    number of chunks the granule spans.
+
+    So (1, 512, N) chunks read as (1, 8, N) cost ONE op — axis 0 has
+    extent 1, so the 8 z-rows are a contiguous interior run — while
+    (48, 64, N) chunks read as (48, 8, N) cost 48.  That asymmetry is why
+    the chunk policy clamps z to the consumer granule only when the θ
+    extent is greater than 1.
+    """
+    gran = [min(int(g), int(b)) for g, b in zip(granule, bank_shape)]
+    inner = [min(g, int(c)) for g, c in zip(gran, chunk)]   # per-chunk box
+
+    # k = smallest axis such that every axis AFTER it is taken in full.
+    k = 2
+    if inner[2] == int(chunk[2]):
+        k = 1
+        if inner[1] == int(chunk[1]):
+            k = 0
+    runs_per_chunk = 1
+    for ax in range(k):
+        runs_per_chunk *= inner[ax]
+
+    nchunks = 1
+    for ax in (0, 1, 2):
+        nchunks *= -(-gran[ax] // int(chunk[ax]))
+
+    ops = max(1, nchunks * runs_per_chunk)
+    total = itemsize
+    for g in gran:
+        total *= g
+    return ops, max(1, total // ops)

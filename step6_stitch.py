@@ -47,6 +47,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_output,
 )
+from iohdf5.layout import add_layout_args, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, report_stage
 
 from step4_extract import read_placements
@@ -66,8 +67,10 @@ def _parse_args() -> argparse.Namespace:
                         "writes {path}/model_big{UPS}x/stitched.h5")
     p.add_argument("--nbanks", type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
-    p.add_argument("--nthetachunk", type=int, default=64,
-                   help="θ per super-chunk (=vchunk C0); should divide N_HALF")
+    p.add_argument("--nthetachunk", type=int, default=0,
+                   help="θ per super-chunk (=vchunk C0); 0 = take it from "
+                        "iohdf5.layout (--mem-budget / --chunk-bytes)")
+    add_layout_args(p)
     return p.parse_args()
 
 
@@ -126,12 +129,24 @@ def main() -> None:
             f"tile ntheta ({tile_ntheta}) != positions NTHETA ({NTHETA})")
     theta_out = theta_deg[:N_HALF]
 
-    if N_HALF % args.nthetachunk != 0:
-        rprint(f"WARN: N_HALF={N_HALF} not divisible by --nthetachunk="
-               f"{args.nthetachunk}; the final vchunk will be short and the "
+    # Layout from the shared byte-budget policy.  A flat 64 θ is 24 GB at
+    # UPS=1 but 1.5 TB at UPS=8, and the default (1, NZ, N) chunk is past
+    # HDF5's 4 GiB limit from UPS=16 on.  The planned C0 always divides
+    # N_HALF, so the mirror read range can never wrap past NTHETA.
+    _plan = resolve_step("stitched", ups=args.ups,
+                         in_nz=NZ // args.ups, in_nyx=N // args.ups,
+                         ntheta=NTHETA, nbanks=args.nbanks,
+                         mem_budget_gb=args.mem_budget,
+                         chunk_mb=args.chunk_bytes, nranks=SIZE,
+                         vchunks=((args.nthetachunk, NZ, N)
+                                  if args.nthetachunk else None))
+    VCHUNKS  = _plan.vchunks
+    NBANKS   = _plan.nbanks
+    H5CHUNKS = _plan.chunks
+    if N_HALF % VCHUNKS[0] != 0:
+        rprint(f"WARN: N_HALF={N_HALF} not divisible by vchunk C0="
+               f"{VCHUNKS[0]}; the final vchunk will be short and the "
                f"mirror read range may wrap around NTHETA.")
-    VCHUNKS = (args.nthetachunk, NZ, N)
-    NBANKS       = args.nbanks
 
     if RANK == 0:
         os.makedirs(dst_dir, exist_ok=True)
@@ -142,11 +157,12 @@ def main() -> None:
            f"OVERLAP={OVERLAP}  ranks={SIZE}")
     if RANK == 0:
         describe_output(dst_h5, (N_HALF, NZ, N), np.float32,
-                        VCHUNKS, "proj", NBANKS)
+                        VCHUNKS, "proj", NBANKS, chunks=H5CHUNKS,
+                        read_granule=_plan.read_granule)
 
     ctx = initx_and_bcast(dst_h5, shape=(N_HALF, NZ, N),
                           dtype=np.float32, vchunks=VCHUNKS,
-                          stype="proj", nbanks=NBANKS,
+                          stype="proj", nbanks=NBANKS, chunks=H5CHUNKS,
                           rank=RANK, comm=COMM)
     if RANK == 0:
         with h5py.File(dst_h5, "r+") as f:
