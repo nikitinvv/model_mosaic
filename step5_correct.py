@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Per-tile preprocessing: dezinger + dark-flat field correction + FW ring removal.
+"""Per-tile preprocessing: dezinger + dark-flat field correction (+ optional FW ring removal).
 
 Reads the per-tile HDF5 files produced by step4_extract.py at
     {path}/mosaic_h5/{zi}_{xi}.h5
@@ -16,9 +16,13 @@ For every tile:
      it's numerically a no-op, but the code path is exercised so real
      acquisitions drop in unchanged.
   3. FW ring removal — processing.remove_stripe.remove_stripe_fw (vendored
-     wavelet-FFT method from tomocupy.processing.remove_stripe).  Needs the
-     FULL θ axis at once, so tiles are streamed through the GPU row-chunk
-     at a time (--nzchunk rows per pass).
+     wavelet-FFT method from tomocupy.processing.remove_stripe).  OFF by
+     default (--fw-sigma 0): the simulated tiles have no ring artefacts to
+     remove, and on a real acquisition the filter wants tuning against the
+     actual rings rather than the vendored sym16/level-7 defaults.  Pass
+     --fw-sigma 2 to switch it back on.  It needs the FULL θ axis at once,
+     so tiles are streamed through the GPU a row-chunk at a time
+     (--nzchunk rows per pass) whether or not it runs.
 
 Output tile schema matches step4_extract.py byte-for-byte:
     /exchange/data        (NTHETA_TILE, h, w) float32   chunks=(1, h, w)
@@ -45,8 +49,8 @@ import numpy as np
 import cupy as cp
 from cupyx.scipy.ndimage import median_filter
 
-from mpi_utils import RANK, SIZE, barrier as _barrier, rprint, report_stage
-from processing.remove_stripe import remove_stripe_fw
+from iohdf5.h5_vchunks import rm_src, add_rm_src_arg
+from mpi_utils import COMM, RANK, SIZE, barrier as _barrier, rprint, report_stage
 from step4_extract import read_placements
 
 
@@ -67,8 +71,10 @@ def _parse_args() -> argparse.Namespace:
                         "— simulated tiles have no zingers)")
     p.add_argument("--dezinger-threshold", type=float, default=1000.0,
                    help="pixels with (data - median) > threshold get replaced")
-    p.add_argument("--fw-sigma",  type=float, default=2.0,
-                   help="FW ring removal sigma (per-band Gaussian damping)")
+    p.add_argument("--fw-sigma",  type=float, default=0.0,
+                   help="FW ring removal sigma (per-band Gaussian damping); "
+                        "0 disables (default 0 — simulated tiles have no "
+                        "rings; the filter also needs pywt)")
     p.add_argument("--fw-wname",  type=str,   default="sym16",
                    help="FW wavelet name (pywt Wavelet id)")
     p.add_argument("--fw-level",  type=int,   default=7,
@@ -76,6 +82,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--nzchunk",   type=int,   default=8,
                    help="rows per GPU pass (FW requires full θ, so we only "
                         "chunk over nz)")
+    add_rm_src_arg(p, "the input mosaic_h5/ tile directory")
     return p.parse_args()
 
 
@@ -107,7 +114,10 @@ def main() -> None:
 
     from mpi_utils import banner
     banner("5", "mosaic_h5/*.h5 -> mosaic_h5_pre/*.h5  "
-                "(dezinger + dark-flat + FW ring removal)")
+                "(dezinger + dark-flat + FW ring removal)"
+                if args.fw_sigma > 0 else
+                "mosaic_h5/*.h5 -> mosaic_h5_pre/*.h5  "
+                "(dezinger + dark-flat; FW ring removal OFF)")
 
     src_dir = f"{args.path}/mosaic_h5"
     dst_dir = f"{args.path}/mosaic_h5_pre"
@@ -143,8 +153,11 @@ def main() -> None:
         print(f"  OUT: {dst_dir}/{{z}}_{{x}}.h5   ({n_z*n_x} tiles)")
         print(f"       NTHETA={NTHETA_TILE}   nzchunk={args.nzchunk}   "
               f"dezinger={args.dezinger} (thr={args.dezinger_threshold})")
-        print(f"       fw: sigma={args.fw_sigma} wname={args.fw_wname} "
-              f"level={args.fw_level}", flush=True)
+        if args.fw_sigma > 0:
+            print(f"       fw: sigma={args.fw_sigma} wname={args.fw_wname} "
+                  f"level={args.fw_level}", flush=True)
+        else:
+            print("       fw: OFF (--fw-sigma 0)", flush=True)
 
     # Round-robin tile sharding (same pattern as step4_extract).
     my_placements = placements[RANK::SIZE]
@@ -210,8 +223,12 @@ def main() -> None:
                     _dezinger(flat_d, args.dezinger, args.dezinger_threshold)
 
                 corr_d = _darkflat(slab_d, dark_d, flat_d)
-                corr_d = remove_stripe_fw(corr_d, args.fw_sigma,
-                                          args.fw_wname, args.fw_level)
+                if args.fw_sigma > 0:
+                    # Imported here, not at module scope: it is the only
+                    # thing in this step that needs pywt.
+                    from processing.remove_stripe import remove_stripe_fw
+                    corr_d = remove_stripe_fw(corr_d, args.fw_sigma,
+                                              args.fw_wname, args.fw_level)
 
                 out_h = cp.asnumpy(corr_d)
                 del slab_d, corr_d
@@ -234,9 +251,13 @@ def main() -> None:
 
     _barrier()
     report_stage("step5 read (tiles)",  b_read,  t_read)
-    report_stage("step5 comp (dezinger+darkflat+fw)", b_read + b_write, t_comp)
+    report_stage("step5 comp (dezinger+darkflat"
+                 + ("+fw)" if args.fw_sigma > 0 else ")"), b_read + b_write, t_comp)
     report_stage("step5 write (tiles)", b_write, t_write)
     rprint(f"done. wrote {n_z*n_x} corrected h5 files to {dst_dir}.")
+
+    rm_src(src_dir, enabled=args.rm_src,
+           rank=RANK, comm=COMM)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,9 @@ never lives entirely on the GPU: TomoLargeReal.RT streams the four
 reversed passes through the device one strip at a time.  Use this at
 UPS ≥ 4 where the GPU-only TomoReal.RT no longer fits.
 
-Reads {path}/model_big{UPS}x/paganin.h5 and writes
+Reads {path}/model_big{UPS}x/sino.h5 (step7b's z-banked transpose; see
+step8_fbp.py for why, and for the `--src paganin` A/B escape hatch) and
+writes
 {path}/model_big{UPS}x/rec.h5.  Same shape and theta grid as
 step8_fbp.py.
 
@@ -28,10 +30,11 @@ from processing.tomo_large import TomoLargeReal
 from processing.fbp_filter import FBPFilter
 from iohdf5.dxchange_hdf5_chunks import tomo_writex, read_slices_vchunkx
 from iohdf5.h5_vchunks import (
-    initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
+    initx_and_bcast, open_out, close_out, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
+    read_src_header, rm_src, add_rm_src_arg,
 )
-from iohdf5.layout import add_layout_args, resolve_step
+from iohdf5.layout import add_layout_args, add_geometry_args, input_dims, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
@@ -41,10 +44,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ups",  type=int, default=8,
                    help="matches step6 --ups (drives paths)")
     p.add_argument("--path", default="/data2/brain_sym_mosaic")
+    p.add_argument("--src", default="sino", choices=("sino", "paganin"),
+                   help="input store: 'sino' = step7b's z-banked transpose "
+                        "(default, sequential read); 'paganin' = step7 "
+                        "output directly (transposed read, for A/B timing). "
+                        "'sino' falls back to paganin.h5 when absent.")
     p.add_argument("--filter", default="ramp",
                    choices=("none", "ramp", "shepp", "cosine", "cosine2",
                             "hamming", "hann", "parzen"),
                    help="FBP filter (default: ramp)")
+    p.add_argument("--center-shift", type=float, default=0.0,
+                   help="move the sinogram by this many pixels (+ = towards "
+                        "higher columns) in the filter, as a phase ramp "
+                        "(tomocupy's centre shift).  TomoLargeReal takes the "
+                        "axis at column N/2 + 0.5; step56 folds it onto N/2, "
+                        "so real data wants +0.5.  Simulated data made with "
+                        "TomoLargeReal.R needs 0")
     p.add_argument("--nzchunk", type=int, default=1,
                    help="z-slices per TomoLargeReal.RT call.  Default 1 at "
                         "high UPS since the host fde scales with nz.")
@@ -58,10 +73,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ntasks",      type=int, default=8,
                    help="parallel workers for read_slices_vchunkx (sino prefetch)")
     add_layout_args(p)
+    add_geometry_args(p)
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk for rec.h5; default comes from "
                         "iohdf5.layout (--mem-budget / --chunk-bytes)")
+    add_rm_src_arg(p, "the input sino.h5 (or paganin.h5)")
     return p.parse_args()
 
 
@@ -70,10 +87,13 @@ _A = _parse_args()
 UPS      = _A.ups
 BASE_DIR = _A.path
 DST_DIR  = f"{BASE_DIR}/model_big{UPS}x"
-SRC_H5   = f"{DST_DIR}/paganin.h5"
+SINO_H5  = f"{DST_DIR}/sino.h5"
+PGN_H5   = f"{DST_DIR}/paganin.h5"
+SRC_H5   = (SINO_H5 if (_A.src == "sino" and os.path.isfile(SINO_H5))
+            else PGN_H5)
 DST_H5   = f"{DST_DIR}/rec.h5"
 
-IN_NZ = IN_N = 3072            # init.h5 dims after step00; UPS scales from here
+IN_NZ, IN_N = input_dims(_A, UPS)   # 3072 (init.h5 after step00) unless --nz/--n
 NZ    = IN_NZ * UPS
 N     = IN_N  * UPS
 FILTER     = _A.filter
@@ -84,18 +104,34 @@ NTASKS      = _A.ntasks
 
 # Layout from the shared byte-budget policy -- same plan step8_fbp uses,
 # so the host-chunked twin writes an identically-laid-out rec.h5.
-_PLAN       = resolve_step("rec", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
-                           nbanks=_A.nbanks, mem_budget_gb=_A.mem_budget,
-                           chunk_mb=_A.chunk_bytes, nzchunk=_A.nzchunk,
-                           vchunks=_A.vchunks, nranks=SIZE)
-NBANKS      = _PLAN.nbanks
-VCHUNKS     = _PLAN.vchunks
-H5CHUNKS    = _PLAN.chunks
-NZCHUNK     = _PLAN.align
+# Resolved in main(): the policy needs the true angle count, which only
+# the source file knows (see step8_fbp._resolve_plan).
+_PLAN = NBANKS = VCHUNKS = H5CHUNKS = NZCHUNK = None
 
 
-def _validate_chunks(NTHETA: int) -> None:
+def _resolve_plan(ntheta):
+    global _PLAN, NBANKS, VCHUNKS, H5CHUNKS, NZCHUNK
+    _PLAN       = resolve_step("rec", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
+                               ntheta=2 * ntheta,
+                               nbanks=_A.nbanks, mem_budget_gb=_A.mem_budget,
+                               chunk_mb=_A.chunk_bytes, nzchunk=_A.nzchunk,
+                               vchunks=_A.vchunks, nranks=SIZE)
+    NBANKS      = _PLAN.nbanks
+    VCHUNKS     = _PLAN.vchunks
+    H5CHUNKS    = _PLAN.chunks
+    NZCHUNK     = _PLAN.align
+    return resolve_step("sino", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
+                        ntheta=2 * ntheta,
+                        nbanks=_A.nbanks, mem_budget_gb=_A.mem_budget,
+                        chunk_mb=_A.chunk_bytes, nzchunk=_A.nzchunk,
+                        nranks=SIZE)
+
+
+def _validate_chunks(NTHETA: int, sino_plan) -> None:
     problems = []
+    if SRC_H5 == SINO_H5 and VCHUNKS[0] % sino_plan.vchunks[1] != 0:
+        problems.append(f"rec --vchunks C0={VCHUNKS[0]} must be a multiple "
+                        f"of sino.h5's z-bank {sino_plan.vchunks[1]}")
     if N % CHUNK_N:
         problems.append(f"--chunk-n={CHUNK_N} must divide N={N}")
     if NTHETA % CHUNK_THETA:
@@ -114,28 +150,21 @@ def _validate_chunks(NTHETA: int) -> None:
 
 def main() -> None:
     from mpi_utils import banner
-    banner("8", f"paganin.h5 -> rec.h5  (FBP, large/host-chunked, filter={FILTER})")
+    banner("8", f"{os.path.basename(SRC_H5)} -> rec.h5  "
+                f"(FBP, large/host-chunked, filter={FILTER})")
 
     if RANK == 0:
         os.makedirs(DST_DIR, exist_ok=True)
     barrier()
 
-    if RANK == 0:
-        with h5py.File(SRC_H5, "r") as f:
-            src_shape = tuple(f["exchange/data"].shape)
-            theta_deg = f["exchange/theta"][:]
-    else:
-        src_shape = None
-        theta_deg = None
-    src_shape = COMM.bcast(src_shape, root=0)
-    theta_deg = COMM.bcast(theta_deg, root=0)
+    src_shape, theta_deg = read_src_header(SRC_H5, rank=RANK, comm=COMM)
     NTHETA = src_shape[0]
     if src_shape[1:] != (NZ, N):
         raise SystemExit(
-            f"paganin.h5 shape {src_shape} incompatible with (NZ={NZ}, N={N})")
+            f"{SRC_H5} shape {src_shape} incompatible with (NZ={NZ}, N={N})")
     theta_rad = np.deg2rad(theta_deg).astype(np.float32)
 
-    _validate_chunks(NTHETA)
+    _validate_chunks(NTHETA, _resolve_plan(NTHETA))
 
     dev_id   = cp.cuda.runtime.getDevice()
     dev_name = cp.cuda.runtime.getDeviceProperties(dev_id)['name'].decode()
@@ -168,6 +197,7 @@ def main() -> None:
                 del f["exchange/theta"]
             f["exchange"].create_dataset("theta", data=theta_deg)
     barrier()
+    open_out(ctx)                 # single-file output: collective MPI-IO open
 
     buf_gb = vchunk_bytes(VCHUNKS, np.float32) / 1e9
     rprint(f"per-rank shm buffer={buf_gb:.2f} GB   "
@@ -175,6 +205,13 @@ def main() -> None:
 
     cl_filter = FBPFilter(N)
     w_gpu     = cl_filter.calc_filter(FILTER)
+    if _A.center_shift:
+        # x(j - s) <-> X(f) exp(-2 pi i f s), f in cycles per pixel of the
+        # 4N-padded line the filter works on
+        f_gpu = cp.fft.rfftfreq(cl_filter.ne).astype(cp.float32)
+        w_gpu = (w_gpu * cp.exp(-2j * cp.pi * f_gpu * np.float32(_A.center_shift))
+                 ).astype(cp.complex64)
+        rprint(f"centre shift {_A.center_shift:+g} px (filter phase ramp)")
     cl_tomo   = TomoLargeReal(N, theta_rad, CHUNK_XY)   # eager index precompute
 
     r_min, r_max = np.inf, -np.inf
@@ -193,6 +230,7 @@ def main() -> None:
     # replaces NZCHUNK-many per-inner plain-h5py reads.
     sino_shape = (NTHETA, VCHUNKS[0], N)
     shm_sino, sino_buf = alloc_shm(sino_shape, np.float32)
+    sino_c = np.empty((NTHETA, NZCHUNK, N), dtype=np.float32)
 
     try:
         for k, ivc in enumerate(my_ivchunks, start=1):
@@ -212,8 +250,12 @@ def main() -> None:
                 zc1 = min(zc0 + NZCHUNK, z1_vc)
                 b   = zc1 - zc0
 
-                # Slice from the pre-fetched RAM buffer — free.
-                sino_h = sino_buf[:, zc0 - z0_vc : zc1 - z0_vc, :]
+                # A z-range of the (NTHETA, C0, N) prefetch is a strided
+                # view whenever C0 > NZCHUNK; filter_host / RT need it
+                # C-contiguous, so copy into a reused buffer.
+                sino_h = sino_c[:, :b, :] if b == NZCHUNK else \
+                    np.empty((NTHETA, b, N), dtype=np.float32)
+                np.copyto(sino_h, sino_buf[:, zc0 - z0_vc : zc1 - z0_vc, :])
 
                 # Filter via filter_host — chunks the H2D → GPU-filter
                 # → D2H roundtrip by FBPFilter.batch_chunk (default 256
@@ -251,6 +293,7 @@ def main() -> None:
     finally:
         free_shm(shm)
         free_shm(shm_sino)
+    close_out(ctx)
 
     r_min     = allreduce(r_min,     MPI.MIN)
     r_max     = allreduce(r_max,     MPI.MAX)
@@ -259,12 +302,14 @@ def main() -> None:
     r_has_nan = allreduce(r_has_nan, MPI.LOR)
     barrier()
 
-    report_stage("step8 read (paganin)", b_read,  t_read)
+    report_stage(f"step8 read ({os.path.basename(SRC_H5)})", b_read, t_read)
     report_stage("step8 write (rec)",    b_write, t_write)
 
     rprint(f"rec stats: min={r_min:.4g} max={r_max:.4g} "
            f"mean={r_sum/max(r_cnt,1):.4g} nan={r_has_nan}")
     rprint(f"wrote {NZ} z-slices to {DST_H5}")
+
+    rm_src(SRC_H5, enabled=_A.rm_src, rank=RANK, comm=COMM)
 
 
 if __name__ == "__main__":

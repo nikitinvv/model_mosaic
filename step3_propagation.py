@@ -30,6 +30,7 @@ from iohdf5.dxchange_hdf5_chunks import tomo_writex, read_projs_vchunkx
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
+    rm_src, add_rm_src_arg,
 )
 from iohdf5.layout import add_layout_args, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
@@ -50,9 +51,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--phase-scale", type=float, default=1.0,
                    help=">1 amplifies the phase to make Fresnel fringes visible")
     p.add_argument("--energy",    type=float, default=30.0, help="keV")
-    p.add_argument("--voxelsize", type=float, default=1.38e-6,
+    p.add_argument("--voxelsize", type=float, default=0.72222e-6,
                    help="voxel = detector pixel, meters (parallel beam)")
-    p.add_argument("--distance",  type=float, default=0.2,
+    p.add_argument("--distance",  type=float, default=0.15,
                    help="sample → detector distance, meters")
     p.add_argument("--npropchunk", type=int, default=8,
                    help="angles per Fresnel batch")
@@ -65,6 +66,7 @@ def _parse_args() -> argparse.Namespace:
                    help="super-chunk for data.h5; default comes from "
                         "iohdf5.layout (--mem-budget / --chunk-bytes)")
     add_layout_args(p)
+    add_rm_src_arg(p, "the input proj.h5")
     return p.parse_args()
 
 
@@ -96,7 +98,7 @@ NTASKS      = _A.ntasks
 # accounted for.  NPROPCHUNK follows the plan's alignment: the Fresnel loop
 # can run in smaller batches rather than inflate the super-chunk.
 _PLAN   = resolve_step("data", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
-                       ntheta=NTHETA, nbanks=_A.nbanks,
+                       ntheta=2 * NTHETA,   # policy wants the 360 deg tile count nbanks=_A.nbanks,
                        mem_budget_gb=_A.mem_budget, chunk_mb=_A.chunk_bytes,
                        npropchunk=_A.npropchunk, vchunks=_A.vchunks,
                        nranks=SIZE)
@@ -278,6 +280,9 @@ def main() -> None:
 
     report_stage("step3 read (proj)",  b_read,  t_read)
     report_stage("step3 write (data)", b_write, t_write)
+
+    rm_src(PROJ_H5, enabled=_A.rm_src,
+           rank=RANK, comm=COMM)
 
     rprint(f"data stats: min={d_min:.4g} max={d_max:.4g} "
            f"mean={d_sum/max(d_cnt,1):.4g} nan={d_has_nan}")

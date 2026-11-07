@@ -36,8 +36,9 @@ from iohdf5.dxchange_hdf5_chunks import tomo_writex, read_projs_vchunkx
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
+    read_src_header, rm_src, add_rm_src_arg,
 )
-from iohdf5.layout import add_layout_args, resolve_step
+from iohdf5.layout import add_layout_args, add_geometry_args, input_dims, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
@@ -50,9 +51,9 @@ def _parse_args() -> argparse.Namespace:
                    help="base dir; reads {path}/model_big{UPS}x/stitched.h5, "
                         "writes {path}/model_big{UPS}x/paganin.h5")
     p.add_argument("--energy",     type=float, default=30.0,   help="keV")
-    p.add_argument("--voxelsize",  type=float, default=1.38e-6,
+    p.add_argument("--voxelsize",  type=float, default=0.72222e-6,
                    help="voxel = detector pixel, meters (parallel beam)")
-    p.add_argument("--distance",   type=float, default=0.2,
+    p.add_argument("--distance",   type=float, default=0.15,
                    help="sample → detector distance, meters (matches step3)")
     p.add_argument("--alpha",      type=float, default=5e-4,
                    help="Tikhonov regularisation added to T² in the filter")
@@ -83,6 +84,8 @@ def _parse_args() -> argparse.Namespace:
                         "and costs one HDF5 op per z row per bank, which is "
                         "latency-bound on Lustre.  Ignored for 'proj'.")
     add_layout_args(p)
+    add_geometry_args(p)
+    add_rm_src_arg(p, "the input stitched.h5")
     return p.parse_args()
 
 
@@ -94,7 +97,7 @@ DST_DIR   = f"{BASE_DIR}/model_big{UPS}x"
 SRC_H5    = f"{DST_DIR}/stitched.h5"
 DST_H5    = f"{DST_DIR}/paganin.h5"
 
-IN_NZ = IN_N = 3072            # init.h5 dims after step00; UPS scales from here
+IN_NZ, IN_N = input_dims(_A, UPS)   # 3072 (init.h5 after step00) unless --nz/--n
 NZ    = IN_NZ * UPS
 N     = IN_N  * UPS
 
@@ -116,26 +119,49 @@ NTASKS      = _A.ntasks
 # It also drops back to projection order once θ_per_bank hits 1: with a
 # single angle per bank the sinogram chunk is (1, chunk_z, N), which is all
 # cost and no benefit — at UPS=8 that was a 4.5 MB chunk.
-_PLAN     = resolve_step("paganin", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
-                         nbanks=_A.nbanks, mem_budget_gb=_A.mem_budget,
-                         chunk_mb=_A.chunk_bytes, npgnchunk=_A.npgnchunk,
-                         vchunks=_A.vchunks, order=_A.chunk_order,
-                         nranks=SIZE)
-NBANKS    = _PLAN.nbanks
-VCHUNKS   = _PLAN.vchunks
-NPGNCHUNK = _PLAN.align
-H5CHUNKS  = _PLAN.chunks
-if _A.chunk_z:                      # explicit override of the z extent only
-    H5CHUNKS = (H5CHUNKS[0], max(1, min(_A.chunk_z, _PLAN.bank_shape[1])),
-                H5CHUNKS[2])
-THETA_PER_BANK = _PLAN.bank_shape[0]
-CHUNK_Z = H5CHUNKS[1]
+# Resolved in main(): the policy needs the true 360-degree angle count to
+# size stitched/paganin/sino, and only stitched.h5's shape knows it.
+_PLAN = NBANKS = VCHUNKS = NPGNCHUNK = H5CHUNKS = None
+THETA_PER_BANK = CHUNK_Z = None
+
+
+def _resolve_plan(n_half):
+    global _PLAN, NBANKS, VCHUNKS, NPGNCHUNK, H5CHUNKS
+    global THETA_PER_BANK, CHUNK_Z
+    _PLAN     = resolve_step("paganin", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
+                             ntheta=2 * n_half,
+                             nbanks=_A.nbanks, mem_budget_gb=_A.mem_budget,
+                             chunk_mb=_A.chunk_bytes, npgnchunk=_A.npgnchunk,
+                             vchunks=_A.vchunks, order=_A.chunk_order,
+                             nranks=SIZE)
+    NBANKS    = _PLAN.nbanks
+    VCHUNKS   = _PLAN.vchunks
+    NPGNCHUNK = _PLAN.align
+    H5CHUNKS  = _PLAN.chunks
+    if _A.chunk_z:                      # explicit override of the z extent only
+        H5CHUNKS = (H5CHUNKS[0], max(1, min(_A.chunk_z, _PLAN.bank_shape[1])),
+                    H5CHUNKS[2])
+    THETA_PER_BANK = _PLAN.bank_shape[0]
+    CHUNK_Z = H5CHUNKS[1]
 
 
 def main() -> None:
     from mpi_utils import banner
     banner("7", f"stitched.h5 -> paganin.h5  "
                 f"(single-distance Paganin, α={ALPHA})")
+
+    if RANK == 0:
+        os.makedirs(DST_DIR, exist_ok=True)
+    barrier()
+
+    wavelength = 1.24e-9 / ENERGY
+
+    src_shape, theta_deg = read_src_header(SRC_H5, rank=RANK, comm=COMM)
+    N_HALF = src_shape[0]
+    if src_shape[1:] != (NZ, N):
+        raise SystemExit(
+            f"stitched.h5 shape {src_shape} incompatible with (NZ={NZ}, N={N})")
+    _resolve_plan(N_HALF)
 
     if VCHUNKS[0] % NPGNCHUNK != 0:
         raise SystemExit(
@@ -145,26 +171,6 @@ def main() -> None:
         raise SystemExit(
             f"--vchunks C1×C2 must equal NZ×N ({NZ}×{N}).  "
             f"Got {VCHUNKS[1]}×{VCHUNKS[2]}.")
-
-    if RANK == 0:
-        os.makedirs(DST_DIR, exist_ok=True)
-    barrier()
-
-    wavelength = 1.24e-9 / ENERGY
-
-    if RANK == 0:
-        with h5py.File(SRC_H5, "r") as f:
-            src_shape = tuple(f["exchange/data"].shape)
-            theta_deg = f["exchange/theta"][:]
-    else:
-        src_shape = None
-        theta_deg = None
-    src_shape = COMM.bcast(src_shape, root=0)
-    theta_deg = COMM.bcast(theta_deg, root=0)
-    N_HALF = src_shape[0]
-    if src_shape[1:] != (NZ, N):
-        raise SystemExit(
-            f"stitched.h5 shape {src_shape} incompatible with (NZ={NZ}, N={N})")
 
     dev_id   = cp.cuda.runtime.getDevice()
     dev_name = cp.cuda.runtime.getDeviceProperties(dev_id)['name'].decode()
@@ -286,6 +292,8 @@ def main() -> None:
     rprint(f"paganin stats: min={p_min:.4g} max={p_max:.4g} "
            f"mean={p_sum/max(p_cnt,1):.4g} nan={p_has_nan}")
     rprint(f"wrote {N_HALF} angles to {DST_H5}")
+
+    rm_src(SRC_H5, enabled=_A.rm_src, rank=RANK, comm=COMM)
 
 
 if __name__ == "__main__":

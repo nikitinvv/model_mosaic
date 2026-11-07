@@ -37,14 +37,23 @@ from math import gcd
 # Hit it and file creation fails outright, before any I/O happens.
 HDF5_MAX_CHUNK_BYTES = 2 ** 32 - 1
 
-# Per-rank RAM ceiling covering BOTH buffers every step holds: the output
+# Per-rank ceiling covering BOTH buffers every step holds: the output
 # vchunk and the prefetched input slab.  Sizing only the first is what let
 # step8 ask for 9.7 GB at UPS=1 while also allocating a 1.8 GB sinogram.
 #
-# 96 GiB = a 512 GB Polaris node / 4 ranks, less ~25% for the worker pool,
-# page cache and CUDA host staging.  Scale it with ranks-per-node: the run
-# scripts pass NODE_GB * 0.75 / NRANKS.
-DEFAULT_MEM_BUDGET = 96 * 2 ** 30
+# The ceiling is /dev/shm, not node RAM: both buffers are allocated through
+# h5_vchunks.alloc_shm -> shared_memory.SharedMemory, which is a file in the
+# tmpfs mounted at /dev/shm, and Linux caps that tmpfs at half of RAM.  A
+# Polaris node has 503 GiB RAM and so 252 GiB of /dev/shm -- budgeting off
+# RAM (4 x 96 = 384 GiB/node) overcommits it.  tmpfs pages are allocated
+# lazily, so the overcommit is not an allocation failure: it lands minutes
+# later as SIGBUS on the first touch past the cap (signal 7, shell rc=135),
+# with no OOM message in any log.
+#
+# 48 GiB = 252 GiB of /dev/shm / 4 ranks, less ~24% for the worker pool and
+# any other /dev/shm user.  Scale it with ranks-per-node: the run scripts
+# pass (df /dev/shm) * 0.85 / NRANKS.
+DEFAULT_MEM_BUDGET = 48 * 2 ** 30
 
 # Target bytes for one HDF5 chunk.  This is the op size Lustre sees; the
 # last Polaris sweep only ever measured 12.6 MB, so treat the default as
@@ -372,7 +381,12 @@ def plan_pipeline(ups, *, in_nz=3072, in_nyx=3072, ntheta=None, nbanks=8,
 
     NZ = int(in_nz) * ups
     N = int(in_nyx) * ups
-    NTHETA = int(ntheta) if ntheta else 3 * N // 4
+    # NTHETA is the 360 deg PER-TILE acquisition count (the schematic's
+    # NTHETA = 3N/2); N_HALF = NTHETA//2 = 3N/4 is the 180 deg count that
+    # every stored projection volume here -- proj, data, stitched, paganin,
+    # sino -- actually carries.  Callers that know only their own 180 deg
+    # count must pass ntheta = 2 * that, or every row comes out half size.
+    NTHETA = int(ntheta) if ntheta else 3 * N // 2
     N_HALF = NTHETA // 2
 
     plane = NZ * N * itemsize          # one θ-plane of a (θ, NZ, N) volume
@@ -397,20 +411,62 @@ def plan_pipeline(ups, *, in_nz=3072, in_nyx=3072, ntheta=None, nbanks=8,
         return out[name]
 
     # 8. rec.h5 -- terminal, nobody reads it in-pipeline.  step8 holds the
-    #    (C0, N, N) output plus a (NTHETA, C0, N) sinogram prefetch.
+    #    (C0, N, N) output plus a (N_HALF, C0, N) sinogram prefetch.  N_HALF,
+    #    not NTHETA: the 180 deg count is what sino.h5/paganin.h5 carry, while
+    #    NTHETA is the 360 deg per-tile count.  Pricing the prefetch at NTHETA
+    #    overstated the cost 2x and halved every rec super-chunk.
     rec = add("rec", (NZ, N, N), "proj", "proj",
-              align=nzchunk, companion_unit=NTHETA * N * itemsize,
+              align=nzchunk, companion_unit=N_HALF * N * itemsize,
               dim0_one=True,
               note="terminal; chunk[0]=1 for slice-wise viewing")
 
+    # 7b. sino.h5 -- paganin.h5 transposed from theta-banked to Z-BANKED by
+    #     step7b_transpose.py, so step8's (all theta, zslab, N) read is one
+    #     whole super-chunk out of banks that split the same axis.  That is
+    #     the whole point of the step: no consumer granule has to bind a
+    #     chunk extent here, because the read covers every chunk in the bank.
+    #
+    #     step7b holds two buffers of (N_HALF, Zb, N): the theta-sub-slab it
+    #     reads and the all-theta block it receives from the all-to-all --
+    #     hence companion_unit == the output plane.
+    #
+    #     Zb must DIVIDE rec.vchunks[0] so an FBP z-slab is a whole number of
+    #     these super-chunks.  plan_banking only knows about divisors of NZ,
+    #     so snap afterwards; every divisor of rec.vchunks[0] divides NZ, so
+    #     the axis still tiles exactly.
+    sino = add("sino", (N_HALF, NZ, N), "slice", "sino",
+               align=1, companion_unit=N_HALF * N * itemsize, dim0_one=False,
+               read_granule=(N_HALF, rec.vchunks[0], N),
+               note="z-banked transpose of paganin.h5; step8 reads one "
+                    "whole super-chunk per FBP z-slab")
+    zb = _largest_divisor_le(rec.vchunks[0], sino.vchunks[1])
+    if zb != sino.vchunks[1]:
+        sino.vchunks = (sino.vchunks[0], zb, sino.vchunks[2])
+        sino.nbanks = _largest_divisor_le(zb, max(1, int(nbanks)))
+        sino.buffer_bytes = zb * sino.unit_bytes
+        sino.chunks = plan_chunks(sino.bank_shape, sino.order, itemsize,
+                                  int(chunk_bytes), dim0_one=sino.dim0_one,
+                                  z_granule=sino.z_granule)
+    sino.note += f"; Zb={sino.vchunks[1]} divides FBP z-slab {rec.vchunks[0]}"
+
     # 7. paganin.h5 -- written a θ-slab at a time (so banking is on θ) but
-    #    read (all θ, zslab, N) by step8 (so chunks must be on z).  The one
-    #    place a consumer granule binds.
+    #    read z-wise downstream (so chunks must be on z).  The one place a
+    #    consumer granule binds.
+    #
+    #    The consumer is step7b, not step8, and that is what rescues the
+    #    chunk size.  step7b reads (N_HALF/P, P*Zb, N): a θ-SUB-slab spanning
+    #    P ranks' worth of output z-blocks, so the z granule is P times what
+    #    a direct FBP read would allow.  At UPS=8 / 32 ranks that is 768
+    #    instead of 24 rows, taking the chunk from 4.7 MB to ~50 MB.  Reading
+    #    paganin.h5 z-wise with a Zb-sized granule is exactly the pathology
+    #    step7b exists to remove -- see step7b_transpose.py.
+    zgran = max(1, int(nranks)) * sino.vchunks[1]
     pgn = add("paganin", (N_HALF, NZ, N), "proj", "sino",
               align=npgnchunk, companion_unit=plane, dim0_one=False,
-              z_granule=rec.vchunks[0],
-              read_granule=(N_HALF, rec.vchunks[0], N),
-              note=f"sinogram-ordered; cz divides FBP z-slab {rec.vchunks[0]}")
+              z_granule=zgran,
+              read_granule=(max(1, N_HALF // max(1, int(nranks))), zgran, N),
+              note=f"sinogram-ordered; cz divides step7b's {zgran}-row read "
+                   f"block ({nranks} ranks x Zb={sino.vchunks[1]})")
 
     # 6. stitched.h5 -- step7 reads a θ-slab of full planes, so plain
     #    projection order is already whole-chunk and sequential.
@@ -422,14 +478,22 @@ def plan_pipeline(ups, *, in_nz=3072, in_nyx=3072, ntheta=None, nbanks=8,
     # 3. data.h5 -- step3 holds the (C0, NZ, N) output plus a same-sized
     #    proj prefetch.  step4 reads sub-windows, which stay contiguous
     #    per row at full chunk width.
-    data = add("data", (NTHETA, NZ, N), "proj", "proj",
+    #
+    #    N_HALF, not NTHETA.  data.h5 is a 180 deg volume: step2 runs Radon
+    #    over [0, pi) (step2_radon.py ANG_MAX = np.pi) and step4 fabricates
+    #    the 360 deg tile scan from it by h-flipping the mirror crop, so the
+    #    second half of the tile angles never exists as stored data.  NTHETA
+    #    is the per-tile acquisition count and belongs only to the tile
+    #    files, which this policy does not lay out.
+    data = add("data", (N_HALF, NZ, N), "proj", "proj",
                align=npropchunk, companion_unit=plane, dim0_one=True,
                read_granule=(1, NZ, N),
                note="chunk[0]=1 (required); full-width rows for step4 tiles")
 
     # 2. proj.h5 -- z-banked.  step3 reads (θ-slab, all z, N), so a bank's
     #    whole z extent belongs in one chunk and θ fills the rest.
-    prj = add("proj", (NTHETA, NZ, N), "slice", "proj",
+    #    N_HALF for the same reason as data.h5 above.
+    prj = add("proj", (N_HALF, NZ, N), "slice", "proj",
               align=nzchunk, companion_unit=N * N * itemsize, dim0_one=False,
               read_granule=(data.vchunks[0], NZ, N),
               note=f"z-banked; read as ({data.vchunks[0]}, NZ, N) θ-slabs "
@@ -467,7 +531,8 @@ def plan_pipeline(ups, *, in_nz=3072, in_nyx=3072, ntheta=None, nbanks=8,
 
     # Return in pipeline order rather than planning order.
     return {k: out[k] for k in
-            ("init", "big", "proj", "data", "stitched", "paganin", "rec")}
+            ("init", "big", "proj", "data", "stitched", "paganin", "sino",
+             "rec")}
 
 
 # --------------------------------------------------------------------------
@@ -492,6 +557,27 @@ def add_layout_args(p, budget_gb=DEFAULT_MEM_BUDGET / 2 ** 30,
                    help="target size of one HDF5 chunk = the op size Lustre "
                         f"sees (default {chunk_mb})")
     return p
+
+
+def add_geometry_args(p):
+    """--nz / --n for the steps after the stitch (7, 7b, 8).  They default
+    to the simulation's 3072*UPS; a real acquisition (big_sandstone/) has
+    its own projection size and passes it here."""
+    p.add_argument("--nz", type=int, default=0,
+                   help="rows of the stitched projection (0 = 3072*UPS)")
+    p.add_argument("--n", type=int, default=0,
+                   help="width of the stitched projection = reconstruction "
+                        "size (0 = 3072*UPS)")
+    return p
+
+
+def input_dims(args, ups):
+    """(IN_NZ, IN_N) such that IN_NZ*ups, IN_N*ups are the step's NZ, N."""
+    in_nz = args.nz // ups if args.nz else 3072
+    in_n = args.n // ups if args.n else 3072
+    if (args.nz and args.nz % ups) or (args.n and args.n % ups):
+        raise SystemExit(f"--nz/--n must be multiples of --ups={ups}")
+    return in_nz, in_n
 
 
 def resolve_step(name, *, ups, in_nz, in_nyx, ntheta=None, nbanks=8,
@@ -575,16 +661,24 @@ if __name__ == "__main__":                     # quick manual inspection
     ap.add_argument("--in-nz", type=int, default=3072)
     ap.add_argument("--in-nyx", type=int, default=3072)
     ap.add_argument("--nranks", type=int, default=1,
-                    help="total MPI ranks; caps the vchunk so none idle")
+                    help="total MPI ranks; caps the vchunk so none idle, and "
+                         "sets step7b's read block (paganin cz = nranks*Zb)")
+    ap.add_argument("--ntheta", type=int, default=None,
+                    help="360 deg per-tile angle count from step0 (default "
+                         "3N/2, the schematic's NTHETA).  Without it the "
+                         "stitched/paganin/sino rows print at half their "
+                         "real angle count.")
     ap.add_argument("--mem-budget", type=float, default=96.0,
                     help="GiB per rank")
     ap.add_argument("--chunk-bytes", type=float, default=64.0, help="MiB")
     a = ap.parse_args()
     for u in a.ups:
         print(f"=== UPS={u}  nbanks<={a.nbanks}  nranks={a.nranks}  "
-              f"budget={a.mem_budget} GiB  chunk~{a.chunk_bytes} MiB ===")
+              f"budget={a.mem_budget} GiB  chunk~{a.chunk_bytes} MiB  "
+              f"ntheta={a.ntheta if a.ntheta else 3 * (a.in_nyx * u) // 2} ===")
+        nth = a.ntheta if a.ntheta else 3 * (a.in_nyx * u) // 2
         print(describe_plan(plan_pipeline(
-            u, in_nz=a.in_nz, in_nyx=a.in_nyx, nbanks=a.nbanks,
+            u, in_nz=a.in_nz, in_nyx=a.in_nyx, ntheta=nth, nbanks=a.nbanks,
             nranks=a.nranks, budget=int(a.mem_budget * 2 ** 30),
             chunk_bytes=int(a.chunk_bytes * 2 ** 20))))
         print()

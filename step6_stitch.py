@@ -46,6 +46,7 @@ from iohdf5.dxchange_hdf5_chunks import tomo_writex
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_output,
+    rm_src, add_rm_src_arg,
 )
 from iohdf5.layout import add_layout_args, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, report_stage
@@ -71,6 +72,7 @@ def _parse_args() -> argparse.Namespace:
                    help="θ per super-chunk (=vchunk C0); 0 = take it from "
                         "iohdf5.layout (--mem-budget / --chunk-bytes)")
     add_layout_args(p)
+    add_rm_src_arg(p, "the input mosaic_h5_pre/ tile directory")
     return p.parse_args()
 
 
@@ -267,6 +269,9 @@ def main() -> None:
     report_stage("step6 read (tiles)",    b_read,  t_read)
     report_stage("step6 write (stitched)", b_write, t_write)
     rprint(f"wrote {N_HALF} angles to {dst_h5}")
+
+    rm_src(src_dir, enabled=args.rm_src,
+           rank=RANK, comm=COMM)
 
 
 if __name__ == "__main__":

@@ -17,8 +17,12 @@ on and that arithmetic alone can decide:
     over_budget_step);
   * chunk bytes stay near the target instead of scaling with N^2, which
     is the whole point of the policy;
-  * paganin's z extent divides the FBP z-slab whenever paganin actually
-    ends up sinogram-ordered — the one case a consumer granule binds.
+  * paganin's z extent divides the block step7b reads whenever paganin
+    actually ends up sinogram-ordered — the one case a consumer granule
+    binds;
+  * the step7b transpose closes the loop: sino's z-block divides the FBP
+    slab, paganin's read granule is nranks of those blocks, and the two
+    buffers step7b holds at once fit the budget.
 
 Run:  python -m pytest tests/test_layout_policy.py -q
       python tests/test_layout_policy.py        (no pytest needed)
@@ -34,7 +38,7 @@ from iohdf5.layout import (HDF5_MAX_CHUNK_BYTES, _sitems_axis,  # noqa: E402
                            nominal_bank_shape, plan_chunks, plan_pipeline,
                            resolve_step)
 
-UPS_LIST = (1, 2, 4, 8, 16, 32)
+UPS_LIST = (1, 2, 4, 8, 12, 16, 32)
 NBANKS_LIST = (1, 2, 4, 8)
 DIM0_ONE = ("init", "big", "data", "rec")
 
@@ -172,28 +176,135 @@ def test_big_keeps_ups_alignment_whenever_the_budget_allows():
     assert all(aligned[u] for u in (1, 2, 4, 8)), aligned
 
 
-def test_paganin_z_divides_the_fbp_slab_when_sino_ordered():
-    """The one place a consumer granule binds: step8 reads (all θ, zslab,
-    N) out of paganin.h5.  With chunk[0] > 1 a z sub-range inside a chunk
-    is chunk[0] separate runs, so cz must divide the slab exactly.  With
-    chunk[0] == 1 — which is where the sino order lands on its own once a
-    bank holds a single θ — the z range is the outermost non-trivial axis,
-    so it is one contiguous run and a fatter chunk is strictly better."""
+def test_paganin_z_divides_its_readers_block_when_sino_ordered():
+    """The one place a consumer granule binds.  paganin.h5's reader is
+    step7b, not step8: it pulls (θ/P, P·Zb, N).  With chunk[0] > 1 a z
+    sub-range inside a chunk is chunk[0] separate runs, so cz must divide
+    that block exactly.  With chunk[0] == 1 — which is where the sino
+    order lands on its own once a bank holds a single θ — the z range is
+    the outermost non-trivial axis, so it is one contiguous run and a
+    fatter chunk is strictly better."""
     for ups in UPS_LIST:
         for nbanks in NBANKS_LIST:
             plans = plan_pipeline(ups, nbanks=nbanks, budget=BUDGET,
                                   chunk_bytes=CHUNK_BYTES, nranks=8)
-            pgn, rec = plans["paganin"], plans["rec"]
-            slab = rec.vchunks[0]
+            pgn = plans["paganin"]
             if pgn.chunks[0] > 1:
-                assert slab % pgn.chunks[1] == 0, \
+                assert pgn.z_granule % pgn.chunks[1] == 0, \
                     (f"ups={ups} nbanks<={nbanks}: paganin chunk "
-                     f"{pgn.chunks} vs FBP z-slab {slab}")
+                     f"{pgn.chunks} vs step7b read block {pgn.z_granule}")
             else:
                 # proj-ordered: the z range is the outermost non-trivial
                 # axis, so any contiguous sub-range is one run.
                 assert pgn.chunk_bytes >= CHUNK_BYTES // 4, \
                     f"ups={ups}: proj fallback gave only {pgn.chunk_bytes} B"
+
+
+def test_sino_is_the_z_banked_transpose_step8_can_read_whole():
+    """step7b exists to make step8's read sequential, which needs three
+    things to line up: sino banked on z (the axis step8 shards on), its
+    z-block Zb dividing the FBP z-slab (so one read is a whole number of
+    super-chunks), and the same Zb dividing NZ (so the axis tiles)."""
+    for ups in UPS_LIST:
+        for nranks in (4, 8, 32):
+            plans = plan_pipeline(ups, nbanks=8, budget=BUDGET,
+                                  chunk_bytes=CHUNK_BYTES, nranks=nranks,
+                                  ntheta=3 * (3072 * ups) // 2)
+            sino, rec = plans["sino"], plans["rec"]
+            nz = 3072 * ups
+            assert sino.stype == "slice", f"ups={ups}: sino is {sino.stype}"
+            assert sino.shape == plans["paganin"].shape, \
+                f"ups={ups}: {sino.shape} != {plans['paganin'].shape}"
+            assert nz % sino.vchunks[1] == 0, \
+                f"ups={ups}: Zb={sino.vchunks[1]} does not tile NZ={nz}"
+            assert rec.vchunks[0] % sino.vchunks[1] == 0, \
+                (f"ups={ups} nranks={nranks}: Zb={sino.vchunks[1]} does not "
+                 f"divide the FBP z-slab {rec.vchunks[0]}")
+
+
+def test_paganin_read_granule_matches_the_transpose_block():
+    """step7b reads nranks z-blocks at once — that P-times-taller block is
+    the whole reason the all-to-all beats a plain copy, and it only pays
+    if paganin's chunks were planned for it."""
+    for ups in UPS_LIST:
+        for nranks in (4, 8, 32):
+            plans = plan_pipeline(ups, nbanks=8, budget=BUDGET,
+                                  chunk_bytes=CHUNK_BYTES, nranks=nranks,
+                                  ntheta=3 * (3072 * ups) // 2)
+            pgn, sino = plans["paganin"], plans["sino"]
+            assert pgn.z_granule == nranks * sino.vchunks[1], \
+                (f"ups={ups} nranks={nranks}: granule {pgn.z_granule} != "
+                 f"{nranks}x{sino.vchunks[1]}")
+            # With chunk[0] > 1 a z sub-range inside a chunk is chunk[0]
+            # separate runs, so the granule must be whole chunks.
+            if pgn.chunks[0] > 1:
+                assert pgn.z_granule % pgn.chunks[1] == 0, \
+                    (f"ups={ups} nranks={nranks}: read block "
+                     f"{pgn.z_granule} straddles chunk z {pgn.chunks[1]}")
+
+
+def test_transpose_holds_two_buffers_inside_the_budget():
+    """step7b's peak is the (θ/P, P·Zb, N) read block plus the (N_HALF, Zb,
+    N) output vchunk — equal in size, so 2·N_HALF·Zb·N·4 has to fit or the
+    step OOMs the node rather than merely running slowly.
+
+    On top of those sit the send/recv staging pair, one per-peer message
+    each: P·msg_bytes apiece.  They are small only because --msg-mb is
+    small, so price them in at the default -- the two 40 GiB buffers leave
+    little room for a surprise, and an OOM here costs a whole run."""
+    msg_mb = 64.0                       # step7b_transpose.py --msg-mb default
+    for ups in UPS_LIST:
+        for nranks in (4, 8, 32):
+            plans = plan_pipeline(ups, nbanks=8, budget=BUDGET,
+                                  chunk_bytes=CHUNK_BYTES, nranks=nranks,
+                                  ntheta=3 * (3072 * ups) // 2)
+            sino = plans["sino"]
+            n_half, _, n = sino.shape
+            big     = 2 * n_half * sino.vchunks[1] * n * 4
+            staging = 2 * nranks * int(msg_mb * 2 ** 20)
+            need    = big + staging
+            assert need <= BUDGET, \
+                (f"ups={ups} nranks={nranks}: transpose needs "
+                 f"{need/2**30:.1f} GiB ({big/2**30:.1f} big + "
+                 f"{staging/2**30:.1f} staging) > budget "
+                 f"{BUDGET/2**30:.1f} GiB")
+
+
+def test_every_stored_projection_volume_is_the_180_degree_count():
+    """`ntheta` is the 360 deg PER-TILE acquisition count, and every volume
+    this policy lays out holds 180 deg of it.
+
+    The acquisition really is 360 deg per tile, but only the tile files
+    carry that many frames, and the policy does not lay those out.  step2
+    runs Radon over [0, pi) and step4 fabricates the second half by
+    h-flipping the mirror crop, so proj/data are 180 deg volumes just like
+    stitched/paganin/sino downstream of the fold in step6.
+
+    Getting this wrong is silent: proj and data were once planned at the
+    full NTHETA, which doubled their apparent size in the startup summary
+    and made the disk budget for a run unreadable, while each step still
+    ran correctly because it passed whatever convention made its own row
+    right.  Pin both halves of the relation so neither can drift."""
+    for ups in UPS_LIST:
+        n = 3072 * ups
+        ntheta = 3 * n // 2                     # the schematic's per-tile count
+        plans = plan_pipeline(ups, nbanks=8, budget=BUDGET,
+                              chunk_bytes=CHUNK_BYTES, nranks=32,
+                              ntheta=ntheta)
+        for name in ("proj", "data", "stitched", "paganin", "sino"):
+            assert plans[name].shape[0] == ntheta // 2, \
+                (f"ups={ups}: {name} planned at {plans[name].shape[0]} "
+                 f"angles, expected the 180 deg count {ntheta // 2} "
+                 f"(ntheta={ntheta} is the 360 deg tile count)")
+        assert plans["rec"].shape == (n, n, n), \
+            f"ups={ups}: rec is a volume, not an angle count"
+
+    # And the default, for a caller that passes no ntheta at all.
+    dflt = plan_pipeline(1, nbanks=8, budget=BUDGET,
+                         chunk_bytes=CHUNK_BYTES, nranks=8)
+    assert dflt["proj"].shape[0] == 3 * 3072 // 4, \
+        (f"default ntheta gives proj {dflt['proj'].shape[0]} angles, "
+         f"expected {3 * 3072 // 4}")
 
 
 def test_plan_chunks_respects_a_tiny_byte_target():

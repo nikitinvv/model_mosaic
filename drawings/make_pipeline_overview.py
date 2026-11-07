@@ -10,8 +10,11 @@ Each column stacks vertically:
     · preview slice (from drawings/pipeline_viz/)
     · script filename
     · operation description
-    · reads:  input dataset  (name / shape / size / vchunk / chunk)
     · writes: output dataset (name / shape / size / vchunk / chunk)
+
+Only the output dataset is printed: step N reads exactly what step N-1
+wrote, so the arrow carries that.  Step 1 also shows its input (init.h5),
+which has no predecessor column.
 
 vchunk = super-chunk = RAM buffer worked on by one MPI rank per iteration.
 chunk  = HDF5 on-disk chunk (read/write granularity + compression unit).
@@ -84,7 +87,7 @@ def _steps(ups: int, nbanks: int, nranks: int, budget: int, chunk_bytes: int):
                     size=size,
                     vc=("vchunk " + _sh(vc)) if vc else "(no vchunks)",
                     buf=buf,
-                    ch="chunk  " + _sh(ch),
+                    ch="chunk " + _sh(ch),
                     note=note, warn=warn)
 
     def pblock(key, name):
@@ -103,8 +106,10 @@ def _steps(ups: int, nbanks: int, nranks: int, budget: int, chunk_bytes: int):
             buf=(f"  buf {_fmt_gb(p.buffer_bytes)}  ⚠ > budget"
                  if p.over_budget else
                  f"  buf {_fmt_gb(p.buffer_bytes)} × {p.n_vchunks} sc"),
-            ch=f"chunk  {_sh(p.chunks)}  {_fmt_gb(p.chunk_bytes)}",
-            note=(f"stype={p.stype}, nbanks={p.nbanks}, "
+            ch=f"chunk {_sh(p.chunks)} {_fmt_gb(p.chunk_bytes)}",
+            note=(f"nbanks={p.nbanks} · {p.effective_order}-ordered"
+                  if p.stype == p.effective_order else
+                  f"stype={p.stype} · nbanks={p.nbanks} · "
                   f"{p.effective_order}-ordered"),
             warn=p.over_budget)
 
@@ -126,7 +131,7 @@ def _steps(ups: int, nbanks: int, nranks: int, budget: int, chunk_bytes: int):
 
     return [
         dict(num=1, name="upsample", script="step1_upsample.py",
-             img="step1_init.png",
+             img="step1_init.png", show_inp=True,
              op="trilinear upsample\n(bilinear xy + linear z)",
              inp=init, out=big),
         dict(num=2, name="Radon",
@@ -173,54 +178,61 @@ def _draw_io_block(ax, y_top, tag_label, tag_col, blk):
     """Render one input/output card top-anchored at y_top (axis fraction).
     Returns the y-coordinate just below the block."""
     lh = 0.125
-    ax.text(0.03, y_top, tag_label, fontsize=18, weight="bold",
+    ax.text(0.03, y_top, tag_label, fontsize=36, weight="bold",
             color=tag_col, va="top", ha="left")
-    ax.text(0.36, y_top, blk["name"], fontsize=18, weight="bold",
+    ax.text(0.36, y_top, blk["name"], fontsize=36, weight="bold",
             color=_TEXT_MAIN, family="monospace", va="top", ha="left")
     y = y_top - lh
-    ax.text(0.03, y, blk["shape"], fontsize=16, family="monospace",
+    ax.text(0.03, y, blk["shape"], fontsize=32, family="monospace",
             color=_TEXT_MAIN, va="top", ha="left")
     y -= lh
-    ax.text(0.03, y, blk["size"], fontsize=16, family="monospace",
+    ax.text(0.03, y, blk["size"], fontsize=32, family="monospace",
             weight="bold", color=_TEXT_MUTE, va="top", ha="left")
     y -= lh
-    ax.text(0.03, y, blk["vc"], fontsize=16, family="monospace",
+    ax.text(0.03, y, blk["vc"], fontsize=32, family="monospace",
             color=_TEXT_MAIN, va="top", ha="left")
     if blk.get("buf"):
         y -= lh
-        ax.text(0.03, y, blk["buf"], fontsize=15, family="monospace",
+        ax.text(0.03, y, blk["buf"], fontsize=30, family="monospace",
                 color=_WARN_C if blk.get("warn") else _TEXT_MUTE,
                 weight="bold" if blk.get("warn") else "normal",
                 va="top", ha="left")
     y -= lh
-    ax.text(0.03, y, blk["ch"], fontsize=16, family="monospace",
+    ax.text(0.03, y, blk["ch"], fontsize=32, family="monospace",
             color=_TEXT_MAIN, va="top", ha="left")
     if blk["note"]:
         y -= lh
-        ax.text(0.03, y, blk["note"], fontsize=14, style="italic",
+        ax.text(0.03, y, blk["note"], fontsize=28, style="italic",
                 color=_WARN_C if blk.get("warn") else _TEXT_MUTE,
                 weight="bold" if blk.get("warn") else "normal",
                 va="top", ha="left")
     return y - lh * 0.3
 
 
-def _draw_step(fig, gs_col, step: dict, viz_dir: str):
-    """Fill one step column: [header | image | script+op | reads | writes]."""
+def _draw_step(fig, gs_col, step: dict, viz_dir: str, wide: bool = False):
+    """Fill one step column: [header | image | script+op | writes].
+
+    Only the *output* card is drawn: step N's input is step N-1's output,
+    so printing both said everything twice.  Step 1 is the exception — its
+    input has no predecessor, and its column is 2x wide, so `reads init.h5`
+    and `writes big1x.h5` sit side by side in the one card row."""
     sub = gs_col.subgridspec(
-        5, 1,
-        # Compact heights matched to actual content; image gets the most.
-        height_ratios=[0.45, 2.20, 0.65, 1.30, 1.30],
+        4, 1,
+        # Heights in (relative) inches: the text rows are sized for the
+        # doubled font, the image row is left at its original size so the
+        # type really is 2x larger relative to the previews.
+        height_ratios=[1.90, 3.70, 3.80, 5.20],
         hspace=0.04)
 
     # 1. header — big badge number + step name
     ax_h = fig.add_subplot(sub[0])
     ax_h.set_axis_off()
     ax_h.set_xlim(0, 1); ax_h.set_ylim(0, 1)
-    ax_h.text(0.02, 0.5, str(step["num"]),
-              fontsize=54, weight="bold", color=_BADGE_BG,
+    ax_h.text(0.01, 0.5, str(step["num"]),
+              fontsize=108, weight="bold", color=_BADGE_BG,
               va="center", ha="left")
-    ax_h.text(0.22, 0.55, step["name"],
-              fontsize=24, weight="bold", color=_TEXT_MAIN,
+    ax_h.text(0.082 if wide else 0.17, 0.55, step["name"],
+              fontsize=48, weight="bold", color=_TEXT_MAIN,
               va="center", ha="left")
 
     # 2. image — natural aspect preserved (wide step1/step8 get 2× columns).
@@ -230,7 +242,7 @@ def _draw_step(fig, gs_col, step: dict, viz_dir: str):
         ax_img.imshow(imread(img_path))
     else:
         ax_img.text(0.5, 0.5, f"(missing {step['img']})",
-                    fontsize=8, color="#a00000",
+                    fontsize=16, color="#a00000",
                     ha="center", va="center", transform=ax_img.transAxes)
     ax_img.set_xticks([]); ax_img.set_yticks([])
     for spine in ax_img.spines.values():
@@ -241,22 +253,24 @@ def _draw_step(fig, gs_col, step: dict, viz_dir: str):
     ax_op.set_axis_off()
     ax_op.set_xlim(0, 1); ax_op.set_ylim(0, 1)
     ax_op.text(0.03, 0.95, step["script"],
-               fontsize=17, family="monospace", color=_TEXT_MUTE,
+               fontsize=34, family="monospace", color=_TEXT_MUTE,
                va="top", ha="left")
-    ax_op.text(0.03, 0.55, step["op"],
-               fontsize=17, color=_TEXT_MAIN, va="top", ha="left")
+    ax_op.text(0.03, 0.50, step["op"],
+               fontsize=34, color=_TEXT_MAIN, va="top", ha="left")
 
-    # 4. reads
-    ax_in = fig.add_subplot(sub[3])
-    ax_in.set_axis_off()
-    ax_in.set_xlim(0, 1); ax_in.set_ylim(0, 1)
-    _draw_io_block(ax_in, 0.97, "reads",  _INP_TAG, step["inp"])
+    # 4. dataset card(s) — output only, except on step 1 (see docstring)
+    def _card(gs, tag, col, blk):
+        ax = fig.add_subplot(gs)
+        ax.set_axis_off()
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+        _draw_io_block(ax, 0.97, tag, col, blk)
 
-    # 5. writes
-    ax_out = fig.add_subplot(sub[4])
-    ax_out.set_axis_off()
-    ax_out.set_xlim(0, 1); ax_out.set_ylim(0, 1)
-    _draw_io_block(ax_out, 0.97, "writes", _OUT_TAG, step["out"])
+    if step.get("show_inp"):
+        io = sub[3].subgridspec(1, 2, wspace=0.10)
+        _card(io[0], "reads",  _INP_TAG, step["inp"])
+        _card(io[1], "writes", _OUT_TAG, step["out"])
+    else:
+        _card(sub[3], "writes", _OUT_TAG, step["out"])
 
 
 def build(ups: int, out_path: str, dpi: int, viz_dir: str,
@@ -272,7 +286,7 @@ def build(ups: int, out_path: str, dpi: int, viz_dir: str,
     # (xy@z + xz@y), so give them 2× column slots so aspect is preserved
     # without shrinking.  Others get 1× slots.  Arrows sit in narrow slots
     # between steps.
-    STEP_W_WIDE = 2.0
+    STEP_W_WIDE = 2.2
     STEP_W_NORM = 1.0
     ARROW_W     = 0.14
     widths = []
@@ -280,25 +294,28 @@ def build(ups: int, out_path: str, dpi: int, viz_dir: str,
         widths.append(STEP_W_WIDE if i in (0, n - 1) else STEP_W_NORM)
         if i < n - 1:
             widths.append(ARROW_W)
-    fig_w = sum(widths) * 3.6
-    fig_h = 19.0
+    # 7.2 in per single column (was 3.6): the doubled monospace lines are
+    # twice as wide, so the columns have to follow.
+    fig_w = sum(widths) * 7.9
+    fig_h = 17.0
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
 
     outer = GridSpec(1, len(widths), width_ratios=widths,
-                     left=0.015, right=0.99, top=0.925, bottom=0.02,
+                     left=0.008, right=0.996, top=0.876, bottom=0.02,
                      wspace=0.10)
 
     fig.suptitle(f"Mosaic-modelling pipeline — 8 steps  (UPS={ups})",
-                 fontsize=34, weight="bold", y=0.988, color=_TEXT_MAIN)
-    fig.text(0.5, 0.955,
+                 fontsize=68, weight="bold", y=0.988, color=_TEXT_MAIN)
+    fig.text(0.5, 0.898,
              f"layout from iohdf5.layout:  {mem_budget_gb:g} GiB/rank"
              f" × {nranks} ranks  ·  chunk target ~{chunk_mb:g} MiB"
              f"  ·  nbanks ≤ {nbanks}",
-             fontsize=20, color=_TEXT_MUTE, ha="center", va="center")
+             fontsize=40, color=_TEXT_MUTE, ha="center", va="center")
 
     for i, step in enumerate(steps):
         col_idx = 2 * i
-        _draw_step(fig, outer[col_idx], step, viz_dir)
+        _draw_step(fig, outer[col_idx], step, viz_dir,
+                   wide=i in (0, n - 1))
 
         if i < n - 1:
             ax_arrow = fig.add_subplot(outer[col_idx + 1])
@@ -308,8 +325,8 @@ def build(ups: int, out_path: str, dpi: int, viz_dir: str,
             # Vertically centered on the image band (~50% of column).
             ax_arrow.add_patch(FancyArrowPatch(
                 (0.05, 0.60), (0.95, 0.60),
-                arrowstyle="-|>", mutation_scale=18,
-                lw=2.0, color=_ARROW_C))
+                arrowstyle="-|>", mutation_scale=36,
+                lw=4.0, color=_ARROW_C))
 
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -322,7 +339,7 @@ def _parse_args():
     p.add_argument("--ups", type=int, default=1)
     p.add_argument("--viz-dir", default=_VIZ_DIR)
     p.add_argument("--out", default=None)
-    p.add_argument("--dpi", type=int, default=140)
+    p.add_argument("--dpi", type=int, default=110)
     # Layout knobs — same names and defaults the steps use, so the picture
     # can be regenerated for exactly the configuration a run will have.
     p.add_argument("--nbanks", type=int, default=8,

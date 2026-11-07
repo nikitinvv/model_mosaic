@@ -27,6 +27,11 @@ from multiprocessing import shared_memory
 
 from iohdf5.dxchange_hdf5_chunks import tomo_initx as _initx
 
+# MOSAIC_SINGLE_H5=1: every step writes one plain h5 with parallel HDF5
+# (h5py mpio, collective create/open/close, independent writes) instead of
+# a VDS master + one bank file per writer.  mpirun needs --mca io romio341.
+SINGLE_H5 = os.environ.get("MOSAIC_SINGLE_H5") == "1"
+
 
 def cleanup_h5(path: str) -> None:
     """Remove a VDS master and its sibling bank directory (name/name_*.h5)."""
@@ -36,6 +41,75 @@ def cleanup_h5(path: str) -> None:
     bank_dir = os.path.join(os.path.dirname(path) or ".", stem)
     if os.path.isdir(bank_dir):
         shutil.rmtree(bank_dir)
+
+
+def read_src_header(path, rank=0, comm=None, dataset="exchange/data",
+                    theta="exchange/theta"):
+    """Rank 0 reads a source store's shape (+ theta grid) and broadcasts it.
+
+    Every step needs the true angle count BEFORE it can size its own output:
+    iohdf5.layout defaults NTHETA to 3N/4 when nobody passes `ntheta=`, which
+    is HALF the schematic's 360-degree per-tile count, so stitched/paganin/
+    sino silently plan at half their real angle extent.  Steps 2 and 3 pass it
+    from the positions file; steps 7/7b/8 learn it from their input's shape,
+    which means the plan has to be resolved after this read rather than at
+    import time.
+
+    One rank opens the file, so there is no metadata-read storm at high rank
+    counts.  Returns (shape, theta_deg); theta_deg is None when absent.
+    """
+    import h5py
+    if rank == 0:
+        with h5py.File(path, "r") as f:
+            shape = tuple(f[dataset].shape)
+            th = f[theta][:] if theta and theta in f else None
+    else:
+        shape = th = None
+    if comm is not None:
+        shape = comm.bcast(shape, root=0)
+        th = comm.bcast(th, root=0)
+    return shape, th
+
+
+def rm_src(path, *, enabled=False, rank=0, comm=None, label=None):
+    """Delete a finished step's input once every rank is done reading it.
+
+    The pipeline writes 20x the reconstruction volume across its seven
+    intermediate stores -- 384 TiB at UPS=8, 1.3 PiB at UPS=12 -- but only
+    ever needs one producer/consumer pair resident at a time.  Dropping each
+    input as its step completes turns that into a ~98 TiB peak at UPS=8.
+
+    Barriers FIRST so no rank is still reading, then rank 0 removes it.
+    Handles both a VDS master + bank dir (cleanup_h5) and a plain directory
+    of per-tile files (step4/step5 mosaic_h5*).  Never raises: losing an
+    intermediate to a permissions error must not kill a multi-hour job that
+    has already produced its output.
+    """
+    if not enabled:
+        return
+    if comm is not None:
+        comm.Barrier()
+    if rank == 0:
+        what = label or os.path.basename(path.rstrip("/")) or path
+        try:
+            if os.path.isdir(path) and not os.path.isfile(path):
+                shutil.rmtree(path)
+            else:
+                cleanup_h5(path)
+            print(f"  [rm-src] removed {what} ({path})", flush=True)
+        except Exception as exc:                      # noqa: BLE001
+            print(f"  [rm-src] WARNING could not remove {path}: {exc}",
+                  flush=True)
+    if comm is not None:
+        comm.Barrier()
+
+
+def add_rm_src_arg(p, what):
+    """The --rm-src flag, worded per step so --help names the actual file."""
+    p.add_argument("--rm-src", action="store_true",
+                   help=f"delete {what} once this step has finished writing "
+                        f"(keeps peak disk to one producer/consumer pair)")
+    return p
 
 
 def iter_vchunks(shape, vchunks):
@@ -50,17 +124,79 @@ def iter_vchunks(shape, vchunks):
                 yield (i0, i1, i2)
 
 
+# Bytes this process currently holds in /dev/shm via alloc_shm.  Used only
+# by the preflight below; free_shm() decrements it.
+_SHM_HELD = {}
+
+
+def _local_ranks() -> int:
+    """Ranks of this job sharing this node, from whichever launcher put it in
+    the environment (PALS/mpiexec on Polaris, mpich, OpenMPI, Slurm).  1 if
+    none of them did, which makes the preflight check per-process only."""
+    for var in ("PALS_LOCAL_SIZE", "PMI_LOCAL_SIZE", "MPI_LOCALNRANKS",
+                "OMPI_COMM_WORLD_LOCAL_SIZE", "SLURM_NTASKS_PER_NODE"):
+        try:
+            n = int(os.environ[var])
+        except (KeyError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return 1
+
+
+def _shm_preflight(nbytes: int) -> None:
+    """Refuse an allocation the node's /dev/shm cannot hold.
+
+    SharedMemory is a file in the tmpfs at /dev/shm, which Linux caps at half
+    of RAM (252 GiB on a 503 GiB Polaris node).  tmpfs pages are allocated
+    lazily, so asking for more than the cap succeeds here and then kills the
+    rank with SIGBUS on the first touch past it -- signal 7, shell rc=135, no
+    OOM message anywhere.  Checking the *capacity* (not the free space, which
+    for the same lazy-allocation reason says nothing about what the other
+    ranks are about to touch) turns that into a message naming the knob.
+
+    Set MOSAIC_SHM_CHECK=0 to skip.
+    """
+    if os.environ.get("MOSAIC_SHM_CHECK", "1") == "0":
+        return
+    try:
+        st = os.statvfs("/dev/shm")
+    except OSError:
+        return                      # no tmpfs to reason about
+    cap = st.f_blocks * st.f_frsize
+    if cap <= 0:
+        return
+    nloc = _local_ranks()
+    want = (sum(_SHM_HELD.values()) + nbytes) * nloc
+    if want <= cap * 0.95:
+        return
+    g = 2 ** 30
+    raise MemoryError(
+        f"/dev/shm too small for this layout: {nloc} rank(s) on this node x "
+        f"{(sum(_SHM_HELD.values()) + nbytes) / g:.1f} GiB = {want / g:.1f} "
+        f"GiB, but /dev/shm holds {cap / g:.1f} GiB.  The shared-memory "
+        f"buffers are sized by --mem-budget (GiB per rank); lower it to at "
+        f"most {cap * 0.85 / nloc / g:.1f}.  Note /dev/shm is half of node "
+        f"RAM, so budgeting off total RAM overcommits it -- and because tmpfs "
+        f"pages come lazily, the overcommit would otherwise not fail here but "
+        f"much later, as SIGBUS (signal 7, rc=135) on first touch."
+    )
+
+
 def alloc_shm(shape, dtype):
     """Allocate a shared-memory buffer of the given shape+dtype.  Returns
     (shm, ndarray-view).  Caller must call `free_shm(shm)` when done."""
     dtp = np.dtype(dtype)
-    shm = shared_memory.SharedMemory(create=True,
-                                     size=int(np.prod(shape)) * dtp.itemsize)
+    nbytes = int(np.prod(shape)) * dtp.itemsize
+    _shm_preflight(nbytes)
+    shm = shared_memory.SharedMemory(create=True, size=nbytes)
+    _SHM_HELD[shm.name] = nbytes
     buf = np.ndarray(shape=shape, dtype=dtp, buffer=shm.buf)
     return shm, buf
 
 
 def free_shm(shm) -> None:
+    _SHM_HELD.pop(getattr(shm, "name", None), None)
     try:
         shm.close()
     finally:
@@ -80,6 +216,15 @@ def initx_and_bcast(path, shape, dtype, vchunks, stype="proj",
     `chunks` overrides the HDF5 chunk shape inside the bank files without
     touching the banking — see tomo_initx.  It does not affect the
     banking plan, so the non-root branch below stays chunk-agnostic."""
+    if SINGLE_H5:
+        from iohdf5.dxchange_hdf5_chunks import tomo_initx_single
+        if rank == 0:
+            cleanup_h5(path)
+        if comm is not None:
+            comm.Barrier()
+        return tomo_initx_single(path, shape, dtype, vchunks=vchunks,
+                                 stype=stype, nbanks=nbanks, chunks=chunks,
+                                 comm=comm)
     if rank == 0:
         cleanup_h5(path)
         ctx = _initx(filename=path, shape=shape, dtype=dtype,
@@ -98,6 +243,28 @@ def initx_and_bcast(path, shape, dtype, vchunks, stype="proj",
     if comm is not None:
         comm.Barrier()
     return ctx
+
+
+def open_out(ctx) -> None:
+    """Single-file output: open it for writing, collectively (every rank).
+    Call after rank 0's serial edits (theta, attrs) and the barrier after
+    them -- a serial handle and the MPI-IO one must not overlap.  No-op for
+    VDS + banks."""
+    if ctx.get('single'):
+        import h5py
+        from iohdf5.dxchange_hdf5_chunks import romio_info
+        f = h5py.File(ctx['path'], 'r+', driver='mpio', comm=ctx['comm'],
+                      info=romio_info())
+        ctx['h5'], ctx['dset'] = f, f['exchange/data']
+
+
+def close_out(ctx) -> None:
+    """Single-file output: close the MPI-IO handle (collective, every rank).
+    No-op for VDS + banks."""
+    f = ctx.pop('h5', None)
+    ctx.pop('dset', None)
+    if f is not None:
+        f.close()
 
 
 def vchunk_bytes(vchunks, dtype) -> int:

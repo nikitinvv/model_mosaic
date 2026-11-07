@@ -37,6 +37,7 @@ from iohdf5.dxchange_hdf5_chunks import tomo_writex, read_projs_vchunkx
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
+    rm_src, add_rm_src_arg,
 )
 from iohdf5.layout import add_layout_args, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
@@ -62,6 +63,7 @@ def _parse_args() -> argparse.Namespace:
                    help="super-chunk for proj.h5; default comes from "
                         "iohdf5.layout (--mem-budget / --chunk-bytes)")
     add_layout_args(p)
+    add_rm_src_arg(p, "the input big{UPS}x.h5")
     return p.parse_args()
 
 
@@ -88,7 +90,7 @@ NTASKS  = _A.ntasks
 # loop can run in smaller pieces, so it bends rather than pushing the
 # super-chunk over the RAM budget.
 _PLAN   = resolve_step("proj", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
-                       ntheta=NTHETA, nbanks=_A.nbanks,
+                       ntheta=2 * NTHETA,   # policy wants the 360 deg tile count nbanks=_A.nbanks,
                        mem_budget_gb=_A.mem_budget, chunk_mb=_A.chunk_bytes,
                        nzchunk=_A.nzchunk, vchunks=_A.vchunks, nranks=SIZE)
 NBANKS   = _PLAN.nbanks
@@ -239,6 +241,9 @@ def main() -> None:
 
     report_stage("step2 read (big)",  b_read,  t_read)
     report_stage("step2 write (proj)", b_write, t_write)
+
+    rm_src(SRC_H5, enabled=_A.rm_src,
+           rank=RANK, comm=COMM)
 
     norm_const = float(np.sqrt(N / NTHETA))
     rprint(f"proj = R(delta) stats: min={proj_min:.4g} max={proj_max:.4g}  "

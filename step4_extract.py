@@ -18,8 +18,19 @@ pixel in the big projection plus crop_{top,bottom,left,right}; the stored
 tile is exactly the part of the detector footprint that falls inside
 [0, NZ) x [0, N) — no air padding.
 
-Multi-rank via MPI: tiles are round-robin sharded across ranks so many
-tiles can be extracted in parallel.
+Multi-rank via MPI.  There are only n_z*n_x tiles (6 at UPS=2) but each is
+hundreds of GB, so one tile per rank both idles most of the job and asks a
+single rank to hold ~700 GB.  Instead COMM is split into a group per tile;
+each member owns a contiguous theta span, streams it in --block-gb blocks,
+and writes its own plain HDF5 *bank* file.  Rank 0 of the group then stitches
+the banks into the tile's VDS master, so step5 still opens one
+mosaic_h5/{z}_{x}.h5 and reads it as a single (NTHETA, h, w) dataset.
+
+Banks rather than parallel HDF5 on purpose: h5py has mpio here, but a file
+created with MPI-IO gets H5D_ALLOC_TIME_EARLY, and on Lustre that allocation
+is not sparse -- measured 532 s to create one empty 348 GB tile before any
+real data is written.  Independent per-rank banks allocate lazily and need
+no coordination, which is why the rest of the pipeline is built this way too.
 """
 from __future__ import annotations
 
@@ -31,8 +42,9 @@ import h5py
 import numpy as np
 
 import time
-from mpi_utils import RANK, SIZE, barrier as _barrier, rprint, report_stage
+from mpi_utils import COMM, RANK, SIZE, barrier as _barrier, rprint, report_stage
 from iohdf5.h5_vchunks import describe_input
+from iohdf5.h5_vchunks import rm_src, add_rm_src_arg
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +59,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
                    help="base dir; reads {path}/model_big{UPS}x/data.h5, "
                         "writes {path}/mosaic_h5/*.h5")
+    p.add_argument("--block-gb", type=float, default=4.0,
+                   help="host buffer budget for one theta-block; each rank "
+                        "holds a direct + a mirror block, so peak is ~2x this")
+    add_rm_src_arg(p, "the input data.h5")
     return p.parse_args()
 
 
@@ -107,6 +123,28 @@ def read_placements(txt_path: str):
     return meta, placements
 
 
+def bank_rel(zi: int, xi: int, r: int) -> str:
+    """Bank path as written into the VDS master -- relative to the master, so
+    the whole mosaic_h5/ tree stays relocatable."""
+    return f"{zi}_{xi}/bank{r:05d}.h5"
+
+
+def theta_spans(n: int, k: int):
+    """k contiguous, near-equal spans covering [0, n).
+
+    Contiguous rather than round-robin: each span becomes one bank file and
+    two VDS mappings (its direct half and its mirror half), so a rank's work
+    must be one unbroken theta range.
+    """
+    base, rem = divmod(n, k)
+    out, s = [], 0
+    for i in range(k):
+        ln = base + (1 if i < rem else 0)
+        out.append((s, s + ln))
+        s += ln
+    return out
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -156,6 +194,25 @@ def main() -> None:
     theta_tile_deg = np.concatenate([theta_data_deg,
                                      theta_data_deg + 180.0]).astype(np.float32)
 
+    # Rank -> tile-group -> theta-span decomposition.
+    #
+    # A tile is enormous (348 GB at UPS=2, 696 GB at UPS=4) and there are only
+    # n_z*n_x of them -- 6 at UPS=2.  Sharding one tile per rank therefore left
+    # 90 of 96 ranks idle AND asked each worker to hold direct + mirror + tile
+    # (~700 GB) in host RAM at once, which is more than a whole Polaris node.
+    #
+    # Split COMM into a group per tile instead.  Each member owns a contiguous
+    # theta span of the source, streams it in blocks, and writes its own bank;
+    # rank 0 of the group publishes the VDS master.  Every rank does I/O, and
+    # peak host memory per rank is ~2*--block-gb regardless of UPS.
+    n_tiles  = len(placements)
+    n_groups = min(SIZE, n_tiles)
+    color    = (RANK * n_groups) // SIZE      # contiguous ranks share a group
+    sub      = COMM.Split(color=color, key=RANK) if COMM is not None else None
+    sub_rank = sub.Get_rank() if sub is not None else 0
+    sub_size = sub.Get_size() if sub is not None else 1
+    my_tiles = placements[color::n_groups]    # groups round-robin over tiles
+
     if RANK == 0:
         describe_input(src_h5)
         max_tile = NTHETA_TILE * DET_H * DET_W * 4
@@ -166,10 +223,10 @@ def main() -> None:
               f"(first {N_HALF} from data.h5 direct, second {N_HALF} from "
               f"mirror crop + h-flip)")
         print(f"       {n_z} z-tiles × {n_x} x-tiles = {n_z*n_x} files   "
-              f"MPI ranks={SIZE}", flush=True)
-
-    # Round-robin tile sharding.
-    my_placements = placements[RANK::SIZE]
+              f"MPI ranks={SIZE}")
+        print(f"       writers: {n_groups} group(s) of ~{SIZE//n_groups} ranks; "
+              f"each writes one bank, group rank 0 publishes the VDS master; "
+              f"θ-block budget={args.block_gb} GB/buffer", flush=True)
 
     t_read = t_write = 0.0
     b_read = b_write = 0
@@ -177,7 +234,7 @@ def main() -> None:
     with h5py.File(src_h5, "r") as fsrc:
         data_dset = fsrc["exchange/data"]
 
-        for p in my_placements:
+        for p in my_tiles:
             zi, xi = p["zi"], p["xi"]
             r_lo_d, r_hi_d = p["r_lo_dir"], p["r_hi_dir"]
             c_lo_d, c_hi_d = p["c_lo_dir"], p["c_hi_dir"]
@@ -191,61 +248,110 @@ def main() -> None:
             assert (r_hi_m - r_lo_m, c_hi_m - c_lo_m) == (h_out, w_out), (
                 "mirror crop shape must match direct")
 
-            t0 = time.perf_counter()
-            direct_slab = data_dset[:, r_lo_d:r_hi_d, c_lo_d:c_hi_d]
-            mirror_slab = data_dset[:, r_lo_m:r_hi_m, c_lo_m:c_hi_m][:, :, ::-1]
-            t_read += time.perf_counter() - t0
-            b_read += direct_slab.nbytes + mirror_slab.nbytes
+            spans      = theta_spans(N_HALF, sub_size)
+            s0, s1     = spans[sub_rank]
+            span       = s1 - s0
+            out_path   = os.path.join(dst_dir, f"{zi}_{xi}.h5")
+            bank_dir   = os.path.join(dst_dir, f"{zi}_{xi}")
 
-            tile = np.empty((NTHETA_TILE, h_out, w_out), dtype=np.float32)
-            tile[:N_HALF]  = direct_slab
-            tile[N_HALF:]  = mirror_slab   # already h-flipped
+            if sub_rank == 0:
+                os.makedirs(bank_dir, exist_ok=True)
+                print(f"  [grp {color}] {out_path}  "
+                      f"dir rows[{r_lo_d}:{r_hi_d}] cols[{c_lo_d}:{c_hi_d}]  "
+                      f"mir cols[{c_lo_m}:{c_hi_m}](h-flipped)  "
+                      f"shape=({NTHETA_TILE},{h_out},{w_out})  "
+                      f"{sum(1 for a, b in spans if b > a)} bank(s)",
+                      flush=True)
+            if sub is not None:
+                sub.Barrier()          # bank dir must exist before anyone writes
 
-            out_path = os.path.join(dst_dir, f"{zi}_{xi}.h5")
-            t0 = time.perf_counter()
-            with h5py.File(out_path, "w") as fout:
-                g = fout.create_group("exchange")
-                d = g.create_dataset("data", data=tile,
-                                     chunks=(1, h_out, w_out))
-                g.create_dataset("theta", data=theta_tile_deg)   # DEGREES, 360°
-                # Synthetic flat/dark fields for downstream reconstruction:
-                # data_white = ones (perfect flat), data_dark = zeros (no noise).
-                g.create_dataset(
-                    "data_white",
-                    data=np.ones((1, h_out, w_out), dtype=np.float32),
-                )
-                g.create_dataset(
-                    "data_dark",
-                    data=np.zeros((1, h_out, w_out), dtype=np.float32),
-                )
-                d.attrs["z_tile"]        = zi
-                d.attrs["x_tile"]        = xi
-                d.attrs["z_center"]      = p["z_center"]
-                d.attrs["x_center"]      = p["x_center"]
-                d.attrs["crop_top"]      = p["crop_top"]
-                d.attrs["crop_bottom"]   = p["crop_bottom"]
-                d.attrs["crop_left"]     = p["crop_left"]
-                d.attrs["crop_right"]    = p["crop_right"]
-                d.attrs["full_det_h"]    = DET_H
-                d.attrs["full_det_w"]    = DET_W
-                # Back-compat: top-left corner of stored (direct) tile in big proj.
-                d.attrs["z_start"]       = r_lo_d
-                d.attrs["x_start"]       = c_lo_d
-                d.attrs["det_h"]         = h_out
-                d.attrs["det_w"]         = w_out
-            t_write += time.perf_counter() - t0
-            b_write += tile.nbytes
-            del direct_slab, mirror_slab, tile
-            print(f"  [rank {RANK}] {out_path}  "
-                  f"dir rows[{r_lo_d}:{r_hi_d}] cols[{c_lo_d}:{c_hi_d}]  "
-                  f"mir cols[{c_lo_m}:{c_hi_m}](h-flipped)  "
-                  f"shape=({NTHETA_TILE},{h_out},{w_out})",
-                  flush=True)
+            # A bank holds its span's direct half then its mirror half, so the
+            # theta-block loop writes both from one read.  Block depth comes
+            # from the byte budget; peak host memory is ~2x that.
+            if span > 0:
+                frame_b = h_out * w_out * 4
+                dt = max(1, min(span, int(args.block_gb * 1e9) // frame_b))
+                with h5py.File(os.path.join(dst_dir, bank_rel(zi, xi, sub_rank)), "w",
+                               libver="latest") as fb:
+                    gb = fb.create_group("exchange")
+                    db = gb.create_dataset("data",
+                                           shape=(2 * span, h_out, w_out),
+                                           dtype=np.float32,
+                                           chunks=(1, h_out, w_out),
+                                           fillvalue=None)
+                    for t0 in range(s0, s1, dt):
+                        t1 = min(t0 + dt, s1)
+                        tt = time.perf_counter()
+                        direct = data_dset[t0:t1, r_lo_d:r_hi_d, c_lo_d:c_hi_d]
+                        mirror = data_dset[t0:t1,
+                                           r_lo_m:r_hi_m,
+                                           c_lo_m:c_hi_m][:, :, ::-1]
+                        t_read += time.perf_counter() - tt
+                        b_read += direct.nbytes + mirror.nbytes
+
+                        o0, o1 = t0 - s0, t1 - s0
+                        tt = time.perf_counter()
+                        db[o0:o1]                = direct
+                        db[span + o0:span + o1]  = mirror   # already h-flipped
+                        t_write += time.perf_counter() - tt
+                        b_write += direct.nbytes + mirror.nbytes
+                        del direct, mirror
+
+            if sub is not None:
+                sub.Barrier()          # every bank closed before the master
+
+            if sub_rank == 0:
+                # VDS master.  Each bank contributes two mappings: its direct
+                # half lands at [a:b), its mirror half at N_HALF + [a:b).
+                layout = h5py.VirtualLayout(shape=(NTHETA_TILE, h_out, w_out),
+                                            dtype=np.float32)
+                for r, (a, b) in enumerate(spans):
+                    ln = b - a
+                    if ln <= 0:
+                        continue
+                    vs = h5py.VirtualSource(bank_rel(zi, xi, r), "/exchange/data",
+                                            shape=(2 * ln, h_out, w_out))
+                    layout[a:b]                       = vs[0:ln]
+                    layout[N_HALF + a:N_HALF + b]     = vs[ln:2 * ln]
+
+                with h5py.File(out_path, "w", libver="latest") as fout:
+                    g = fout.create_group("exchange")
+                    d = g.create_virtual_dataset("data", layout, fillvalue=-5)
+                    g.create_dataset("theta", data=theta_tile_deg)
+                    # Synthetic flat/dark fields for downstream reconstruction:
+                    # data_white = ones (perfect flat), data_dark = zeros.
+                    g.create_dataset(
+                        "data_white",
+                        data=np.ones((1, h_out, w_out), dtype=np.float32))
+                    g.create_dataset(
+                        "data_dark",
+                        data=np.zeros((1, h_out, w_out), dtype=np.float32))
+                    d.attrs["z_tile"]        = zi
+                    d.attrs["x_tile"]        = xi
+                    d.attrs["z_center"]      = p["z_center"]
+                    d.attrs["x_center"]      = p["x_center"]
+                    d.attrs["crop_top"]      = p["crop_top"]
+                    d.attrs["crop_bottom"]   = p["crop_bottom"]
+                    d.attrs["crop_left"]     = p["crop_left"]
+                    d.attrs["crop_right"]    = p["crop_right"]
+                    d.attrs["full_det_h"]    = DET_H
+                    d.attrs["full_det_w"]    = DET_W
+                    # Back-compat: top-left corner of stored (direct) tile.
+                    d.attrs["z_start"]       = r_lo_d
+                    d.attrs["x_start"]       = c_lo_d
+                    d.attrs["det_h"]         = h_out
+                    d.attrs["det_w"]         = w_out
+
+    if sub is not None:
+        sub.Free()
 
     _barrier()
     report_stage("step4 read (data)",   b_read,  t_read)
     report_stage("step4 write (tiles)", b_write, t_write)
     rprint(f"done. wrote {n_z*n_x} h5 files.")
+
+    rm_src(src_h5, enabled=args.rm_src,
+           rank=RANK, comm=COMM)
 
 
 if __name__ == "__main__":

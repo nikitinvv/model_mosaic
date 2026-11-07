@@ -2,13 +2,18 @@
 """Filtered backprojection (FBP) reconstruction of the paganin-retrieved
 180° big projection.
 
-Reads {path}/model_big{UPS}x/paganin.h5 (N_HALF, NZ, N) — the
-line-integrated linear attenuation from step7_paganin.py — and writes
+Reads {path}/model_big{UPS}x/sino.h5 (N_HALF, NZ, N) — step7b's z-banked
+transpose of the line integrals from step7_paganin.py — and writes
 {path}/model_big{UPS}x/rec.h5 with shape (NZ, N, N) float32:  the
 reconstructed 3-D volume.
 
 For each --nzchunk z-slab this rank owns:
-  1. Read (N_HALF, chunk_nz, N) sino slab from paganin.h5.
+  1. Read (N_HALF, chunk_nz, N) sino slab from sino.h5.  Because that
+     store is banked on z — the same axis this loop shards on — the slab
+     is one whole super-chunk and each worker stays inside its own bank
+     files.  `--src paganin` reads step7's output directly instead, which
+     is banked on theta and so reads transposed (~500 MB/s against
+     ~20 GB/s in the UPS=1 log); it exists for A/B timing only.
   2. Apply FBP filter along the sample axis (rfft → w → irfft) —
      see processing.fbp_filter.FBPFilter (ported from tomocupy).
   3. Backproject via processing.tomo.TomoReal.RT → (chunk_nz, N, N).
@@ -40,8 +45,9 @@ from iohdf5.dxchange_hdf5_chunks import tomo_writex, read_slices_vchunkx
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
+    read_src_header, rm_src, add_rm_src_arg,
 )
-from iohdf5.layout import add_layout_args, resolve_step
+from iohdf5.layout import add_layout_args, add_geometry_args, input_dims, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
@@ -51,8 +57,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ups",  type=int, default=1,
                    help="matches step6 --ups (drives paths)")
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
-                   help="base dir; reads {path}/model_big{UPS}x/paganin.h5, "
+                   help="base dir; reads {path}/model_big{UPS}x/sino.h5, "
                         "writes {path}/model_big{UPS}x/rec.h5")
+    p.add_argument("--src", default="sino", choices=("sino", "paganin"),
+                   help="input store: 'sino' = step7b's z-banked transpose "
+                        "(default, sequential read); 'paganin' = step7 "
+                        "output directly (transposed read, for A/B timing). "
+                        "'sino' falls back to paganin.h5 when sino.h5 is "
+                        "absent.")
     p.add_argument("--filter", default="ramp",
                    choices=("none", "ramp", "shepp", "cosine", "cosine2",
                             "hamming", "hann", "parzen"),
@@ -67,7 +79,9 @@ def _parse_args() -> argparse.Namespace:
                    metavar=("C0", "C1", "C2"),
                    help="super-chunk for rec.h5; default comes from "
                         "iohdf5.layout (--mem-budget / --chunk-bytes)")
+    add_rm_src_arg(p, "the input sino.h5 (or paganin.h5)")
     add_layout_args(p)
+    add_geometry_args(p)
     return p.parse_args()
 
 
@@ -76,10 +90,16 @@ _A = _parse_args()
 UPS      = _A.ups
 BASE_DIR = _A.path
 DST_DIR  = f"{BASE_DIR}/model_big{UPS}x"
-SRC_H5   = f"{DST_DIR}/paganin.h5"
+SINO_H5  = f"{DST_DIR}/sino.h5"
+PGN_H5   = f"{DST_DIR}/paganin.h5"
+# 'sino' is the default but step7b may not have run (or may have been
+# skipped at UPS=1, where the transposed read is cheap) -- fall back
+# rather than dying three hours into a job.
+SRC_H5   = (SINO_H5 if (_A.src == "sino" and os.path.isfile(SINO_H5))
+            else PGN_H5)
 DST_H5   = f"{DST_DIR}/rec.h5"
 
-IN_NZ = IN_N = 3072            # init.h5 dims after step00; UPS scales from here
+IN_NZ, IN_N = input_dims(_A, UPS)   # 3072 (init.h5 after step00) unless --nz/--n
 NZ    = IN_NZ * UPS
 N     = IN_N  * UPS
 FILTER     = _A.filter
@@ -91,19 +111,48 @@ NTASKS     = _A.ntasks
 # 8·NZCHUNK literal counted neither: it already asked for 9.7 GB + 1.8 GB
 # at UPS=1 and 155 GB at UPS=2.  NZCHUNK follows the plan's alignment,
 # since the backprojection loop can just run in smaller pieces.
-_PLAN    = resolve_step("rec", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
+# Resolved in main(), once the source file has told us the true angle
+# count: without ntheta= the policy assumes NTHETA=3N/4 and prices the
+# sinogram prefetch at half its real size.
+_PLAN = NBANKS = VCHUNKS = H5CHUNKS = NZCHUNK = None
+
+
+def _resolve_plan(ntheta):
+    """rec's super-chunk / HDF5 chunk / z-alignment for this angle count."""
+    global _PLAN, NBANKS, VCHUNKS, H5CHUNKS, NZCHUNK
+    _PLAN    = resolve_step("rec", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
+                            ntheta=2 * ntheta,
+                            nbanks=_A.nbanks, mem_budget_gb=_A.mem_budget,
+                            chunk_mb=_A.chunk_bytes, nzchunk=_A.nzchunk,
+                            vchunks=_A.vchunks, nranks=SIZE)
+    NBANKS   = _PLAN.nbanks
+    VCHUNKS  = _PLAN.vchunks
+    H5CHUNKS = _PLAN.chunks
+    NZCHUNK  = _PLAN.align
+    return resolve_step("sino", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
+                        ntheta=2 * ntheta,
                         nbanks=_A.nbanks, mem_budget_gb=_A.mem_budget,
                         chunk_mb=_A.chunk_bytes, nzchunk=_A.nzchunk,
-                        vchunks=_A.vchunks, nranks=SIZE)
-NBANKS     = _PLAN.nbanks
-VCHUNKS    = _PLAN.vchunks
-H5CHUNKS   = _PLAN.chunks
-NZCHUNK    = _PLAN.align
+                        nranks=SIZE)
 
 
 def main() -> None:
     from mpi_utils import banner
-    banner("8", f"paganin.h5 -> rec.h5  (FBP, filter={FILTER})")
+    banner("8", f"{os.path.basename(SRC_H5)} -> rec.h5  "
+                f"(FBP, filter={FILTER})")
+
+    if RANK == 0:
+        os.makedirs(DST_DIR, exist_ok=True)
+    barrier()
+
+    src_shape, theta_deg = read_src_header(SRC_H5, rank=RANK, comm=COMM)
+    NTHETA = src_shape[0]        # = N_HALF from step5/step6
+    if src_shape[1:] != (NZ, N):
+        raise SystemExit(
+            f"{SRC_H5} shape {src_shape} incompatible with (NZ={NZ}, N={N})")
+    theta_rad = np.deg2rad(theta_deg).astype(np.float32)
+
+    sino_plan = _resolve_plan(NTHETA)
 
     if VCHUNKS[0] % NZCHUNK != 0:
         raise SystemExit(
@@ -113,25 +162,16 @@ def main() -> None:
         raise SystemExit(
             f"--vchunks C1×C2 must equal N×N ({N}×{N}).  "
             f"Got {VCHUNKS[1]}×{VCHUNKS[2]}.")
-
-    if RANK == 0:
-        os.makedirs(DST_DIR, exist_ok=True)
-    barrier()
-
-    if RANK == 0:
-        with h5py.File(SRC_H5, "r") as f:
-            src_shape = tuple(f["exchange/data"].shape)
-            theta_deg = f["exchange/theta"][:]
-    else:
-        src_shape = None
-        theta_deg = None
-    src_shape = COMM.bcast(src_shape, root=0)
-    theta_deg = COMM.bcast(theta_deg, root=0)
-    NTHETA = src_shape[0]        # = N_HALF from step5/step6
-    if src_shape[1:] != (NZ, N):
+    # sino.h5 is banked every sino_plan.vchunks[1] z-rows.  A read slab
+    # that is not a whole number of those banks would make two ranks
+    # touch one bank file, which is the access pattern step7b exists to
+    # avoid -- the policy snaps Zb to a divisor of VCHUNKS[0], so this
+    # only fires when --vchunks was overridden by hand.
+    if SRC_H5 == SINO_H5 and VCHUNKS[0] % sino_plan.vchunks[1] != 0:
         raise SystemExit(
-            f"paganin.h5 shape {src_shape} incompatible with (NZ={NZ}, N={N})")
-    theta_rad = np.deg2rad(theta_deg).astype(np.float32)
+            f"rec --vchunks C0={VCHUNKS[0]} must be a multiple of sino.h5's "
+            f"z-bank {sino_plan.vchunks[1]} (drop --vchunks and let the "
+            f"layout policy pick, or re-run step7b with a matching Zb).")
 
     dev_id   = cp.cuda.runtime.getDevice()
     dev_name = cp.cuda.runtime.getDeviceProperties(dev_id)['name'].decode()
@@ -256,12 +296,14 @@ def main() -> None:
     r_has_nan = allreduce(r_has_nan, MPI.LOR)
     barrier()
 
-    report_stage("step8 read (paganin)", b_read,  t_read)
+    report_stage(f"step8 read ({os.path.basename(SRC_H5)})", b_read, t_read)
     report_stage("step8 write (rec)",    b_write, t_write)
 
     rprint(f"rec stats: min={r_min:.4g} max={r_max:.4g} "
            f"mean={r_sum/max(r_cnt,1):.4g} nan={r_has_nan}")
     rprint(f"wrote {NZ} z-slices to {DST_H5}")
+
+    rm_src(SRC_H5, enabled=_A.rm_src, rank=RANK, comm=COMM)
 
 
 if __name__ == "__main__":

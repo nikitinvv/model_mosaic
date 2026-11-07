@@ -29,9 +29,15 @@ N_GPUS=${N_GPUS:-4}                          # total ranks (= total GPUs)
 # Physics knobs — kept in sync between step3 (forward Fresnel) and step7
 # (Paganin inversion).  DISTANCE is the sample→detector propagation
 # distance in metres (near-field regime).
-DISTANCE=${DISTANCE:-0.2}
+DISTANCE=${DISTANCE:-0.15}
 
 # Compute chunk sizes
+# FW (wavelet-FFT) ring removal in step5.  OFF (0) -- the simulated tiles
+# have no rings, and on real data the filter wants tuning against the
+# actual artefact rather than the vendored sym16/level-7 defaults.  Set
+# e.g. FW_SIGMA=2 to switch it on (needs pywt in the env).
+FW_SIGMA=${FW_SIGMA:-0}
+
 NZCHUNK=${NZCHUNK:-8}                        # z-slices per Radon call
 NPROPCHUNK=${NPROPCHUNK:-8}                  # angles per Fresnel batch
 
@@ -46,16 +52,23 @@ NTASKS=${NTASKS:-8}                          # parallel workers for read_{projs,
 # comes from these two numbers, so the layout scales with UPS instead of
 # being a fixed slice count:
 #
-#   MEM_BUDGET_GB   per-rank RAM for the output vchunk PLUS the input
-#                   prefetch slab -- sizes the super-chunk.
+#   MEM_BUDGET_GB   per-rank memory for the output vchunk PLUS the input
+#                   prefetch slab -- sizes the super-chunk.  Derived from
+#                   /dev/shm, NOT from node RAM: those buffers are
+#                   shared_memory.SharedMemory, i.e. files in the tmpfs at
+#                   /dev/shm, which Linux caps at half of RAM.  Overcommit
+#                   there is not an allocation error -- tmpfs pages come
+#                   lazily, so it surfaces much later as SIGBUS on first
+#                   touch (signal 7, rc=135) with no OOM message.
 #   CHUNK_MB        target size of one HDF5 chunk = the op size the
 #                   filesystem sees -- sizes the chunk.
 #
 # NZCHUNK / NPROPCHUNK above stay the *requested* compute batch; a step
 # bends its own down to a divisor of the planned super-chunk if the budget
 # forces a smaller one.
-NODE_GB=${NODE_GB:-512}
-MEM_BUDGET_GB=${MEM_BUDGET_GB:-$(python3 -c "print(f'{${NODE_GB} * 0.75 / ${N_GPUS}:.1f}')")}
+SHM_GB=${SHM_GB:-$(df -B1 --output=size /dev/shm | tail -1 |
+                   awk '{printf "%.1f", $1/1073741824}')}
+MEM_BUDGET_GB=${MEM_BUDGET_GB:-$(python3 -c "print(f'{${SHM_GB} * 0.85 / ${N_GPUS}:.1f}')")}
 CHUNK_MB=${CHUNK_MB:-64}
 
 # Optional --vchunks overrides per step ("C0 C1 C2" as a single string);
@@ -93,7 +106,7 @@ vcarg() { local val="$1"; [[ -n "$val" ]] && echo "--vchunks $val"; }
 LAYOUT=(--mem-budget "$MEM_BUDGET_GB" --chunk-bytes "$CHUNK_MB")
 
 echo "=== UPS=$UPS  PATH_DATA=$PATH_DATA  N_GPUS=$N_GPUS  NBANKS=$NBANKS  NTASKS=$NTASKS  DISTANCE=${DISTANCE}m ==="
-echo "=== layout: mem-budget=${MEM_BUDGET_GB} GiB/rank  chunk-bytes=${CHUNK_MB} MiB ==="
+echo "=== layout: mem-budget=${MEM_BUDGET_GB} GiB/rank  chunk-bytes=${CHUNK_MB} MiB  (/dev/shm=${SHM_GB} GiB, ${N_GPUS} ranks) ==="
 python -m iohdf5.layout --ups "$UPS" --nbanks "$NBANKS" --nranks "$N_GPUS" \
     --mem-budget "$MEM_BUDGET_GB" --chunk-bytes "$CHUNK_MB" || true
 
@@ -137,7 +150,7 @@ mpirun --quiet -n "$N_GPUS" \
 #    the ring removal always runs.
 mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
     python step5_correct.py --ups "$UPS" --path "$PATH_DATA" \
-        --nzchunk "$NZCHUNK"
+        --nzchunk "$NZCHUNK" --fw-sigma "$FW_SIGMA"
 
 # 6. mosaic_h5_pre/*.h5 → stitched.h5  (tent-weight blend, fold to 180°).
 mpirun --quiet -n "$N_GPUS" \
@@ -151,7 +164,15 @@ mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
         --nbanks "$NBANKS" --ntasks "$NTASKS" "${LAYOUT[@]}"
 # For UPS≥8 swap in step7_paganin_large.py (same flags).
 
-# 8. paganin.h5 → rec.h5   (filtered backprojection).
+# 7b. paganin.h5 → sino.h5   (θ-banked → z-banked, MPI all-to-all; no GPU).
+# Skippable at UPS=1, where the transposed read in step8 is still cheap --
+# step8 falls back to paganin.h5 when sino.h5 is absent.
+mpirun --quiet -n "$N_GPUS" \
+    python step7b_transpose.py --ups "$UPS" --path "$PATH_DATA" \
+        --nzchunk "$NZCHUNK" --nbanks "$NBANKS" --ntasks "$NTASKS" \
+        "${LAYOUT[@]}"
+
+# 8. sino.h5 → rec.h5   (filtered backprojection).
 mpirun --quiet -n "$N_GPUS" set_affinity_gpu.sh \
     python step8_fbp.py --ups "$UPS" --path "$PATH_DATA" \
         --nzchunk "$NZCHUNK" --nbanks "$NBANKS" --ntasks "$NTASKS" \

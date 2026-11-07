@@ -43,9 +43,13 @@ def _get_pool(nbanks: int):
         for k in list(os.environ):
             if k.startswith(_SCRUB_ENV_PREFIXES):
                 saved[k] = os.environ.pop(k)
+        # Mark the children: mpi_utils must not run MPI_Init in them, and
+        # multiprocessing.parent_process() cannot tell it (see mpi_utils).
+        os.environ["MOSAIC_POOL_WORKER"] = "1"
         try:
             p = _SPAWN_CTX.Pool(processes=int(nbanks))
         finally:
+            os.environ.pop("MOSAIC_POOL_WORKER", None)
             os.environ.update(saved)
         _POOLS[nbanks] = p
     return p
@@ -187,6 +191,17 @@ def tomo_info(filename):
         info["nx"] = nx
         info["dtype"] = dtype
         info["is_virtual"] = dset.is_virtual
+        if 'stype' not in dset.attrs:
+            # a plain (NT, NZ, N) file this layer did not write -- e.g. the
+            # stitched 360 deg input of step 7 -- read as one projection
+            # store; only the read path uses it, and reads go through h5py
+            info["nbanks_per_svchunk"] = 1
+            info["vchunks"] = (nproj, ny, nx)
+            info["shape"] = (nproj, ny, nx)
+            info["stype"] = "proj"
+            info["chunks"] = dset.chunks or (1, ny, nx)
+            _INFO_CACHE[filename] = info
+            return info
         info["nbanks_per_svchunk"] = dset.attrs['nbanks_per_svchunk']
         vchunks = (int(dset.attrs['vchunks_0']),
                    int(dset.attrs['vchunks_1']),
@@ -424,7 +439,106 @@ def tomo_initx(filename, shape, dtype, vchunks=None, mode='a', stype='proj',
 
     return {'banks_filename_path': banks_filename_path, 'banks_size': banks_size}
     
+def romio_info():
+    """MPI-IO hints for a shared h5 on NFS.  Data sieving does locked
+    read-modify-write cycles around non-contiguous writes; on NFS two ranks
+    doing that next to each other can clobber each other's bytes."""
+    from mpi4py import MPI
+    info = MPI.Info.Create()
+    info.Set("romio_ds_write", "disable")
+    info.Set("romio_ds_read", "disable")
+    return info
+
+
+def tomo_initx_single(filename, shape, dtype, vchunks=None, stype='proj',
+                      nbanks=1, chunks=None, comm=None):
+    """One plain h5 instead of a VDS master + bank files (parallel HDF5).
+
+    Collective over `comm`: every rank must call it.  The dataset has the
+    chunk shape tomo_initx would give a bank, every chunk allocated at
+    creation and never filled (otherwise HDF5 writes the whole file once
+    over MPI-IO before anyone can start), and the same attrs on it, so
+    tomo_info and the readers do not see a difference.  The file is closed
+    on return; open_out() reopens it collectively for the writes.
+    Needs h5py built against MPI and OpenMPI's ROMIO (`--mca io romio341`;
+    the default ompio segfaults in its collective write path).
+    """
+    nproj, ny, nx = shape
+    stype = 'proj' if stype.lower() in ('proj', 'projs') else 'slice'
+    vchunks = vchunks if vchunks is not None else (nproj, ny, nx)
+    sitems_idx = 0 if stype == 'proj' else 1
+    sitems_per_bank = (vchunks[sitems_idx] + nbanks - 1) // nbanks
+    if stype == 'proj':
+        nominal_bank = (sitems_per_bank, ny, nx)
+        default_chunks = (1,) + tuple(vchunks[1:])
+    else:
+        nominal_bank = (nproj, sitems_per_bank, nx)
+        default_chunks = (vchunks[0], 1, vchunks[2])
+    want = tuple(int(c) for c in chunks) if chunks is not None else default_chunks
+    ch = tuple(min(c, s, S) for c, s, S in zip(want, nominal_bank, shape))
+    cb = int(np.prod(ch)) * np.dtype(dtype).itemsize
+    if cb >= 2**32:
+        raise ValueError(f"chunk {ch} is {cb / 2**30:.2f} GiB, over HDF5's 4 GiB")
+    d = os.path.dirname(filename)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with h5py.File(filename, 'w', driver='mpio', comm=comm, info=romio_info(),
+                   libver='latest') as hf:
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_chunk(ch)
+        dcpl.set_alloc_time(h5py.h5d.ALLOC_TIME_EARLY)
+        dcpl.set_fill_time(h5py.h5d.FILL_TIME_NEVER)
+        g = hf.create_group('exchange')
+        dsid = h5py.h5d.create(g.id, b'data', h5py.h5t.py_create(np.dtype(dtype)),
+                               h5py.h5s.create_simple(tuple(shape)), dcpl=dcpl)
+        dset = h5py.Dataset(dsid)
+        for k, v in dict(nbanks_per_svchunk=nbanks, stype=stype,
+                         vchunks_0=vchunks[0], vchunks_1=vchunks[1],
+                         vchunks_2=vchunks[2], chunks_0=ch[0], chunks_1=ch[1],
+                         chunks_2=ch[2], single_file=1).items():
+            dset.attrs[k] = v
+    return {'single': True, 'path': filename, 'comm': comm}
+
+
+def write_region_single(dset, data, lo):
+    """Write `data` at offset `lo` of a single-file (parallel HDF5) dataset.
+
+    One write per HDF5 chunk, from a contiguous chunk-shaped copy: a region
+    whose memory order differs from the chunk's (sinogram chunks of a
+    theta-major buffer) otherwise goes through HDF5's 1 MB type-conversion
+    buffer as thousands of small MPI-IO writes (85 MB/s per rank measured,
+    against ~250 MB/s this way).  Independent I/O, so it may run in a helper
+    thread (MPI_THREAD_MULTIPLE) while the main thread computes.
+    """
+    hi = [min(lo[i] + data.shape[i], dset.shape[i]) for i in range(3)]
+    ch = dset.chunks
+    for c0 in range(lo[0] - lo[0] % ch[0], hi[0], ch[0]):
+        for c1 in range(lo[1] - lo[1] % ch[1], hi[1], ch[1]):
+            for c2 in range(lo[2] - lo[2] % ch[2], hi[2], ch[2]):
+                a = [max(c0, lo[0]), max(c1, lo[1]), max(c2, lo[2])]
+                b = [min(c0 + ch[0], hi[0]), min(c1 + ch[1], hi[1]),
+                     min(c2 + ch[2], hi[2])]
+                src = np.ascontiguousarray(
+                    data[a[0] - lo[0]:b[0] - lo[0], a[1] - lo[1]:b[1] - lo[1],
+                         a[2] - lo[2]:b[2] - lo[2]])
+                dset.write_direct(src, dest_sel=np.s_[a[0]:b[0], a[1]:b[1],
+                                                      a[2]:b[2]])
+
+
 def tomo_writex(filename, data, shm=None, ivchunk=(0,0,0), ctx=None):
+
+    if ctx is not None and ctx.get('single'):
+        # one shared h5 (parallel HDF5): this rank writes its own vchunk
+        # region straight into it, independent I/O on the collective handle
+        if 'dset' not in ctx:
+            raise RuntimeError("single-file output: call open_out(ctx) first")
+        dset = ctx['dset']
+        vch = ctx.get('vch')
+        if vch is None:
+            vch = ctx['vch'] = tuple(int(dset.attrs[f'vchunks_{i}']) for i in range(3))
+        lo = [ivchunk[i] * vch[i] for i in range(3)]
+        write_region_single(dset, data, lo)
+        return
 
     info = tomo_info(filename)
 
@@ -726,6 +840,52 @@ def read_projs_vchunkx(filename, shm, ntasks, vchunksx, ivchunkx,
     pool = _get_pool(ntasks)
     pool.map(partial(_process_read_box, filename=filename,
                      vchunksx=vchunksx, dtype=dtp, shm=shm), task_meta)
+    return data
+
+
+def read_boxx(filename, shm, ntasks, box, shard_axis=None):
+    """Read an arbitrary (theta, z, x) sub-box into an shm buffer, in parallel.
+
+    `box` is ((t0, t1), (z0, z1), (x0, x1)); the shm buffer is exactly that
+    shape.  read_projs_vchunkx and read_slices_vchunkx each offset along a
+    single axis -- one takes a theta slab of every z, the other a z slab of
+    every theta -- but step7b_transpose reads a theta sub-slab of a z
+    sub-block (that 2-D box is the whole point of the all-to-all: it is what
+    lets the z extent of one read be nranks times taller than the z extent
+    one rank finally owns).
+
+    Workers are sharded along `shard_axis` (default: the file's bank axis)
+    and aligned to that axis's HDF5 chunk extent, so each stays inside its
+    own bank files and never straddles a chunk.
+
+    Returns a numpy view of the shm buffer.
+    """
+    info = tomo_info(filename)
+    shape, dtp = info['shape'], info['dtype']
+    (t0, t1), (z0, z1), (x0, x1) = box
+    t1, z1, x1 = min(t1, shape[0]), min(z1, shape[1]), min(x1, shape[2])
+    out_shape = (t1 - t0, z1 - z0, x1 - x0)
+    data = np.ndarray(shape=out_shape, dtype=dtp, buffer=shm.buf)
+
+    if shard_axis is None:
+        shard_axis = _bank_axis(filename)
+        shard_axis = 0 if shard_axis is None else shard_axis
+
+    lo, hi = (t0, t1) if shard_axis == 0 else (z0, z1)
+    task_meta = []
+    for itask, s0, s1 in _split(lo, hi, ntasks,
+                                align=_chunk_extent(info, shard_axis)):
+        if shard_axis == 0:
+            src = ((s0, s1), (z0, z1), (x0, x1))
+            dst = (s0 - t0, 0, 0)
+        else:
+            src = ((t0, t1), (s0, s1), (x0, x1))
+            dst = (0, s0 - z0, 0)
+        task_meta.append({'itask': itask, 'src': src, 'dst': dst})
+
+    pool = _get_pool(ntasks)
+    pool.map(partial(_process_read_box, filename=filename,
+                     vchunksx=out_shape, dtype=dtp, shm=shm), task_meta)
     return data
 
 

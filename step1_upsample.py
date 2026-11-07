@@ -38,6 +38,7 @@ from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     describe_input, describe_output,
     vchunk_bytes,
+    rm_src, add_rm_src_arg,
 )
 from iohdf5.layout import add_layout_args, resolve_step
 from mpi_utils import COMM, RANK, SIZE, barrier, rprint, report_stage
@@ -69,6 +70,7 @@ def _parse_args() -> argparse.Namespace:
                         "multiple of UPS avoids re-reading input planes at "
                         "the vchunk seams, but is not required")
     add_layout_args(p)
+    add_rm_src_arg(p, "init.h5 -- the ONE irreplaceable input, so off by default and rarely what you want")
     return p.parse_args()
 
 
@@ -281,6 +283,9 @@ def main() -> None:
     report_stage("step1 read (init)",  b_read,  t_read)
     report_stage("step1 write (big)",  b_write, t_write)
     rprint("upsample done.")
+
+    rm_src(SRC_H5, enabled=_A.rm_src,
+           rank=RANK, comm=COMM)
 
 
 if __name__ == "__main__":

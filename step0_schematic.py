@@ -1,19 +1,20 @@
 #!/usr/bin/env python
 """Mosaic scan schematic for the experimental setup.
 
-Physical dimensions stay constant across --ups; only the voxel-count
-representation of the pipeline changes.  At UPS=1 (init/prototype) the
-schematic reports coarse voxel counts (detector 404×303, sample 2720×2720)
-at 11.04 µm/voxel.  At UPS=8 (full real experiment) it reports the real
-counts (detector 3232×2426, sample 21760×21760) at 1.38 µm/voxel.
+The detector is fixed at 3072 x 3072 px @ 6.5/9 = 0.7222 µm (2.22 x 2.22 mm
+FOV) and the reconstruction voxel equals the detector pixel, for every --ups.
+What --ups scales is the SAMPLE: its extent grows by UPS, so a bigger sample
+needs more x-tiles, more z-positions and proportionally more angles.  The
+⌀32 mm sample of the real experiment lands at UPS=16 with this pixel.
 
-Sample cylinder ~28.67 × 27.55 mm tall (real physical size), rotating
-about the vertical axis.  Reconstruction voxel = detector pixel.
-Angles-per-scan follows NTHETA = 3·N/4 (matches step2_model_*.py).
+Sample cylinder rotates about the vertical axis.
+Angles-per-scan follows the pipeline grid PIPELINE_N = 3072·UPS
+(N_HALF = 3·N/4 over 180°, NTHETA = 2·N_HALF over 360°), so each doubling
+of UPS doubles the angle count.
 
 360-deg extended-FOV mosaic:
   - rotation axis fixed at horizontal centre
-  - tile 0 has the rotation axis AXIS_INSET (=200) px INSIDE its left border
+  - tile 0 has the rotation axis AXIS_INSET (=400) px INSIDE its left border
     (tile + its 180-deg mirror overlap by 2*AXIS_INSET, giving a clean
     central disk in virtual radial coverage)
   - tiles 1..N are shifted in +x by (DET_W - OVERLAP) each => concentric
@@ -40,8 +41,9 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ups",  type=int, default=1,
                    help="pipeline upsample factor (matches step1_upsample --ups). "
-                        "1 = init/prototype (small dims, coarse voxel); "
-                        "8 = full real experiment (3232×2426 detector, 1.4 µm voxel).")
+                        "The detector (3072×3072 @ 0.7222 µm) and the voxel are "
+                        "fixed; UPS scales the SAMPLE, hence the tile count. "
+                        "Need not be a power of two: 12 is a valid size.")
     p.add_argument("--path", default="/data2/brain_sym_mosaic",
                    help="base directory (positions txt is written here)")
     return p.parse_args()
@@ -52,52 +54,59 @@ UPS  = _A.ups
 BASE = _A.path
 
 # --- physical geometry (source of truth) --------------------------------
-# The detector is 3232 × 2426 physical pixels at 1.38 µm/px.  At the
-# REFERENCE UPS=8 the pipeline voxel matches the detector pixel: 1.38 µm.
+# The detector is FIXED at 3072 × 3072 px, 6.5 µm scintillator pixel imaged
+# through 9× optics => 0.7222 µm/px, a 2.219 × 2.219 mm FOV.  The pipeline
+# voxel equals the detector pixel, for EVERY UPS -- there is no REF_UPS
+# scaling any more.
 # step00 crops the source TIFF to 2560^3 and upsamples to init.h5 (3072^3);
 # step1 further upsamples voxel-wise by UPS to big{UPS}x = (3072·UPS)^3.
-#     pipeline voxel(UPS) = 1.38·8/UPS  µm
-#     pipeline dataset    = (3072·UPS)^3 voxels, physical extent
-#                         = 3072·UPS · 1.38·8/UPS µm = 33.92 mm  (constant)
+#     pipeline voxel     = 0.7222 µm            (constant)
+#     pipeline dataset   = (3072·UPS)^3 voxels, physical extent
+#                        = 3072·UPS · 0.7222 µm = 2.219·UPS mm  (grows)
 # Sample = cylinder of ≈0.95·N diameter with ~50 air voxels at each end
 # of z (both boundaries have a cosine taper for smooth transition to air):
-#     SAMPLE_D_PX = 2918·UPS  (0.95·3072 = 2918.4, ≈ 32.2 mm at UPS=1)
-#     SAMPLE_H_PX = 2972·UPS  (3072 − 2·50 = 2972, ≈ 32.8 mm at UPS=1)
-DETECTOR_W_PX          = 3232            # physical detector, px
-DETECTOR_H_PX          = 2426
-DETECTOR_PIXEL_UM_REF  = 1.38            # detector pixel size at REF_UPS
-REF_UPS                = 8               # UPS at which voxel == detector pixel
-OVERLAP_PX_REF         = 200             # x-tile overlap at REF_UPS
-AXIS_INSET_PX_REF      = 200             # rotation axis inset at REF_UPS
-Z_OVERLAP_PX_REF       = 200             # z-tile overlap at REF_UPS
+#     SAMPLE_D_PX = 2918·UPS  (0.95·3072 = 2918.4, ≈ 2.11 mm at UPS=1)
+#     SAMPLE_H_PX = 2972·UPS  (3072 − 2·50 = 2972, ≈ 2.15 mm at UPS=1)
+# What --ups scales is the SAMPLE: its px extent grows by UPS, so a bigger
+# sample needs more x-tiles and more z-positions to cover, and proportionally
+# more angles.  The ⌀32 mm sample of the real experiment is UPS=16 here.
+DETECTOR_W_PX          = 3072            # physical detector, px  (fixed)
+DETECTOR_H_PX          = 3072            #                        (fixed)
+DETECTOR_PIXEL_UM      = 6.5 / 9         # 6.5 µm pixel / 9× optics (fixed)
 
-PIXEL_UM     = DETECTOR_PIXEL_UM_REF * REF_UPS / UPS   # pipeline voxel µm
+PIXEL_UM     = DETECTOR_PIXEL_UM                       # pipeline voxel µm
 VOXEL_UM     = PIXEL_UM
-DET_W        = DETECTOR_W_PX     * UPS // REF_UPS
-DET_H        = DETECTOR_H_PX     * UPS // REF_UPS
-OVERLAP      = OVERLAP_PX_REF    * UPS // REF_UPS
-AXIS_INSET   = AXIS_INSET_PX_REF * UPS // REF_UPS
-Z_OVERLAP    = Z_OVERLAP_PX_REF  * UPS // REF_UPS
+DET_W        = DETECTOR_W_PX             # detector px, independent of UPS
+DET_H        = DETECTOR_H_PX
+OVERLAP      = 400                       # x-tile overlap, det px (289 µm)
+AXIS_INSET   = 400                       # rotation-axis inset, det px
+Z_OVERLAP    = 400                       # z-tile overlap, det px
 
-# Sample cylinder centered in the (3072·UPS)^3 dataset (33.92 mm cube).
+# Sample cylinder centered in the (3072·UPS)^3 dataset (2.219·UPS mm cube).
 #   diameter: 0.95·3072 = 2918.4 → 2918·UPS voxels (mask in step00 uses
 #             CROP-grid --circle-diam=2432, which after 2560→3072 upsample
 #             gives 2432·(3072/2560) = 2918.4 pipeline voxels)
 #   height:   3072 − 2·50 = 2972·UPS voxels (step00 --z-pad=42 in CROP
 #             grid → ~50 in OUT grid → 2971 sample voxels in init.h5)
+# PIPELINE_N is the grid EVERY other step assumes (iohdf5.layout, step4's
+# positions-header guard, step6's stitch canvas).  It must stay 3072·UPS.
+PIPELINE_N    = 3072 * UPS
 SAMPLE_D_PX   = 2918 * UPS
 SAMPLE_H_PX   = 2972 * UPS
-SAMPLE_D_MM   = SAMPLE_D_PX * VOXEL_UM * 1e-3          # ≈ 32.2 mm
-SAMPLE_H_MM   = SAMPLE_H_PX * VOXEL_UM * 1e-3          # ≈ 32.8 mm
+SAMPLE_D_MM   = SAMPLE_D_PX * VOXEL_UM * 1e-3          # ≈ 16.9 mm at UPS=8
+SAMPLE_H_MM   = SAMPLE_H_PX * VOXEL_UM * 1e-3          # ≈ 17.2 mm at UPS=8
 
 # Angle counts.  Tomography (step2/step3) samples 180° with N_HALF = 3·N/4
 # angles (Nyquist-scaled).  step4 fabricates a 360° tile-scan from
 # data.h5's mirror crop, so each tile file carries NTHETA = 2·N_HALF =
 # 3·N/2 frames over the full 360°.
-_N_PIPELINE       = 3072 * UPS
-N_HALF            = 3 * _N_PIPELINE // 4
+# N_HALF follows the pipeline grid PIPELINE_N (= 3072·UPS), so each doubling
+# of the sample extent doubles the angles needed to keep the 180° sampling at
+# Nyquist.
+N_HALF            = 3 * PIPELINE_N // 4
 NTHETA            = 2 * N_HALF
 MAX_DRAWN_SPOKES  = 64
+FPS               = 70.0     # detector frame rate, frames/s
 ANG_MAX           = 360
 
 
@@ -278,12 +287,24 @@ def main() -> None:
           f"= {int(2*virt_R)} px "
           f"({'OK' if 2*virt_R >= 2*sample_r_px else 'INSUFFICIENT'})")
     # Reconstruction voxel = detector pixel (upsample_big.py runs UPS=1).
+    # Reconstruct on the pipeline grid PIPELINE_N (24576 at UPS=8) rather
+    # than on the exact virtual FOV: it contains the FOV and is FFT-friendly
+    # (3072·UPS = 2^10·3·UPS), which 2·virt_R is not.
+    # The grid must contain the SAMPLE; the tiles' virtual reach may exceed it
+    # (at low UPS tile 0 alone already overshoots the small sample), and that
+    # surplus is simply not reconstructed.
     rec_ratio = VOXEL_UM / PIXEL_UM
-    rec_nx = int(round(2 * virt_R / rec_ratio))
+    rec_fov   = int(round(2 * virt_R / rec_ratio))     # tiles reach this far
+    rec_req   = int(round(2 * sample_r_px / rec_ratio))  # must cover this
+    rec_nx    = PIPELINE_N
+    if rec_nx < rec_req:
+        raise ValueError(f"pipeline grid {rec_nx} < sample ⌀ {rec_req} px")
     rec_nz = int(round(sample_h_px / rec_ratio))
     print(f"REC volume      : {rec_nx} x {rec_nx} x {rec_nz} voxels "
           f"@ {VOXEL_UM} µm  "
-          f"(nx mod 8 = {rec_nx%8}, nz mod 8 = {rec_nz%8})")
+          f"(pipeline grid; sample ⌀{rec_req} px + "
+          f"{(rec_nx - rec_req)//2} px pad each side; tiles reach {rec_fov} px"
+          + (", clipped)" if rec_fov > rec_nx else ")"))
     print(f"                : {rec_nx*rec_nx*rec_nz:.3e} voxels "
           f"= {rec_nx*rec_nx*rec_nz*4/1e12:.2f} TB (float32)")
     print(f"z stacks        : {n_z} (step {px_to_mm(DET_H-Z_OVERLAP):.3f} mm, "
@@ -293,6 +314,10 @@ def main() -> None:
     print(f"z origins  (mm) : {[f'{px_to_mm(z):+.3f}' for z in z_positions]}")
     print(f"angles          : {NTHETA} over {ANG_MAX}°")
     print(f"TOTAL PROJ.     : {NTHETA} × {n_tiles} × {n_z} = {total_proj}")
+    scan_s = total_proj / FPS
+    print(f"SCAN TIME       : {total_proj}/{FPS:.0f} fps = {scan_s:.0f} s "
+          f"= {scan_s/3600:.2f} h  (frame time only, no motor/flat overhead)")
+    print(f"RAW DATA        : {total_proj*DET_W*DET_H*2/1e12:.1f} TB (uint16)")
 
     # Outputs split by file type: positions text file lives in
     # mosaic_modeling/mosaic_positions/ (a single-purpose folder shared with
@@ -308,7 +333,7 @@ def main() -> None:
     positions_path = os.path.join(_POS_DIR, f"mosaic_positions{UPS}.txt")
     # Big-projection dims match step2/step3 (--in-nz/--in-n default 3072 · UPS).
     # z_pad = (NZ - SAMPLE_H_PX)/2 matches step4's derivation of the same offset.
-    _NZ = _N = 3072 * UPS
+    _NZ = _N = PIPELINE_N
     _z_pad = (_NZ - SAMPLE_H_PX) // 2
     placements = compute_tile_placements(_NZ, _N,
                                          det_h=DET_H, det_w=DET_W,
@@ -320,7 +345,8 @@ def main() -> None:
                          placements=placements)
 
     # ============ figure ============
-    fig, (axL, axM, axR) = plt.subplots(1, 3, figsize=(20, 8),
+    plt.rcParams.update({"font.size": 2 * 10.0})   # 2x the matplotlib default
+    fig, (axL, axM, axR) = plt.subplots(1, 3, figsize=(34, 14.0),
                                          gridspec_kw={"width_ratios": [1.3, 0.55, 1.0]})
 
     tile_colors = ["tab:blue", "tab:orange", "tab:green", "tab:purple",
@@ -337,14 +363,14 @@ def main() -> None:
     axL.set_ylim(y_lim, -y_lim)
     axL.set_xlabel("x [mm]  (relative to rotation axis)")
     axL.set_ylabel("y [mm]")
-    axL.set_title(
+    header_txt = (
         f"360° extended-FOV mosaic — {n_tiles} x-tiles × {n_z} z-stacks × {NTHETA} angles\n"
         f"detector {DET_W}×{DET_H} px @ {PIXEL_UM} µm  |  "
         f"voxel = det.pixel = {VOXEL_UM} µm  |  "
         f"overlap {OVERLAP} px = {px_to_mm(OVERLAP)*1e3:.0f} µm\n"
         f"solid = direct placement (angles [0°,180°));  "
-        f"dashed = mirror placement (angles [180°,360°) via h-flip)"
-    )
+        f"dashed = mirror placement (angles [180°,360°) via h-flip)")
+    axL.set_title("physical view — x–y slice at mid-z")
 
     # Full sample cross-section (cylinder → circle in xy plane)
     axL.add_patch(Circle((0, 0), SAMPLE_D_MM / 2,
@@ -352,7 +378,7 @@ def main() -> None:
                          edgecolor="tab:red", lw=1.8))
     axL.text(0, SAMPLE_D_MM / 2 + 0.4,
              f"sample cylinder ⌀{SAMPLE_D_MM:.2f} mm",
-             ha="center", color="tab:red", fontsize=10)
+             ha="center", color="tab:red", fontsize=20)
 
     # Detector tiles at mid-z, drawn as thin horizontal bars because
     # DET_H (3.4 mm) is much smaller than sample height/diameter.
@@ -369,7 +395,7 @@ def main() -> None:
                                 facecolor=col, alpha=0.35,
                                 edgecolor=col, lw=1.4))
         axL.text(x0_mm + w_mm / 2, y_tile_mm + tile_h_mm / 2, f"{i}",
-                 ha="center", va="center", fontsize=16, color=col,
+                 ha="center", va="center", fontsize=32, color=col,
                  fontweight="bold")
         # Mirror placement (dashed outline, no fill) at the reflection
         # of the direct footprint across the rotation axis.
@@ -378,7 +404,7 @@ def main() -> None:
                                 facecolor="none",
                                 edgecolor=col, lw=1.2, linestyle="--"))
         axL.text(mx0_mm + w_mm / 2, y_tile_mm + tile_h_mm / 2, f"{i}'",
-                 ha="center", va="center", fontsize=13, color=col,
+                 ha="center", va="center", fontsize=26, color=col,
                  fontweight="bold", alpha=0.85)
 
     # Overlap bands (physical x-overlap) — direct side only; the mirror
@@ -399,7 +425,7 @@ def main() -> None:
         f"inside tile 0's left border",
         xy=(0, y_tile_mm),
         xytext=(-SAMPLE_D_MM / 2 + 2, y_tile_mm - 4),
-        ha="left", fontsize=9,
+        ha="left", fontsize=18,
         arrowprops=dict(arrowstyle="->", color="0.3", lw=1))
 
     # x-shift arrows: one per shift, labelled in mm, positioned BELOW tiles
@@ -409,9 +435,10 @@ def main() -> None:
         x_to   = px_to_mm(origins[i+1]) + px_to_mm(DET_W) / 2
         axL.annotate("", xy=(x_to, y_arrow), xytext=(x_from, y_arrow),
                      arrowprops=dict(arrowstyle="->", color="0.25", lw=1.2))
-        axL.text((x_from + x_to) / 2, y_arrow + 0.5,
-                 f"{step_mm:.2f} mm", ha="center", va="top",
-                 color="0.25", fontsize=9)
+        if i == n_tiles // 2 - 1:      # label the uniform step once
+            axL.text((x_from + x_to) / 2, y_arrow + 0.5,
+                     f"x-step {step_mm:.2f} mm", ha="center", va="top",
+                     color="0.25", fontsize=18)
 
     # Tile-origin ticks in mm above the tiles
     for x0 in origins:
@@ -419,7 +446,7 @@ def main() -> None:
         axL.plot([x0_mm, x0_mm], [y_tile_mm - 0.15, y_tile_mm - 0.6],
                  color="0.4", lw=0.8)
         axL.text(x0_mm, y_tile_mm - 0.7, f"{x0_mm:+.2f}",
-                 ha="center", va="bottom", fontsize=8, color="0.35")
+                 ha="center", va="bottom", fontsize=18, color="0.35")
 
     # Virtual FOV bracket
     y_br = -y_lim + 1.0
@@ -428,7 +455,7 @@ def main() -> None:
                  arrowprops=dict(arrowstyle="<->", color="tab:red", lw=1.6))
     axL.text(0, y_br + 0.6,
              f"virtual FOV via 360° = {px_to_mm(2*virt_R):.2f} mm",
-             ha="center", color="tab:red", fontsize=10)
+             ha="center", color="tab:red", fontsize=20)
 
     # --------- MIDDLE: vertical z-scan (side view, mm) ----------
     axM.set_aspect("equal")
@@ -445,11 +472,10 @@ def main() -> None:
     axM.set_xlabel("x [mm]")
     axM.set_ylabel("z [mm]  (vertical)")
     axM.set_title(
-        f"z-mosaic (side view) — {n_z} vertical positions\n"
-        f"detector {det_h_mm:.2f} mm tall, uniform z-overlap {Z_OVERLAP} px "
+        f"z-mosaic (side view) — {n_z} z-positions\n"
+        f"detector {det_h_mm:.2f} mm tall, z-overlap {Z_OVERLAP} px "
         f"= {px_to_mm(Z_OVERLAP)*1e3:.0f} µm\n"
-        f"symmetric overshoot {z_overshoot:.0f} px "
-        f"= {overshoot_mm*1e3:.0f} µm at z0 and z{n_z-1}"
+        f"overshoot ±{overshoot_mm*1e3:.0f} µm at z0 / z{n_z-1}"
     )
 
     # Sample cylinder projected on xz plane (rectangle SAMPLE_D_MM × SAMPLE_H_MM)
@@ -458,7 +484,7 @@ def main() -> None:
                              facecolor="tab:red", alpha=0.08,
                              edgecolor="tab:red", lw=1.6))
     axM.text(0, -0.6, f"sample cylinder ⌀{SAMPLE_D_MM:.2f} × {SAMPLE_H_MM:.2f} mm",
-             ha="center", color="tab:red", fontsize=9)
+             ha="center", color="tab:red", fontsize=18)
 
     # Rotation axis
     axM.axvline(0, color="black", lw=1.2)
@@ -472,7 +498,7 @@ def main() -> None:
                                 facecolor=zcolors[i], alpha=0.55,
                                 edgecolor=zcolors[i], lw=1.0))
         axM.text(x0_mm + det_w_mm / 2, z0_mm + det_h_mm / 2, f"z{i}",
-                 ha="center", va="center", fontsize=9, color="white",
+                 ha="center", va="center", fontsize=18, color="white",
                  fontweight="bold")
 
     # z-overlap bands
@@ -489,17 +515,20 @@ def main() -> None:
         z_to   = px_to_mm(z_positions[i + 1] + DET_H / 2)
         axM.annotate("", xy=(x_arrow, z_to), xytext=(x_arrow, z_from),
                      arrowprops=dict(arrowstyle="->", color="0.3", lw=1.0))
-    # single mm label (uniform step, except last which is clamped)
-    axM.text(x_arrow + 0.3,
-             (px_to_mm(z_positions[0] + DET_H / 2) +
-              px_to_mm(z_positions[1] + DET_H / 2)) / 2,
-             f"z-shift {z_step_mm:.2f} mm\n({DET_H - Z_OVERLAP} px)",
-             ha="left", va="center", color="0.3", fontsize=8)
+    # single mm label (uniform step, except last which is clamped).  With a
+    # 3072-px detector the UPS=1 sample fits one z-position, so there is no
+    # shift to label -- and no z_positions[1] to place it between.
+    if n_z > 1:
+        axM.text(x_arrow + 0.3,
+                 (px_to_mm(z_positions[0] + DET_H / 2) +
+                  px_to_mm(z_positions[1] + DET_H / 2)) / 2,
+                 f"z-shift {z_step_mm:.2f} mm\n({DET_H - Z_OVERLAP} px)",
+                 ha="left", va="center", color="0.3", fontsize=18)
 
     # Note about x-mosaic repetition per z
     axM.text(z_x_lo + 0.3, z_z_hi - 0.5,
              f"× {n_tiles} x-tiles\nper z-position",
-             ha="left", va="bottom", color="0.35", fontsize=9,
+             ha="left", va="bottom", color="0.35", fontsize=18,
              bbox=dict(boxstyle="round", facecolor="white",
                        edgecolor="0.7", pad=0.3))
 
@@ -519,8 +548,8 @@ def main() -> None:
                   facecolor=col, alpha=0.30, edgecolor=col, lw=1.0)
         axR.add_patch(w)
         r_mid = px_to_mm((ri + ro) / 2)
-        axR.text(r_mid, -0.4, f"{i}", ha="center", va="top",
-                 color=col, fontsize=13, fontweight="bold")
+        axR.text(r_mid, 0.4, f"{i}", ha="center", va="bottom",
+                 color=col, fontsize=26, fontweight="bold")
 
     # Sample cylinder cross-section
     axR.add_patch(Circle((0, 0), SAMPLE_D_MM / 2,
@@ -549,7 +578,7 @@ def main() -> None:
     axR.text(0, arc_r + 0.5,
              f"{ANG_MAX}° / {NTHETA} angles"
              + (f" ({n_drawn} drawn)" if n_drawn < NTHETA else ""),
-             ha="center", fontsize=10)
+             ha="center", fontsize=20)
 
     axR.plot(0, 0, "+", color="black", ms=16, mew=2.4)
 
@@ -569,13 +598,19 @@ def main() -> None:
            f"virtual FOV  : {px_to_mm(2*virt_R):.2f} mm\n"
            f"recon volume : {rec_nx}×{rec_nx}×{rec_nz} vx @ {VOXEL_UM} µm\n"
            f"             = {rec_nx*rec_nx*rec_nz*4/1e12:.2f} TB f32\n"
-           f"total proj.  : {NTHETA}×{n_tiles}×{n_z} = {total_proj}")
+           f"total proj.  : {NTHETA}×{n_tiles}×{n_z} = {total_proj}\n"
+           f"scan time    : {total_proj/FPS/3600:.2f} h @ {FPS:.0f} fps")
     axR.text(-lim_mm * 0.98, -lim_mm * 0.98, txt, family="monospace",
-             fontsize=9, va="bottom", ha="left",
+             fontsize=18, va="bottom", ha="left",
              bbox=dict(boxstyle="round", facecolor="white",
                        edgecolor="0.7", pad=0.4))
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.915])
+    fig.canvas.draw()
+    _r = fig.canvas.get_renderer()
+    _top = max(a.get_tightbbox(_r).y1 for a in (axL, axM, axR))
+    fig.suptitle(header_txt, va="bottom",
+                 y=_top / fig.bbox.height + 0.006)
     out_png = os.path.join(_DRAW_DIR, f"mosaic_schematic{UPS}.png")
     plt.savefig(out_png, dpi=150, bbox_inches="tight")
     print(f"saved {out_png}")
