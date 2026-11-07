@@ -31,14 +31,29 @@ across that node's CPUs).
 Uses helpers from ./dxchange_hdf5_chunks.py (vendored from doe-maxiv)
 and ./utils.py (MPI wiring).
 
+Every super-chunk and HDF5 chunk shape comes from iohdf5/layout.py — the
+same byte-budget policy the pipeline steps use — so the two knobs that
+actually decide the layout are --mem-budget (GiB/rank) and --chunk-bytes
+(MiB).  The six --*-vchunks flags remain as per-dataset overrides.
+
+At UPS >= 8 the full volumes are 54 TB (big) to 3.4 PB (rec at UPS=32),
+which no test filesystem holds and which would make rank 0 create ~10^5
+empty bank files per dataset before a single byte moves.  --max-vchunks
+truncates every dataset along its banked axis to that many super-chunks,
+leaving the planned vchunk / chunk / nbanks shapes — the things being
+measured — exactly as they are at full size.
+
 Example:
-    mpiexec -n 10 --ppn 1 python test_h5_buffer_io.py \\
-        --path /eagle/APS_IRI/vnikitin/iotest_buf_ups2 \\
-        --ups 2 --nbanks 8 --ntasks 8 \\
-        --init-vchunks 32 3072 3072 \\
-        --big-vchunks  32 5488 5488 \\
-        --proj-vchunks 128 32 5488 \\
-        --data-vchunks 128 5120 5488
+    # UPS=1: whole volume, sweep the chunk size
+    mpiexec -n 8 --ppn 4 python -m tests.test_h5_buffer_io \\
+        --path /eagle/APS_IRI/vnikitin/iotest_buf_ups1 \\
+        --ups 1 --nbanks 4 --ntasks 4 --chunk-bytes 64 --mem-budget 96
+
+    # UPS=16: real chunk shapes, 8 super-chunks per dataset
+    mpiexec -n 8 --ppn 4 python -m tests.test_h5_buffer_io \\
+        --path /eagle/APS_IRI/vnikitin/iotest_buf_ups16 \\
+        --ups 16 --nbanks 4 --ntasks 4 --chunk-bytes 64 --mem-budget 96 \\
+        --max-vchunks 8
 """
 from __future__ import annotations
 
@@ -51,6 +66,7 @@ import h5py
 import numpy as np
 from multiprocessing import shared_memory
 
+from iohdf5.layout import add_layout_args, plan_pipeline, describe_plan
 from iohdf5.dxchange_hdf5_chunks import (
     tomo_initx, tomo_readx, tomo_writex,
     read_projs_vchunkx, read_slices_vchunkx,
@@ -127,6 +143,22 @@ def _alloc_shm(shape, dtype):
     return shm, buf
 
 
+def _fill_random(buf, rng):
+    """Fill a super-chunk buffer in place, one axis-0 slab at a time.
+
+    `rng.random(buf.shape)` would materialise a second array the size of
+    the buffer before the copy — 40 GiB for a proj super-chunk at UPS=8,
+    which is exactly the duplicate that makes 4 ranks/node overrun a
+    512 GB node.  Random content matters (it defeats any dedup/compress
+    heuristic that would flatter the bandwidth number), the *pattern*
+    does not, so generate it a slab at a time straight into the buffer.
+    """
+    slab = max(1, (64 * 2 ** 20) // max(1, buf[0].nbytes))
+    for z0 in range(0, buf.shape[0], slab):
+        z1 = min(z0 + slab, buf.shape[0])
+        buf[z0:z1] = rng.random((z1 - z0,) + buf.shape[1:], dtype=np.float32)
+
+
 def _free_shm(shm):
     try:
         shm.close()
@@ -154,6 +186,21 @@ def _parse_args():
     p.add_argument("--nzchunk", type=int, default=8,
                    help="inner z-slab (== step8_fbp --nzchunk); drives fbp "
                         "per-iteration sinogram read size")
+    p.add_argument("--max-vchunks", type=int, default=0,
+                   help="write at most this many super-chunks per dataset "
+                        "(0 = the whole volume).  Truncates each dataset "
+                        "along its BANKED axis only, so the vchunk / chunk / "
+                        "nbanks shapes -- what this benchmark measures -- are "
+                        "the full-size ones.  Needed from UPS=8 on: rec.h5 is "
+                        "54 TB at UPS=8 and 3.4 PB at UPS=32, and rank 0 "
+                        "would create ~1e5 empty bank files per dataset "
+                        "before any I/O happens.  Make it a multiple of the "
+                        "rank count so no rank idles.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the planned layout, the bytes each stage will "
+                        "write and the bank-file count, then exit without "
+                        "touching the filesystem.  Use it to size a run "
+                        "(and a --max-vchunks) before spending a job on it.")
     p.add_argument("--init-vchunks", type=int, nargs=3, default=None,
                    metavar=("C0","C1","C2"),
                    help="super-chunk for init.h5 (default fits ~ nbanks planes)")
@@ -183,6 +230,7 @@ def _parse_args():
                         "chunk sequential op per bank file.  Set 1 for the "
                         "pure-sinogram extreme (one HDF5 op per z row per "
                         "bank — latency-bound on Lustre) to A/B it.")
+    add_layout_args(p)
     return p.parse_args()
 
 
@@ -207,12 +255,69 @@ def main() -> None:
     pgn_shape  = (N_HALF, OUT_NZ, N     )
     rec_shape  = (OUT_NZ, N,      N     )
 
-    init_vc = tuple(args.init_vchunks) if args.init_vchunks else (args.nbanks, IN_NYX, IN_NYX)
-    big_vc  = tuple(args.big_vchunks)  if args.big_vchunks  else (args.nbanks, N,      N     )
-    proj_vc = tuple(args.proj_vchunks) if args.proj_vchunks else (args.nbanks, OUT_NZ, N     )
-    data_vc = tuple(args.data_vchunks) if args.data_vchunks else (args.nbanks, OUT_NZ, N     )
-    pgn_vc  = tuple(args.pgn_vchunks)  if args.pgn_vchunks  else (args.nbanks, OUT_NZ, N     )
-    rec_vc  = tuple(args.rec_vchunks)  if args.rec_vchunks  else (args.nbanks, N,      N     )
+    # Defaults come from the shared byte-budget policy, so this harness
+    # measures the layout the steps will actually write.  A flat `nbanks`
+    # planes per super-chunk is 288 MB at UPS=1 but 1.2 TB at UPS=32, and
+    # the (1, ny, nx) chunk tomo_initx defaults to is past HDF5's 4 GiB
+    # limit from UPS=16 on -- neither survives the sweep this script exists
+    # to run.  Every --*-vchunks flag still overrides its dataset.
+    #
+    # NOTE the harness banks proj.h5 on θ (stype='proj'), unlike step2
+    # which banks it on z, so it takes the `data` plan for both: same
+    # shape, same banked axis, same chunk.
+    plans = plan_pipeline(UPS, in_nz=IN_NZ, in_nyx=IN_NYX, ntheta=NTHETA,
+                          nbanks=args.nbanks,
+                          budget=int(args.mem_budget * 2 ** 30),
+                          chunk_bytes=int(args.chunk_bytes * 2 ** 20),
+                          nzchunk=args.nzchunk, nranks=SIZE)
+    if RANK == 0:
+        print(f"[layout] budget={args.mem_budget} GiB/rank  "
+              f"chunk~{args.chunk_bytes} MiB  ranks={SIZE}", flush=True)
+        describe_plan(plans)
+
+    def _pick(flag, plan):
+        """CLI override, else the planned (vchunks, chunks, nbanks)."""
+        if flag:
+            vc = tuple(int(v) for v in flag)
+            bank1 = (vc[0] + plan.nbanks - 1) // plan.nbanks
+            ch = tuple(min(c, b) for c, b in
+                       zip(plan.chunks, (bank1,) + vc[1:]))
+            return vc, ch, plan.nbanks
+        return plan.vchunks, plan.chunks, plan.nbanks
+
+    init_vc, init_ch, init_nb = _pick(args.init_vchunks, plans["init"])
+    big_vc,  big_ch,  big_nb  = _pick(args.big_vchunks,  plans["big"])
+    proj_vc, proj_ch, proj_nb = _pick(args.proj_vchunks, plans["data"])
+    data_vc, data_ch, data_nb = _pick(args.data_vchunks, plans["data"])
+    pgn_vc,  pgn_ch,  pgn_nb  = _pick(args.pgn_vchunks,  plans["paganin"])
+    rec_vc,  rec_ch,  rec_nb  = _pick(args.rec_vchunks,  plans["rec"])
+
+    # ---- stage 1's read buffer is a harness artifact, not the plan --------
+    # Every other stage reads a super-chunk its producer wrote, so the pair
+    # of buffers it holds is the pair the policy planned.  Stage 1 is the
+    # exception: it prefetches a WHOLE init super-chunk, while step1 streams
+    # input planes (which is why big's companion_unit is one thin slab, not
+    # 54 GiB).  Left alone that makes the harness peak at 54 + 72 = 126 GiB
+    # a rank at UPS=32 -- over a 512 GB node at 4 ranks.  Shrink the read
+    # side instead: more read calls, each still one whole sequential
+    # super-chunk of the same chunk shape, so nothing measured changes.
+    budget_b = int(args.mem_budget * 2 ** 30)
+    room = max(1, (budget_b - int(np.prod(big_vc)) * 4)
+               // (init_shape[1] * init_shape[2] * 4))
+    if init_vc[0] > room:
+        c0 = next((c for c in range(min(init_vc[0], (room // init_nb) * init_nb),
+                                    0, -init_nb) if init_shape[0] % c == 0),
+                  init_nb if init_shape[0] % init_nb == 0 else 1)
+        if RANK == 0:
+            print(f"[layout] init read super-chunk {init_vc[0]} -> {c0} planes "
+                  f"so it fits beside the big write buffer "
+                  f"({_hb(int(np.prod(big_vc)) * 4)}) inside "
+                  f"{args.mem_budget} GiB", flush=True)
+        init_vc = (c0,) + tuple(init_vc[1:])
+        bank0 = max(1, c0 // init_nb)
+        init_ch = (init_ch[0], min(init_ch[1], init_shape[1]),
+                   min(init_ch[2], init_shape[2]))
+        init_ch = (min(init_ch[0], bank0),) + init_ch[1:]
 
     # paganin.h5 is θ-banked (ranks shard on θ, one writer per bank file) but
     # sinogram-chunked, so stage 4's (NTHETA, zslab, N) read covers whole
@@ -227,12 +332,18 @@ def main() -> None:
     # The old (1, NZ, N) projection chunk is the 'proj' branch: same bytes
     # off disk (HDF5 does partial-chunk I/O on unfiltered datasets) but
     # strided NZ·N·4 apart, which is what made stage 4 the slowest read here.
-    pgn_theta_per_bank = (pgn_vc[0] + args.nbanks - 1) // args.nbanks
-    pgn_chunk_z = args.pgn_chunk_z if args.pgn_chunk_z > 0 else rec_vc[0]
-    pgn_chunk_z = max(1, min(pgn_chunk_z, pgn_vc[1]))
-    pgn_chunks = ((pgn_theta_per_bank, pgn_chunk_z, N)
-                  if args.pgn_chunk_order == "sino"
-                  else (1, pgn_vc[1], pgn_vc[2]))
+    # The 'sino' branch is what the policy already planned (it clamps cz to
+    # the FBP z-slab whenever the θ extent is > 1); 'proj' is the old
+    # layout, kept so the sweep can A/B the stage-4 read.
+    pgn_theta_per_bank = (pgn_vc[0] + pgn_nb - 1) // pgn_nb
+    if args.pgn_chunk_order == "sino":
+        pgn_chunks = pgn_ch
+        if args.pgn_chunk_z > 0:       # explicit z override
+            pgn_chunks = (pgn_chunks[0],
+                          max(1, min(args.pgn_chunk_z, pgn_vc[1])),
+                          pgn_chunks[2])
+    else:
+        pgn_chunks = (1, pgn_vc[1], pgn_vc[2])
 
     def _validate(name, shape, vc):
         if any(c > s for c, s in zip(vc, shape)):
@@ -247,7 +358,54 @@ def main() -> None:
     _validate("paganin.h5",    pgn_shape,  pgn_vc)
     _validate("rec.h5",        rec_shape,  rec_vc)
 
-    os.makedirs(args.path, exist_ok=True)
+    # ---- --max-vchunks: shrink the VOLUME, keep the LAYOUT ---------------
+    # The plan above was computed at full size and stays untouched; only the
+    # number of super-chunks each dataset actually holds is capped.  Every
+    # dataset here is banked on axis 0 (the harness banks proj.h5 on θ, see
+    # the note above), so the cut is always axis 0 and the vchunk still
+    # tiles the shape exactly -- no ragged tail, same bank count, same
+    # chunk.  What changes is only how many iterations each stage runs.
+    MAXVC = max(0, args.max_vchunks)
+
+    def _cap(shape, vc):
+        if MAXVC <= 0:
+            return shape
+        n = min(-(-shape[0] // vc[0]), MAXVC)
+        return (n * vc[0],) + tuple(shape[1:])
+
+    init_shape = _cap(init_shape, init_vc)
+    big_shape  = _cap(big_shape,  big_vc)
+    proj_shape = _cap(proj_shape, proj_vc)
+    data_shape = _cap(data_shape, data_vc)
+    pgn_shape  = _cap(pgn_shape,  pgn_vc)
+    rec_shape  = _cap(rec_shape,  rec_vc)
+    if MAXVC > 0 and RANK == 0:
+        print(f"[layout] --max-vchunks {MAXVC}: datasets truncated on their "
+              f"banked axis to init={init_shape[0]} big={big_shape[0]} "
+              f"proj/data={data_shape[0]} paganin={pgn_shape[0]} "
+              f"rec={rec_shape[0]}", flush=True)
+        if MAXVC % SIZE:
+            print(f"[layout] WARNING: {MAXVC} super-chunks over {SIZE} ranks "
+                  f"is uneven -- some ranks idle and the aggregate number "
+                  f"understates the filesystem.", flush=True)
+
+    def _src_ivc(idx, shape, vc):
+        """Clamp a derived source-vchunk index into what the (possibly
+        truncated) source dataset actually has.  With --max-vchunks the
+        consumer can out-run its producer: e.g. rec keeps MAXVC z-slabs of
+        rec_vc[0] while paganin keeps MAXVC θ-slabs, and the two counts
+        need not line up.  Re-reading the last super-chunk keeps the op
+        size and the op count honest, which is all this measures."""
+        return min(int(idx), max(0, -(-shape[0] // vc[0]) - 1))
+
+    # Prefetch super-chunks the two read-heavy stages allocate on top of
+    # their write buffer: a θ-slab of data.h5 for paganin (step7) and the
+    # full-θ sinogram slab of paganin.h5 for fbp (step8).
+    pgn_read_vc  = (pgn_vc[0], pgn_shape[1], pgn_shape[2])
+    sino_read_vc = (pgn_shape[0], rec_vc[0], pgn_shape[2])
+
+    if not args.dry_run:
+        os.makedirs(args.path, exist_ok=True)
     INIT = os.path.join(args.path, "init.h5")
     BIG  = os.path.join(args.path, f"big{UPS}x.h5")
     PROJ = os.path.join(args.path, "proj.h5")
@@ -260,14 +418,52 @@ def main() -> None:
     rprint("")
     rprint("File layout (each dataset = master VDS + nvchunks·nbanks bank files):")
     if RANK == 0:
-        _describe("init.h5",       init_shape, init_vc, args.nbanks, 4)
-        _describe(f"big{UPS}x.h5", big_shape,  big_vc,  args.nbanks, 4)
-        _describe("proj.h5",       proj_shape, proj_vc, args.nbanks, 4)
-        _describe("data.h5",       data_shape, data_vc, args.nbanks, 4)
-        _describe("paganin.h5",    pgn_shape,  pgn_vc,  args.nbanks, 4,
+        _describe("init.h5",       init_shape, init_vc, init_nb, 4, chunks=init_ch)
+        _describe(f"big{UPS}x.h5", big_shape,  big_vc,  big_nb, 4, chunks=big_ch)
+        _describe("proj.h5",       proj_shape, proj_vc, proj_nb, 4, chunks=proj_ch)
+        _describe("data.h5",       data_shape, data_vc, data_nb, 4, chunks=data_ch)
+        _describe("paganin.h5",    pgn_shape,  pgn_vc,  pgn_nb, 4,
                   chunks=pgn_chunks)
-        _describe("rec.h5",        rec_shape,  rec_vc,  args.nbanks, 4)
+        _describe("rec.h5",        rec_shape,  rec_vc,  rec_nb, 4, chunks=rec_ch)
+
+        # What this run will actually cost the filesystem, before it costs
+        # it.  Stage 1 writes init AND big; the other four write one dataset
+        # each and read their predecessor, so bytes-on-disk is the sum.
+        sets = (("init.h5", init_shape, init_vc, init_nb),
+                (f"big{UPS}x.h5", big_shape, big_vc, big_nb),
+                ("proj.h5", proj_shape, proj_vc, proj_nb),
+                ("data.h5", data_shape, data_vc, data_nb),
+                ("paganin.h5", pgn_shape, pgn_vc, pgn_nb),
+                ("rec.h5", rec_shape, rec_vc, rec_nb))
+        tot_b = sum(int(np.prod(s)) * 4 for _, s, _, _ in sets)
+        tot_f = sum(-(-s[0] // v[0]) * nb + 1 for _, s, v, nb in sets)
+        print(f"\n  TOTAL written this run: {_hb(tot_b)} in ~{tot_f} h5 files "
+              f"({'full volume' if MAXVC <= 0 else f'--max-vchunks {MAXVC}'})",
+              flush=True)
+
+        # Peak RAM per rank, stage by stage.  Each stage holds the super-
+        # chunk it writes plus the one it reads, so the peak is a PAIR --
+        # which is what a --mem-budget sized for a single buffer misses.
+        # Multiply by the ranks per node before trusting it.
+        def _b(vc):
+            return int(np.prod(vc)) * 4
+        pairs = (("1 upsample",   _b(init_vc) + _b(big_vc)),
+                 ("2 radon",      _b(big_vc)  + _b(proj_vc)),
+                 ("2 propagation", _b(proj_vc) + _b(data_vc)),
+                 ("3 paganin",    _b(pgn_vc)  + _b(pgn_read_vc)),
+                 ("4 fbp",        _b(rec_vc)  + _b(sino_read_vc)))
+        peak = max(b for _, b in pairs)
+        print("  peak RAM per rank (buffers held together):  "
+              + "   ".join(f"{n}={_hb(b)}" for n, b in pairs), flush=True)
+        if peak > budget_b:
+            print(f"  WARNING: peak {_hb(peak)}/rank exceeds --mem-budget "
+                  f"{args.mem_budget} GiB.  With R ranks per node you need "
+                  f"R x that much; lower --mem-budget (which shrinks the "
+                  f"super-chunks) if the node cannot hold it.", flush=True)
     rprint("")
+    if args.dry_run:
+        rprint("[dry-run] nothing written; drop --dry-run to run it.")
+        return
 
     dtype = np.float32
     dtp   = np.dtype(dtype)
@@ -284,7 +480,8 @@ def main() -> None:
     if RANK == 0:
         _cleanup_h5(INIT)
         ctx_init = tomo_initx(filename=INIT, shape=init_shape, dtype=dtype,
-                              vchunks=init_vc, stype="proj", nbanks=args.nbanks)
+                              vchunks=init_vc, stype="proj", nbanks=init_nb,
+                              chunks=init_ch)
     else:
         ctx_init = None
     barrier()
@@ -303,12 +500,9 @@ def main() -> None:
 
     t_seed = 0.0
     n_vc_init = 0
+    _fill_random(buf_i, rng)          # once: 27 GiB per re-roll, and the
+                                      # write is what is being timed
     for k, ivc in enumerate(my_ivchunks, start=1):
-        z0 = ivc[0] * init_vc[0]
-        z1 = min(z0 + init_vc[0], init_shape[0])
-        buf_i[: z1 - z0].fill(0)
-        buf_i[: z1 - z0] = rng.random(
-            (z1 - z0, init_vc[1], init_vc[2]), dtype=np.float32)
         t = time.perf_counter()
         tomo_writex(INIT, data=buf_i, shm=shm_i, ivchunk=ivc, ctx=ctx_init)
         t_seed += time.perf_counter() - t
@@ -323,7 +517,8 @@ def main() -> None:
     if RANK == 0:
         _cleanup_h5(BIG)
         ctx_big = tomo_initx(filename=BIG, shape=big_shape, dtype=dtype,
-                             vchunks=big_vc, stype="proj", nbanks=args.nbanks)
+                             vchunks=big_vc, stype="proj", nbanks=big_nb,
+                              chunks=big_ch)
     else:
         ctx_big = None
     barrier()
@@ -339,6 +534,17 @@ def main() -> None:
     my_total = len(my_big)
     step = max(1, my_total // 10) if my_total else 1
 
+    # A big super-chunk whose C0 is not a multiple of UPS is legal (see the
+    # NOTE in step1_upsample.py): the layout policy drops below UPS
+    # alignment when the budget cannot hold UPS whole output planes, which
+    # from UPS=16 on it cannot -- one plane is 9.7 GB at UPS=16 and 38.7 GB
+    # at UPS=32.  The cost is the seam: the input plane a vchunk edge falls
+    # inside gets read and upsampled again by the next vchunk.
+    if RANK == 0 and big_vc[0] % UPS:
+        print(f"  NOTE: big vchunk C0={big_vc[0]} is not a multiple of "
+              f"UPS={UPS}; input planes at the vchunk seams are read "
+              f"~{max(1.0, UPS / big_vc[0]):.0f}x more often.", flush=True)
+
     t_read = t_write = 0.0
     bytes_read = bytes_write = 0
     for k, ivc in enumerate(my_big, start=1):
@@ -346,19 +552,31 @@ def main() -> None:
         z1_out = min(z0_out + big_vc[0], big_shape[0])
         z0_in = z0_out // UPS
         z1_in = (z1_out + UPS - 1) // UPS
-        in_ivc = (z0_in // init_vc[0], 0, 0)
+        in_ivc = (_src_ivc(z0_in // init_vc[0], init_shape, init_vc), 0, 0)
         t = time.perf_counter()
         src = tomo_readx(INIT, ntasks=args.ntasks, shm=shm_i,
                          ivchunk=in_ivc, vchunks=init_vc)
         t_read += time.perf_counter() - t
         bytes_read += int(np.prod(init_vc)) * dtp.itemsize
 
-        local_z_lo = z0_in - in_ivc[0] * init_vc[0]
-        local_z_hi = z1_in - in_ivc[0] * init_vc[0]
-        planes_in = src[local_z_lo:local_z_hi]
+        # `src` covers input planes [base, base + init_vc[0]).  Take the
+        # [z0_in, z1_in) window out of it, clipped to what this one
+        # super-chunk holds -- the window spans at most two input planes,
+        # so it only clips when a seam lands on the very last plane of an
+        # init super-chunk.  Content is irrelevant here (this measures
+        # bytes and ops, not physics); step1 does the real read.
+        base = in_ivc[0] * init_vc[0]
+        lo = min(max(z0_in - base, 0), src.shape[0] - 1)
+        hi = min(max(z1_in - base, lo + 1), src.shape[0])
+        planes_in = src[lo:hi]
         up = np.repeat(np.repeat(planes_in, UPS, axis=1), UPS, axis=2)
         up = np.repeat(up, UPS, axis=0).astype(np.float32, copy=False)
-        buf_b[: z1_out - z0_out] = up[: z1_out - z0_out]
+        # `up` starts at output plane (base + lo) * UPS, which equals z0_out
+        # only when big_vc[0] IS a multiple of UPS.  Offset by the remainder
+        # instead of silently writing the wrong planes.
+        off = min(z0_out - (base + lo) * UPS, up.shape[0] - 1)
+        nz = min(z1_out - z0_out, up.shape[0] - off)
+        buf_b[:nz] = up[off:off + nz]
         del up
 
         t = time.perf_counter()
@@ -383,7 +601,8 @@ def main() -> None:
     if RANK == 0:
         _cleanup_h5(PROJ)
         ctx_proj = tomo_initx(filename=PROJ, shape=proj_shape, dtype=dtype,
-                              vchunks=proj_vc, stype="proj", nbanks=args.nbanks)
+                              vchunks=proj_vc, stype="proj", nbanks=proj_nb,
+                              chunks=proj_ch)
     else:
         ctx_proj = None
     barrier()
@@ -398,20 +617,22 @@ def main() -> None:
     total = len(proj_ivchunks)
     my_total = len(my_proj)
     step = max(1, my_total // 10) if my_total else 1
-    fake_proj = rng.random(proj_vc, dtype=np.float32)
+    # Fill the write buffer once instead of keeping a same-size `fake_proj`
+    # copy alongside it: at UPS=8 a proj super-chunk is 40 GiB, and the
+    # duplicate is what pushes 4 ranks/node past a 512 GB node.  The content
+    # was already constant across iterations, so nothing changes but RAM.
+    _fill_random(buf_p, rng)
 
     t_read = t_write = 0.0
     bytes_read = bytes_write = 0
     for k, ivc in enumerate(my_proj, start=1):
         z0 = ivc[1] * proj_vc[1]
-        big_i = (z0 // big_vc[0], 0, 0)
+        big_i = (_src_ivc(z0 // big_vc[0], big_shape, big_vc), 0, 0)
         t = time.perf_counter()
         _ = tomo_readx(BIG, ntasks=args.ntasks, shm=shm_b,
                        ivchunk=big_i, vchunks=big_vc)
         t_read += time.perf_counter() - t
         bytes_read += int(np.prod(big_vc)) * dtp.itemsize
-
-        buf_p[:] = fake_proj
 
         t = time.perf_counter()
         tomo_writex(PROJ, data=buf_p, shm=shm_p, ivchunk=ivc, ctx=ctx_proj)
@@ -435,7 +656,8 @@ def main() -> None:
     if RANK == 0:
         _cleanup_h5(DATA)
         ctx_data = tomo_initx(filename=DATA, shape=data_shape, dtype=dtype,
-                              vchunks=data_vc, stype="proj", nbanks=args.nbanks)
+                              vchunks=data_vc, stype="proj", nbanks=data_nb,
+                              chunks=data_ch)
     else:
         ctx_data = None
     barrier()
@@ -454,7 +676,7 @@ def main() -> None:
     t_read = t_write = 0.0
     bytes_read = bytes_write = 0
     for k, ivc in enumerate(my_data, start=1):
-        proj_i = (ivc[0], 0, 0)
+        proj_i = (_src_ivc(ivc[0], proj_shape, proj_vc), 0, 0)
         t = time.perf_counter()
         src = tomo_readx(PROJ, ntasks=args.ntasks, shm=shm_p,
                          ivchunk=proj_i, vchunks=proj_vc)
@@ -491,7 +713,7 @@ def main() -> None:
     if RANK == 0:
         _cleanup_h5(PGN)
         ctx_pgn = tomo_initx(filename=PGN, shape=pgn_shape, dtype=dtype,
-                             vchunks=pgn_vc, stype="proj", nbanks=args.nbanks,
+                             vchunks=pgn_vc, stype="proj", nbanks=pgn_nb,
                              chunks=pgn_chunks)
     else:
         ctx_pgn = None
@@ -503,7 +725,6 @@ def main() -> None:
     rprint(f"  buffer for paganin: {_hb(buf_pg.nbytes)}   ({pgn_vc})")
 
     # Prefetch shm for read_projs_vchunkx (θ-slab of pgn_vc[0] angles).
-    pgn_read_vc = (pgn_vc[0], pgn_shape[1], pgn_shape[2])
     shm_pg_read, _pg_read_buf = _alloc_shm(pgn_read_vc, dtype)
 
     pgn_ivchunks = list(_iter_vchunks(pgn_shape, pgn_vc))
@@ -511,7 +732,7 @@ def main() -> None:
     total = len(pgn_ivchunks)
     my_total = len(my_pgn)
     step = max(1, my_total // 10) if my_total else 1
-    fake_pgn = rng.random(pgn_vc, dtype=np.float32)
+    _fill_random(buf_pg, rng)
 
     t_read = t_write = 0.0
     bytes_read = bytes_write = 0
@@ -519,13 +740,12 @@ def main() -> None:
         t0_vc = ivc[0] * pgn_vc[0]
         t1_vc = min(t0_vc + pgn_vc[0], pgn_shape[0])
 
+        src_i = _src_ivc(ivc[0], data_shape, pgn_read_vc)
         t = time.perf_counter()
         read_projs_vchunkx(DATA, shm_pg_read, ntasks=args.ntasks,
-                           vchunksx=pgn_read_vc, ivchunkx=(ivc[0], 0, 0))
+                           vchunksx=pgn_read_vc, ivchunkx=(src_i, 0, 0))
         t_read += time.perf_counter() - t
         bytes_read += (t1_vc - t0_vc) * pgn_vc[1] * pgn_vc[2] * dtp.itemsize
-
-        buf_pg[:] = fake_pgn
 
         t = time.perf_counter()
         tomo_writex(PGN, data=buf_pg, shm=shm_pg, ivchunk=ivc, ctx=ctx_pgn)
@@ -538,6 +758,11 @@ def main() -> None:
     barrier()
     _report_stage("paganin  read",  bytes_read,  t_read)
     _report_stage("paganin  write", bytes_write, t_write)
+    # Released here, not at the very end: stage 4 never touches them, and at
+    # UPS>=8 holding a paganin super-chunk plus its θ-slab prefetch (72 GiB
+    # combined at UPS=32) through the FBP stage would OOM the node.
+    _free_shm(shm_pg)
+    _free_shm(shm_pg_read)
     rprint("")
 
     # ================== STAGE 4 FBP: paganin -> rec ========================
@@ -560,7 +785,8 @@ def main() -> None:
     if RANK == 0:
         _cleanup_h5(REC)
         ctx_rec = tomo_initx(filename=REC, shape=rec_shape, dtype=dtype,
-                             vchunks=rec_vc, stype="proj", nbanks=args.nbanks)
+                             vchunks=rec_vc, stype="proj", nbanks=rec_nb,
+                              chunks=rec_ch)
     else:
         ctx_rec = None
     barrier()
@@ -573,7 +799,6 @@ def main() -> None:
     # Prefetch shm for the sinogram vchunkx (NTHETA, rec_vc[0], N).  One
     # read_slices_vchunkx call per rec vchunk replaces NZCHUNK-many
     # per-inner plain-h5py reads.  Amp drops from NZ/NZCHUNK to NZ/rec_vc[0].
-    sino_read_vc = (pgn_shape[0], rec_vc[0], pgn_shape[2])
     shm_sino, _sino_buf = _alloc_shm(sino_read_vc, dtype)
 
     rec_ivchunks = list(_iter_vchunks(rec_shape, rec_vc))
@@ -581,7 +806,7 @@ def main() -> None:
     total = len(rec_ivchunks)
     my_total = len(my_rec)
     step = max(1, my_total // 10) if my_total else 1
-    fake_rec = rng.random(rec_vc, dtype=np.float32)
+    _fill_random(buf_r, rng)
 
     NZCHUNK = args.nzchunk
 
@@ -591,10 +816,13 @@ def main() -> None:
         z0_vc = ivc[0] * rec_vc[0]
         z1_vc = min(z0_vc + rec_vc[0], rec_shape[0])
 
-        # One parallel prefetch of the whole vchunk's sino slab.
+        # One parallel prefetch of the whole vchunk's sino slab.  paganin.h5
+        # is θ-banked, so --max-vchunks cut its θ extent, not its z extent —
+        # but rec's z-slab index still has to stay inside paganin's z.
+        sino_i = min(ivc[0], max(0, pgn_shape[1] // rec_vc[0] - 1))
         t = time.perf_counter()
         read_slices_vchunkx(PGN, shm_sino, ntasks=args.ntasks,
-                            vchunksx=sino_read_vc, ivchunkx=(0, ivc[0], 0))
+                            vchunksx=sino_read_vc, ivchunkx=(0, sino_i, 0))
         t_read += time.perf_counter() - t
         bytes_read += pgn_shape[0] * (z1_vc - z0_vc) * pgn_shape[2] * dtp.itemsize
 
@@ -603,8 +831,6 @@ def main() -> None:
         for zc0 in range(z0_vc, z1_vc, NZCHUNK):
             zc1 = min(zc0 + NZCHUNK, z1_vc)
             _ = _sino_buf[:, zc0 - z0_vc : zc1 - z0_vc, :]
-
-        buf_r[:] = fake_rec
 
         t = time.perf_counter()
         tomo_writex(REC, data=buf_r, shm=shm_r, ivchunk=ivc, ctx=ctx_rec)
@@ -617,8 +843,6 @@ def main() -> None:
     barrier()
     _report_stage("fbp      read",  bytes_read,  t_read)
     _report_stage("fbp      write", bytes_write, t_write)
-    _free_shm(shm_pg)
-    _free_shm(shm_pg_read)
     _free_shm(shm_r)
     _free_shm(shm_sino)
 

@@ -1,0 +1,118 @@
+
+Lmod is automatically replacing "nvidia/25.5" with "gcc-native/14".
+
+
+Lmod is automatically replacing "PrgEnv-nvidia/8.6.0" with "PrgEnv-gnu/8.6.0".
+
+
+Due to MODULEPATH changes, the following have been reloaded:
+  1) cray-mpich/9.0.1
+
+Jobid: 7449823.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov
+Nodes: 2   MPI ranks total: 8   (--ppn 4)
+x3005c0s31b1n0.hsn.cm.polaris.alcf.anl.gov
+x3005c0s7b0n0.hsn.cm.polaris.alcf.anl.gov
+environment: line 5: __conda_exe: command not found
+=== UPS=1  PATH_DATA=/eagle/APS_IRI/vnikitin/iotest_buf_ups1_mpi  NBANKS=8  NTASKS=4  NZCHUNK=8  NODES=2  NRANKS/node=4 ===
+    init-vchunks = 32 3072 3072
+    big-vchunks  = 32 3072 3072
+    proj-vchunks = 128 3072 3072
+    data-vchunks = 128 3072 3072
+    pgn-vchunks  = 128 3072 3072
+    rec-vchunks  = 32 3072 3072
+[test_h5_buffer_io]  UPS=1   nbanks=8   ntasks=4   MPI ranks=8
+
+File layout (each dataset = master VDS + nvchunks·nbanks bank files):
+  init.h5         shape=(3072, 3072, 3072)   dtype=f32  total=108.00 GB
+  init.h5         vchunk=(32, 3072, 3072)   buffer=1.12 GB   nvchunks=96   nbanks=8   files~769
+  big1x.h5        shape=(3072, 3072, 3072)   dtype=f32  total=108.00 GB
+  big1x.h5        vchunk=(32, 3072, 3072)   buffer=1.12 GB   nvchunks=96   nbanks=8   files~769
+  proj.h5         shape=(2304, 3072, 3072)   dtype=f32  total=81.00 GB
+  proj.h5         vchunk=(128, 3072, 3072)   buffer=4.50 GB   nvchunks=18   nbanks=8   files~145
+  data.h5         shape=(2304, 3072, 3072)   dtype=f32  total=81.00 GB
+  data.h5         vchunk=(128, 3072, 3072)   buffer=4.50 GB   nvchunks=18   nbanks=8   files~145
+  paganin.h5      shape=(1152, 3072, 3072)   dtype=f32  total=40.50 GB
+  paganin.h5      vchunk=(128, 3072, 3072)   buffer=4.50 GB   nvchunks=9   nbanks=8   files~73
+  rec.h5          shape=(3072, 3072, 3072)   dtype=f32  total=108.00 GB
+  rec.h5          vchunk=(32, 3072, 3072)   buffer=1.12 GB   nvchunks=96   nbanks=8   files~769
+
+──────────────────────────────────────────────────────────────────────
+STAGE 1  init.h5 ── read ─▶ big.h5 ── write   (per super-chunk)
+──────────────────────────────────────────────────────────────────────
+  buffer for init: 1.12 GB   ((32, 3072, 3072))   (per rank; 8 ranks total)
+    [rank 0] init  vchunk 1/12 (of 96 global)  (write=3.4s)
+    [rank 0] init  vchunk 2/12 (of 96 global)  (write=3.9s)
+    [rank 0] init  vchunk 3/12 (of 96 global)  (write=4.3s)
+    [rank 0] init  vchunk 4/12 (of 96 global)  (write=4.7s)
+    [rank 0] init  vchunk 5/12 (of 96 global)  (write=5.1s)
+    [rank 0] init  vchunk 6/12 (of 96 global)  (write=5.4s)
+    [rank 0] init  vchunk 7/12 (of 96 global)  (write=5.8s)
+    [rank 0] init  vchunk 8/12 (of 96 global)  (write=6.2s)
+    [rank 0] init  vchunk 9/12 (of 96 global)  (write=6.6s)
+    [rank 0] init  vchunk 10/12 (of 96 global)  (write=7.1s)
+    [rank 0] init  vchunk 11/12 (of 96 global)  (write=7.5s)
+    [rank 0] init  vchunk 12/12 (of 96 global)  (write=7.9s)
+  init.h5 seed            aggregate=12.40 GB/s   per-rank[min..max]=[1.55 GB/s..1.71 GB/s]   wall[min..max]=[7.9s..8.7s]  total=108.00 GB
+  buffer for big:  1.12 GB   ((32, 3072, 3072))
+    [rank 0] upsample 1/12 (of 96 global)  (read=2.0s write=0.5s)
+    [rank 0] upsample 2/12 (of 96 global)  (read=2.1s write=1.1s)
+    [rank 0] upsample 3/12 (of 96 global)  (read=2.3s write=1.6s)
+    [rank 0] upsample 4/12 (of 96 global)  (read=2.5s write=2.0s)
+    [rank 0] upsample 5/12 (of 96 global)  (read=2.7s write=2.5s)
+    [rank 0] upsample 6/12 (of 96 global)  (read=2.9s write=2.9s)
+    [rank 0] upsample 7/12 (of 96 global)  (read=3.0s write=3.3s)
+    [rank 0] upsample 8/12 (of 96 global)  (read=3.2s write=3.7s)
+    [rank 0] upsample 9/12 (of 96 global)  (read=3.3s write=4.1s)
+    [rank 0] upsample 10/12 (of 96 global)  (read=3.5s write=4.6s)
+    [rank 0] upsample 11/12 (of 96 global)  (read=3.7s write=5.0s)
+    [rank 0] upsample 12/12 (of 96 global)  (read=3.8s write=5.4s)
+  stage 1  read           aggregate=27.41 GB/s   per-rank[min..max]=[3.43 GB/s..3.57 GB/s]   wall[min..max]=[3.8s..3.9s]  total=108.00 GB
+  stage 1  write          aggregate=17.93 GB/s   per-rank[min..max]=[2.24 GB/s..2.78 GB/s]   wall[min..max]=[4.9s..6.0s]  total=108.00 GB
+
+──────────────────────────────────────────────────────────────────────
+STAGE 2 RADON   big.h5 ── read ─▶ proj.h5 ── write   (per super-chunk)
+──────────────────────────────────────────────────────────────────────
+  buffer for proj: 4.50 GB   ((128, 3072, 3072))
+    [rank 0] radon 1/3 (of 18 global)  (read=0.2s write=1.8s)
+    [rank 0] radon 2/3 (of 18 global)  (read=0.4s write=3.5s)
+    [rank 0] radon 3/3 (of 18 global)  (read=0.6s write=5.2s)
+  radon    read           aggregate=20.44 GB/s   per-rank[min..max]=[2.47 GB/s..6.46 GB/s]   wall[min..max]=[0.3s..1.0s]  total=20.25 GB
+  radon    write          aggregate=14.92 GB/s   per-rank[min..max]=[2.19 GB/s..2.62 GB/s]   wall[min..max]=[3.6s..5.4s]  total=81.00 GB
+
+──────────────────────────────────────────────────────────────────────
+STAGE 2 PROPAGATION  proj.h5 ── read ─▶ data.h5 ── write  (per super-chunk)
+──────────────────────────────────────────────────────────────────────
+  buffer for data: 4.50 GB   ((128, 3072, 3072))
+    [rank 0] propagation 1/3 (of 18 global)  (read=0.6s write=1.7s)
+    [rank 0] propagation 2/3 (of 18 global)  (read=1.2s write=3.6s)
+    [rank 0] propagation 3/3 (of 18 global)  (read=1.9s write=5.3s)
+  propagation  read       aggregate=41.61 GB/s   per-rank[min..max]=[6.03 GB/s..7.13 GB/s]   wall[min..max]=[1.3s..1.9s]  total=81.00 GB
+  propagation  write      aggregate=15.37 GB/s   per-rank[min..max]=[2.30 GB/s..2.58 GB/s]   wall[min..max]=[3.5s..5.3s]  total=81.00 GB
+
+──────────────────────────────────────────────────────────────────────
+STAGE 3 PAGANIN     data.h5 ── read ─▶ paganin.h5 ── write  (per super-chunk)
+──────────────────────────────────────────────────────────────────────
+  buffer for paganin: 4.50 GB   ((128, 3072, 3072))
+    [rank 0] paganin 1/2 (of 9 global)  (read=0.7s write=1.7s)
+    [rank 0] paganin 2/2 (of 9 global)  (read=1.4s write=3.2s)
+  paganin  read           aggregate=28.00 GB/s   per-rank[min..max]=[5.51 GB/s..6.35 GB/s]   wall[min..max]=[0.7s..1.4s]  total=40.50 GB
+  paganin  write          aggregate=12.57 GB/s   per-rank[min..max]=[2.39 GB/s..2.79 GB/s]   wall[min..max]=[1.6s..3.2s]  total=40.50 GB
+
+──────────────────────────────────────────────────────────────────────
+STAGE 4 FBP        paganin.h5 ── SLICE read ─▶ rec.h5 ── write  (per super-chunk)
+──────────────────────────────────────────────────────────────────────
+  buffer for rec:     1.12 GB   ((32, 3072, 3072))
+    [rank 0] fbp 1/12 (of 96 global)  (read=9.5s write=0.5s)
+    [rank 0] fbp 2/12 (of 96 global)  (read=12.5s write=0.9s)
+    [rank 0] fbp 3/12 (of 96 global)  (read=16.2s write=1.3s)
+    [rank 0] fbp 4/12 (of 96 global)  (read=20.1s write=1.7s)
+    [rank 0] fbp 5/12 (of 96 global)  (read=23.8s write=2.1s)
+    [rank 0] fbp 6/12 (of 96 global)  (read=26.2s write=2.5s)
+    [rank 0] fbp 7/12 (of 96 global)  (read=28.3s write=2.8s)
+    [rank 0] fbp 8/12 (of 96 global)  (read=31.7s write=3.3s)
+    [rank 0] fbp 9/12 (of 96 global)  (read=34.9s write=3.7s)
+    [rank 0] fbp 10/12 (of 96 global)  (read=37.0s write=4.1s)
+    [rank 0] fbp 11/12 (of 96 global)  (read=39.0s write=4.5s)
+    [rank 0] fbp 12/12 (of 96 global)  (read=43.3s write=4.9s)
+  fbp      read           aggregate=517.77 MB/s   per-rank[min..max]=[64.72 MB/s..123.20 MB/s]   wall[min..max]=[42.1s..80.1s]  total=40.50 GB
+  fbp      write          aggregate=20.17 GB/s   per-rank[min..max]=[2.52 GB/s..2.73 GB/s]   wall[min..max]=[4.9s..5.4s]  total=108.00 GB

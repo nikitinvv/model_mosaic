@@ -37,7 +37,16 @@ _warnings.filterwarnings(
 )
 
 
-_IS_WORKER = _mp.parent_process() is not None
+# A spawn Pool worker re-imports the main script -- and so this module --
+# BEFORE multiprocessing sets its parent process (that happens afterwards,
+# in _bootstrap), so parent_process() is still None here.  Such a worker
+# then ran `from mpi4py import MPI` with the rank's inherited OMPI_/PMIX_
+# environment, i.e. tried to join the running job as an existing process;
+# with OpenMPI 5 that can hang forever, and the rank's Pool.map with it.
+# dxchange_hdf5_chunks._get_pool sets MOSAIC_POOL_WORKER for its children.
+import os as _os
+_IS_WORKER = (_os.environ.get("MOSAIC_POOL_WORKER") == "1"
+              or _mp.parent_process() is not None)
 
 if not _IS_WORKER:
     # By default, let mpi4py's auto MPI.Finalize atexit run at

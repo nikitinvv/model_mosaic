@@ -38,7 +38,9 @@ from iohdf5.dxchange_hdf5_chunks import tomo_writex, read_projs_vchunkx
 from iohdf5.h5_vchunks import (
     initx_and_bcast, alloc_shm, free_shm, iter_vchunks,
     vchunk_bytes, n_vchunks, describe_input, describe_output,
+    rm_src, add_rm_src_arg,
 )
+from iohdf5.layout import add_layout_args, resolve_step
 from mpi_utils import COMM, RANK, SIZE, MPI, barrier, rprint, allreduce, report_stage
 
 
@@ -53,9 +55,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--beta-ratio", type=float, default=100.0,
                    help="weak absorption: β = phase/beta_ratio")
     p.add_argument("--energy",    type=float, default=30.0, help="keV")
-    p.add_argument("--voxelsize", type=float, default=1.38e-6,
+    p.add_argument("--voxelsize", type=float, default=0.72222e-6,
                    help="voxel = detector pixel, meters (parallel beam)")
-    p.add_argument("--distance",  type=float, default=0.2,
+    p.add_argument("--distance",  type=float, default=0.15,
                    help="sample → detector distance, meters")
     p.add_argument("--nbanks",     type=int, default=8,
                    help="bank files per super-chunk (parallel POSIX writers)")
@@ -65,9 +67,12 @@ def _parse_args() -> argparse.Namespace:
                    help="pass1/3 z-strip depth")
     p.add_argument("--chunk-2n",   type=int, default=768,
                    help="pass2 x-strip width along the padded 2n axis")
+    add_layout_args(p)
     p.add_argument("--vchunks", type=int, nargs=3, default=None,
                    metavar=("C0", "C1", "C2"),
-                   help="super-chunk for data.h5 (default: 8, NZ, N)")
+                   help="super-chunk for data.h5; default comes from "
+                        "iohdf5.layout (--mem-budget / --chunk-bytes)")
+    add_rm_src_arg(p, "the input proj.h5")
     return p.parse_args()
 
 
@@ -90,9 +95,19 @@ ENERGY     = _A.energy
 VOXELSIZE  = _A.voxelsize
 DISTANCE   = _A.distance
 
-NBANKS       = _A.nbanks
 NTASKS       = _A.ntasks
-VCHUNKS = tuple(_A.vchunks) if _A.vchunks else (8, NZ, N)
+
+# Layout from the shared byte-budget policy -- same plan step3_propagation
+# uses, so the host-chunked twin writes an identically-laid-out data.h5.
+_PLAN        = resolve_step("data", ups=UPS, in_nz=IN_NZ, in_nyx=IN_N,
+                            ntheta=2 * NTHETA,   # policy wants the 360 deg tile count
+                            nbanks=_A.nbanks,
+                            mem_budget_gb=_A.mem_budget,
+                            chunk_mb=_A.chunk_bytes, vchunks=_A.vchunks,
+                            nranks=SIZE)
+NBANKS       = _PLAN.nbanks
+VCHUNKS      = _PLAN.vchunks
+H5CHUNKS     = _PLAN.chunks
 
 CHUNK_NZ = _A.chunk_nz
 CHUNK_2N = _A.chunk_2n
@@ -144,18 +159,20 @@ def main() -> None:
            f"Fresnel number (per pixel)={fresnel_number:.4g}")
     rprint(f"norm_const={float(NORM_CONST):.4g}  beta_ratio={BETA_RATIO}")
     rprint(f"picker chunks: CHUNK_NZ={CHUNK_NZ}  CHUNK_2N={CHUNK_2N}  "
-           f"(auto from gpu-budget={_A.gpu_budget_gb} GB)")
+           f"(--chunk-nz / --chunk-2n)")
     rprint(f"host-side psi/fde ≈ {NZ * N * 8 / 1e9:.1f} + "
            f"{NZ * 2 * N * 8 / 1e9:.1f} GB per D() call")
 
     if RANK == 0:
         describe_input(PROJ_H5)
         describe_output(DATA_H5, (NTHETA, NZ, N), np.float32,
-                        VCHUNKS, "proj", NBANKS)
+                        VCHUNKS, "proj", NBANKS, chunks=H5CHUNKS,
+                        read_granule=_PLAN.read_granule,
+                        companion_bytes=VCHUNKS[0] * NZ * N * 4)
 
     ctx = initx_and_bcast(DATA_H5, shape=(NTHETA, NZ, N),
                           dtype=np.float32, vchunks=VCHUNKS,
-                          stype="proj", nbanks=NBANKS,
+                          stype="proj", nbanks=NBANKS, chunks=H5CHUNKS,
                           rank=RANK, comm=COMM)
     if RANK == 0:
         with h5py.File(DATA_H5, "r+") as f:
@@ -271,6 +288,9 @@ def main() -> None:
 
     report_stage("step3 read (proj)",  b_read,  t_read)
     report_stage("step3 write (data)", b_write, t_write)
+
+    rm_src(PROJ_H5, enabled=_A.rm_src,
+           rank=RANK, comm=COMM)
 
     rprint(f"data stats: min={d_min:.4g} max={d_max:.4g} "
            f"mean={d_sum/max(d_cnt,1):.4g} nan={d_has_nan}")
