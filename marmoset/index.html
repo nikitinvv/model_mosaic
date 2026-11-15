@@ -1,3 +1,7 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>body{margin:0;font:14px system-ui,sans-serif}img{max-width:100%}[hidden]{display:none!important}</style>
+</head><body>
 <title>Marmoset 0.5 µm Mosaic Plan</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -68,7 +72,7 @@ tfoot td{font-weight:500;border-bottom:0}
 
 <div class="wrap">
   <header>
-    <div class="eyebrow" id="eyebrow">Marmoset brain · scan plan</div>
+    <div class="eyebrow" id="eyebrow" style="text-transform:none;letter-spacing:.04em">Marmoset brain · scan plan</div>
     <h1 id="ptitle">Mosaic scanning geometry</h1>
     <p class="lede">Background images are the existing 1.9 µm reconstruction (scans 180–186), binned to 61 µm. Each horizontal position is a 360° off-axis scan that covers one annulus around the rotation axis; vertical levels stack the annuli along the brain. Tiles and numbers update with the settings.</p>
   </header>
@@ -85,7 +89,7 @@ tfoot td{font-weight:500;border-bottom:0}
     <div class="ctl"><label for="ov">Vertical overlap between levels</label>
       <div class="row"><input id="ov" type="range" min="2" max="30" step="1" value="10"><output id="ov_o"></output></div></div>
     <div class="ctl"><label for="s">Angular sampling (1 = Nyquist)</label>
-      <div class="row"><input id="s" type="range" min="0.2" max="1.2" step="0.02" value="1"><output id="s_o"></output></div></div>
+      <div class="row"><input id="s" type="range" min="0.2" max="1.2" step="0.02" value="0.5"><output id="s_o"></output></div></div>
     <div class="ctl"><label for="mode">Field of view per level</label>
       <select id="mode"><option value="adapt">Fit brain radius at each level</option><option value="full">Full cylinder r = 10.4 mm everywhere</option></select></div>
     <div class="ctl"><label for="proj">Angular step</label>
@@ -205,11 +209,11 @@ function plan(){
   const W=NX*PIX, WV=NY*PIX;
   const oh=+$('oh').value/100, ov=+$('ov').value/100, s=+$('s').value;
   const mode=$('mode').value, projMode=$('proj').value, seg=+$('seg').value;
-  const wh=W*(1-oh), wv=WV*(1-ov);
+  const wh=W*(1-oh), wv=WV*(1-ov), c=oh*W/2;   // c: axis inside ring-1 frame (centre overlap = oh*W)
   const L=Math.max(1,Math.ceil(Math.max(0,H-WV)/wv)+1);
   const Hcov=(L-1)*wv+WV, ztop=H/2-Hcov/2;
-  const ringOut=k=>k*wh+W;
-  const Kof=R=>Math.max(1,Math.ceil(Math.max(0,R-W)/wh)+1);
+  const ringIn=k=>k*wh-c, ringOut=k=>k*wh-c+W;
+  const Kof=R=>Math.max(1,Math.ceil(Math.max(0,R-W+c)/wh)+1);
   const frame=NX*NY*2;
   const levels=[];
   for(let l=0;l<L;l++){
@@ -223,7 +227,7 @@ function plan(){
     for(let k=0;k<K;k++){
       let n=Nuni, prof=null;
       if(projMode==='adaptive'){
-        prof=pairedProfile(depthProfile(Math.max(0,a),Math.min(H,b),k*wh,ringOut(k)),seg);
+        prof=pairedProfile(depthProfile(Math.max(0,a),Math.min(H,b),ringIn(k),ringOut(k)),seg);
         let sum=0; for(let j=0;j<NB;j++) sum+=prof[j];
         n=s*sum*DTH/PIX;
       }
@@ -238,7 +242,7 @@ function plan(){
   for(let k=0;k<Kmax;k++){
     let nlev=0,frames=0,uni=0;
     levels.forEach(v=>{if(k<v.K){nlev++;frames+=v.rings[k].n;uni+=v.Nuni;}});
-    rings.push({k,r0:k*wh,r1:ringOut(k),nlev,frames,uni});
+    rings.push({k,r0:ringIn(k),r1:ringOut(k),nlev,frames,uni});
   }
   const scans=levels.reduce((t,v)=>t+v.K,0);
   const frames=levels.reduce((t,v)=>t+v.proj,0);
@@ -248,7 +252,7 @@ function plan(){
   const brainVox=D.vox*Math.pow(P/PIX,3);
   const cylVox=Math.pow(2*(RMAX+MARGIN)/PIX,2)*H/PIX;
   const time=frames/fps+scans*ovh;
-  return {NX,NY,PIX,W,WV,fps,exp,ovh,oh,ov,s,seg,wh,wv,L,ztop,levels,rings,Kmax,scans,frames,uniFrames,raw:frames*frame,vox,sino,brainVox,cylVox,time,frame,mode,projMode};
+  return {c,NX,NY,PIX,W,WV,fps,exp,ovh,oh,ov,s,seg,wh,wv,L,ztop,levels,rings,Kmax,scans,frames,uniFrames,raw:frames*frame,vox,sino,brainVox,cylVox,time,frame,mode,projMode};
 }
 
 const NS='http://www.w3.org/2000/svg';
@@ -261,14 +265,14 @@ function drawVertical(svg,img,Pl,centre,width){
   const {W,WV}=Pl, sc=Math.max(0.6,Math.min(1.6,H/26));
   const padL=1.6*sc,padR=1.2*sc,padT=1.4*sc,padB=1.2*sc;
   const x0=-centre*P, x1=x0+width*P;
-  const span=Math.max(-x0,x1,RMAX+MARGIN,(Pl.Kmax-1)*Pl.wh+W)+0.2;
+  const span=Math.max(-x0,x1,RMAX+MARGIN,(Pl.Kmax-1)*Pl.wh-Pl.c+W)+0.2;
   const zt=Math.min(0,Pl.ztop), zb=Math.max(H,Pl.ztop+(Pl.L-1)*Pl.wv+WV);
   const vb=[-span-padL,zt-padT,2*span+padL+padR,zb-zt+padT+padB];
   svg.setAttribute('viewBox',vb.join(' '));
   el('image',{href:'data:image/png;base64,'+img,x:x0,y:0,width:width*P,height:H,preserveAspectRatio:'none'},svg);
   const lw=0.035*sc;
   Pl.levels.forEach(v=>{for(let k=0;k<v.K;k++){
-    const c=ringColor(k,Pl.Kmax), on=selRing===null||selRing===k, x=k*Pl.wh;
+    const c=ringColor(k,Pl.Kmax), on=selRing===null||selRing===k, x=k*Pl.wh-Pl.c;
     el('rect',{x,y:v.a,width:W,height:WV,fill:c,'fill-opacity':on?0.22:0.05,stroke:c,'stroke-opacity':on?0.95:0.25,'stroke-width':lw},svg);
     el('rect',{x:-x-W,y:v.a,width:W,height:WV,fill:'none',stroke:c,'stroke-opacity':on?0.55:0.15,'stroke-width':lw,'stroke-dasharray':`${0.12*sc} ${0.1*sc}`},svg);
   }});
@@ -293,15 +297,15 @@ function levelAt(Pl,z){
 function drawHorizontal(svg,img,i,Pl){
   svg.innerHTML='';
   const {W}=Pl, z=(D.zh[i]+0.5)*P, lv=levelAt(Pl,z);
-  const S=Math.max(Math.max(D.nx,D.ny)*P/2+0.4,(Pl.Kmax-1)*Pl.wh+W)+0.3;
+  const S=Math.max(Math.max(D.nx,D.ny)*P/2+0.4,(Pl.Kmax-1)*Pl.wh-Pl.c+W)+0.3;
   svg.setAttribute('viewBox',[-S,-S-1.6,2*S,2*S+2.6].join(' '));
   el('image',{href:'data:image/png;base64,'+img,x:-D.cx*P-P/2,y:-D.cy*P-P/2,width:D.nx*P,height:D.ny*P,preserveAspectRatio:'none'},svg);
   for(let k=lv.K-1;k>=0;k--){
-    const c=ringColor(k,Pl.Kmax), on=selRing===null||selRing===k, r0=k*Pl.wh, r1=r0+W;
+    const c=ringColor(k,Pl.Kmax), on=selRing===null||selRing===k, r0=Math.max(0,k*Pl.wh-Pl.c), r1=k*Pl.wh-Pl.c+W;
     el('circle',{cx:0,cy:0,r:r1,fill:'none',stroke:c,'stroke-width':0.06,'stroke-opacity':on?0.95:0.25},svg);
     if(selRing===k) el('circle',{cx:0,cy:0,r:(r0+r1)/2,fill:'none',stroke:c,'stroke-width':r1-r0,'stroke-opacity':0.18},svg);
   }
-  const kd=selRing!==null&&selRing<lv.K?selRing:lv.K-1, cd=ringColor(kd,Pl.Kmax), xd=kd*Pl.wh;
+  const kd=selRing!==null&&selRing<lv.K?selRing:lv.K-1, cd=ringColor(kd,Pl.Kmax), xd=kd*Pl.wh-Pl.c;
   el('rect',{x:xd,y:-S,width:W,height:2*S,fill:cd,'fill-opacity':0.13,stroke:cd,'stroke-width':0.03,'stroke-dasharray':'0.15 0.1'},svg);
   el('rect',{x:xd,y:-S-1.1,width:W,height:0.35,fill:cd},svg);
   txt(svg,xd+W/2,-S-1.25,'detector',{fill:'#fff','font-size':0.5,'text-anchor':'middle','font-family':MONO});
@@ -311,7 +315,7 @@ function drawHorizontal(svg,img,i,Pl){
   el('line',{x1:S-5.4,x2:S-0.4,y1:S+0.6,y2:S+0.6,stroke:'#fff','stroke-width':0.12},svg);
   txt(svg,S-2.9,S+0.35,'5 mm',{fill:'#fff','font-size':0.5,'text-anchor':'middle','font-family':MONO});
   const name=['Top','Middle','Bottom'][i];
-  $('c'+i).innerHTML=`<b>${name}</b> · z = ${z.toFixed(1)} mm from top · level L${lv.l+1} · ${lv.K} rings to r = ${((lv.K-1)*Pl.wh+W).toFixed(2)} mm (tissue ${(lv.R-MARGIN).toFixed(2)} mm). Strip shown: ring ${kd+1}.`;
+  $('c'+i).innerHTML=`<b>${name}</b> · z = ${z.toFixed(1)} mm from top · level L${lv.l+1} · ${lv.K} rings to r = ${((lv.K-1)*Pl.wh-Pl.c+W).toFixed(2)} mm (tissue ${(lv.R-MARGIN).toFixed(2)} mm). Strip shown: ring ${kd+1}.`;
 }
 
 function drawStepChart(svg,Pl){
@@ -372,14 +376,14 @@ function render(){
     ['Reconstruction',fmtB(Pl.vox*4),`float32 · ${fmtB(Pl.vox*2)} as uint16`],
     ['Beam time',fmtT(Pl.time),expWarn?`<span class="warn">exposure ${(Pl.exp*1000).toFixed(0)} ms > frame period ${(1000/Pl.fps).toFixed(0)} ms</span>`:`${Pl.fps} fps · ${fmtB(Pl.frame*Pl.fps)}/s to disk · ${fmtN(Pl.ovh)} s/scan overhead`],
   ].map(([a,b,c])=>`<div class="tot"><span class="eyebrow">${a}</span><span class="v">${b}</span><span class="s">${c}</span></div>`).join('');
-  $('legend').innerHTML=Pl.rings.map(r=>`<span data-k="${r.k}"><i style="background:${ringColor(r.k,Pl.Kmax)}"></i>ring ${r.k+1}: ${r.r0.toFixed(2)}–${r.r1.toFixed(2)} mm</span>`).join('');
+  $('legend').innerHTML=Pl.rings.map(r=>`<span data-k="${r.k}"><i style="background:${ringColor(r.k,Pl.Kmax)}"></i>ring ${r.k+1}: ${Math.max(0,r.r0).toFixed(2)}–${r.r1.toFixed(2)} mm</span>`).join('');
   $('legend').querySelectorAll('span').forEach(s=>s.onclick=()=>{const k=+s.dataset.k;selRing=selRing===k?null:k;render();});
   drawVertical($('vxz'),D.xz,Pl,D.cx,D.nx);
   drawVertical($('vyz'),D.yz,Pl,D.cy,D.ny);
   [0,1,2].forEach(i=>drawHorizontal($('h'+i),D.h[i],i,Pl));
   drawStepChart($('stepchart'),Pl);
-  $('rings').innerHTML=`<thead><tr><th>Ring</th><th>Radius, mm</th><th>Axis outside frame, px</th><th>Levels</th><th>Frames, all levels</th><th>vs uniform</th><th>Raw data</th><th>Scan time</th></tr></thead><tbody>`+
-    Pl.rings.map(r=>`<tr data-k="${r.k}" class="${selRing===r.k?'sel':''}"><td><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${ringColor(r.k,Pl.Kmax)};margin-right:8px"></span>${r.k+1}</td><td>${r.r0.toFixed(2)} – ${r.r1.toFixed(2)}</td><td>${r.k===0?'0 (at frame edge)':fmtN(r.r0/PIX)}</td><td>${r.nlev}</td><td>${fmtN(r.frames)}</td><td>${(100*r.frames/r.uni).toFixed(0)}%</td><td>${fmtB(r.frames*Pl.frame)}</td><td>${fmtT(r.frames/Pl.fps+r.nlev*Pl.ovh)}</td></tr>`).join('')+
+  $('rings').innerHTML=`<thead><tr><th>Ring</th><th>Radius, mm</th><th>Axis to frame edge, px</th><th>Levels</th><th>Frames, all levels</th><th>vs uniform</th><th>Raw data</th><th>Scan time</th></tr></thead><tbody>`+
+    Pl.rings.map(r=>`<tr data-k="${r.k}" class="${selRing===r.k?'sel':''}"><td><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${ringColor(r.k,Pl.Kmax)};margin-right:8px"></span>${r.k+1}</td><td>${Math.max(0,r.r0).toFixed(2)} – ${r.r1.toFixed(2)}</td><td>${r.k===0?fmtN(Pl.c/PIX)+' inside frame':fmtN(r.r0/PIX)+' outside'}</td><td>${r.nlev}</td><td>${fmtN(r.frames)}</td><td>${(100*r.frames/r.uni).toFixed(0)}%</td><td>${fmtB(r.frames*Pl.frame)}</td><td>${fmtT(r.frames/Pl.fps+r.nlev*Pl.ovh)}</td></tr>`).join('')+
     `</tbody><tfoot><tr><td>Total</td><td></td><td></td><td>${Pl.scans} scans</td><td>${fmtN(Pl.frames)}</td><td>${(100*Pl.frames/Pl.uniFrames).toFixed(0)}%</td><td>${fmtB(Pl.raw)}</td><td>${fmtT(Pl.time)}</td></tr></tfoot>`;
   $('rings').querySelectorAll('tbody tr').forEach(tr=>tr.onclick=()=>{const k=+tr.dataset.k;selRing=selRing===k?null:k;render();});
   $('levels').innerHTML=`<thead><tr><th>Level</th><th>z, mm</th><th>Tissue r, mm</th><th>Rings</th><th>Frames per ring</th><th>Frames</th><th>Raw data</th></tr></thead><tbody>`+
@@ -398,7 +402,7 @@ function render(){
     '</tbody>';
   $('notes').innerHTML=`
     <p><b>Field of view.</b> One frame is ${W.toFixed(3)} × ${WV.toFixed(3)} mm. With the overlaps set above, each ring adds ${Pl.wh.toFixed(3)} mm of radius and each level adds ${Pl.wv.toFixed(3)} mm of height.</p>
-    <p><b>Rings.</b> Every ring is a 360° scan with the axis outside the frame, shifted ${fmtN(Pl.wh/PIX)} px per ring. Ring 1 has the axis at the frame edge and covers r = 0 to ${W.toFixed(2)} mm.</p>
+    <p><b>Rings.</b> Every ring is a 360° scan with the axis outside the frame, shifted ${fmtN(Pl.wh/PIX)} px per ring. Ring 1 has the axis ${fmtN(Pl.c/PIX)} px inside the frame, so θ and θ+180° overlap by ${fmtN(2*Pl.c/PIX)} px around the axis (the same overlap as between rings), and ring 1 covers r = 0 to ${(W-Pl.c).toFixed(2)} mm.</p>
     <p><b>Angular step.</b> A tissue point at depth s along the beam moves s·Δθ across the detector per step, so Nyquist needs Δθ ≤ p / S(θ), where S is the deepest tissue along the rays a ring sees. Inner rings see the full diameter and stay near the uniform step p/R. Outer rings and the end levels cut short chords and can use larger steps. Where S = 0 the frames are skipped.</p>
     <p><b>Fold and stitching.</b> Wherever both θ and θ+180° record, they get the same step, so the 360° → 180° fold pairs exact angles. If one half sees no tissue, it is filled with flat on any angles. Rings have different angle sets, so before stitching across rings, interpolate the outer rings along θ onto the inner ring's angles. That is safe because each ring is sampled above its own Nyquist limit.</p>
     <p><b>Fly scan.</b> The frame rate stays constant and the rotation speed follows the step: speed = step × frame rate, constant over each ${Pl.seg}° segment, and the 0–180° profile repeats over 180–360°. The beam-time estimate counts frames ÷ frame rate plus a fixed overhead per scan. It does not include acceleration ramps.</p>
@@ -411,3 +415,5 @@ $('lev').addEventListener('change',()=>{selLevel=+$('lev').value;render();});
 render();
 
 </script>
+
+</body></html>
