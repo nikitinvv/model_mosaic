@@ -38,6 +38,11 @@ h2{font-size:1.05rem;font-weight:600;margin:0;text-wrap:balance}
 .ctl output{font-family:var(--f-mono);font-size:.85rem;min-width:5.5em;text-align:right}
 .ctl select,.ctl input[type=number]{font:inherit;font-size:.9rem;padding:4px 6px;border:1px solid var(--rule);border-radius:4px;background:var(--bg);color:var(--fg);width:100%}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.calcrow{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;border-top:1px solid var(--rule);padding-top:12px}
+.calcrow button{font:inherit;font-weight:600;font-size:.95rem;padding:8px 22px;border-radius:5px;border:1px solid var(--accent);background:var(--panel);color:var(--accent);cursor:pointer}
+.calcrow button.dirty{background:var(--accent);color:var(--panel)}
+.calcrow button:disabled{opacity:.6;cursor:progress}
+.calcrow span{font-size:.85rem;color:var(--muted)}
 .totals{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:1px;background:var(--rule);border:1px solid var(--rule);border-radius:6px;overflow:hidden}
 .tot{background:var(--panel);padding:12px 16px;display:flex;flex-direction:column;gap:2px;min-width:0}
 .tot .v{font-family:var(--f-mono);font-size:1.35rem;font-weight:500}
@@ -74,7 +79,7 @@ tfoot td{font-weight:500;border-bottom:0}
   <header>
     <div class="eyebrow" id="eyebrow" style="text-transform:none;letter-spacing:.04em">Marmoset brain · scan plan</div>
     <h1 id="ptitle">Mosaic scanning geometry</h1>
-    <p class="lede">Background images are the existing 1.9 µm reconstruction (scans 180–186), binned to 61 µm. Each horizontal position is a 360° off-axis scan that covers one annulus around the rotation axis; vertical levels stack the annuli along the brain. Tiles and numbers update with the settings.</p>
+    <p class="lede">Background images are the existing 1.9 µm reconstruction (scans 180–186), binned to 61 µm. Each horizontal position is a 360° off-axis scan that covers one annulus around the rotation axis; vertical levels stack the annuli along the brain. Change the settings and press Calculate to update the tiles and numbers.</p>
   </header>
 
   <section class="controls" aria-label="Scan settings">
@@ -96,6 +101,7 @@ tfoot td{font-weight:500;border-bottom:0}
       <select id="proj"><option value="adaptive" selected>Adaptive, same at θ and θ+180°</option><option value="uniform">Uniform (Nyquist at tissue radius)</option></select></div>
     <div class="ctl"><label for="seg">Adaptive step held constant over</label>
       <select id="seg"><option value="2">2° (≈ continuous)</option><option value="10">10° segments</option><option value="16">16° segments</option><option value="30" selected>30° segments</option><option value="60">60° segments</option></select></div>
+    <div class="calcrow"><button id="calc" type="button">Calculate</button><span id="calcstate" aria-live="polite"></span></div>
   </section>
 
   <section class="totals" id="totals" aria-label="Totals"></section>
@@ -168,7 +174,11 @@ function ringColor(k,K){const t=K>1?k/(K-1):0;const h=188-158*t;return `hsl(${h}
 function fmtB(b){const u=['B','KB','MB','GB','TB','PB'];let i=0;while(b>=1000&&i<5){b/=1000;i++;}return (b>=100?b.toFixed(0):b>=10?b.toFixed(1):b.toFixed(2))+' '+u[i];}
 function fmtN(n){return Math.round(n).toLocaleString('en-US');}
 function fmtT(s){const h=s/3600;return h>=48?(h/24).toFixed(1)+' days':h.toFixed(1)+' h';}
-function num(id,def){const v=parseFloat($(id).value);return isFinite(v)&&v>0?v:def;}
+const IDS=['nx','ny','pix','fps','exp','ovh','oh','ov','s','mode','proj','seg'];
+let applied={};
+function snapshot(){const o={};IDS.forEach(id=>o[id]=$(id).value);return o;}
+function V(id){return applied[id];}
+function num(id,def){const v=parseFloat(V(id));return isFinite(v)&&v>0?v:def;}
 
 // deepest tissue along the rays seen by a ring at each of 180 angles (mm, 0 = no tissue)
 function depthProfile(za,zb,r0,r1){
@@ -205,10 +215,10 @@ function pairedProfile(S,segDeg){
 
 function plan(){
   const NX=Math.round(num('nx',4096)), NY=Math.round(num('ny',4096)), PIX=num('pix',0.5)*1e-3;
-  const fps=num('fps',20), exp=num('exp',45)/1000, ovh=parseFloat($('ovh').value)||0;
+  const fps=num('fps',20), exp=num('exp',45)/1000, ovh=parseFloat(V('ovh'))||0;
   const W=NX*PIX, WV=NY*PIX;
-  const oh=+$('oh').value/100, ov=+$('ov').value/100, s=+$('s').value;
-  const mode=$('mode').value, projMode=$('proj').value, seg=+$('seg').value;
+  const oh=+V('oh')/100, ov=+V('ov')/100, s=+V('s');
+  const mode=V('mode'), projMode=V('proj'), seg=+V('seg');
   const wh=W*(1-oh), wv=WV*(1-ov), c=oh*W/2;   // c: axis inside ring-1 frame (centre overlap = oh*W)
   const L=Math.max(1,Math.ceil(Math.max(0,H-WV)/wv)+1);
   const Hcov=(L-1)*wv+WV, ztop=H/2-Hcov/2;
@@ -361,9 +371,6 @@ function render(){
   const {NX,NY,PIX,W,WV}=Pl, pum=+(PIX*1e3).toFixed(3);
   $('eyebrow').textContent=`Marmoset brain · scan plan · ${NX} × ${NY} detector · ${pum} µm pixel · field of view ${W.toFixed(2)} × ${WV.toFixed(2)} mm`;
   $('ptitle').textContent=`Mosaic scanning geometry at ${pum} µm`;
-  $('oh_o').textContent=`${(Pl.oh*100).toFixed(0)}% · ${Math.round(Pl.oh*NX)} px`;
-  $('ov_o').textContent=`${(Pl.ov*100).toFixed(0)}% · ${Math.round(Pl.ov*NY)} px`;
-  $('s_o').textContent=Pl.s.toFixed(2)+(Math.abs(Pl.s-PREV_S)<0.011?' (as 180–186)':'');
   if(selLevel===null||selLevel>=Pl.L) selLevel=Math.floor((Pl.L-1)/2);
   $('lev').innerHTML=Pl.levels.map(v=>`<option value="${v.l}"${v.l===selLevel?' selected':''}>L${v.l+1} · z ${Math.max(0,v.a).toFixed(1)}–${Math.min(H,v.b).toFixed(1)} mm · ${v.K} rings</option>`).join('');
   if(selRing!==null&&selRing>=Pl.Kmax) selRing=null;
@@ -410,9 +417,29 @@ function render(){
     <p><b>Container.</b> The container wall (r ≈ 10.2–10.4 mm) was removed from these images. If the tube stays on, the skipped frames see only the tube. For a centred tube that projection is the same at every angle, so fill the gaps with the tube profile from the recorded frames.</p>
     <p><b>Where the numbers come from.</b> Tissue radius and depth are measured on the 61 µm data with a 0.1 mm margin and 2° of angular padding. The axis is assumed at the container centre. Angular sampling s scales all frame counts. Scans 180–186 used about s = 0.32.</p>`;
 }
-['nx','ny','pix','fps','exp','ovh','oh','ov','s','mode','proj','seg'].forEach(id=>$(id).addEventListener('input',render));
+function labels(){
+  const nx=+$('nx').value||0, ny=+$('ny').value||0, oh=+$('oh').value/100, ov=+$('ov').value/100, sv=+$('s').value;
+  $('oh_o').textContent=`${(oh*100).toFixed(0)}% · ${Math.round(oh*nx)} px`;
+  $('ov_o').textContent=`${(ov*100).toFixed(0)}% · ${Math.round(ov*ny)} px`;
+  $('s_o').textContent=sv.toFixed(2)+(Math.abs(sv-PREV_S)<0.011?' (as 180–186)':'');
+}
+function markDirty(){
+  labels();
+  const cur=snapshot(), dirty=IDS.some(id=>cur[id]!==applied[id]);
+  $('calcstate').textContent=dirty?'Settings changed. Press Calculate to update.':'Results match these settings.';
+  $('calcstate').classList.toggle('warn',dirty);
+  $('calc').classList.toggle('dirty',dirty);
+}
+function calculate(){
+  applied=snapshot();
+  $('calc').disabled=true; $('calcstate').textContent='Calculating…';
+  setTimeout(()=>{render(); $('calc').disabled=false; markDirty();},20);
+}
+IDS.forEach(id=>$(id).addEventListener('input',markDirty));
+IDS.forEach(id=>$(id).addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();calculate();}}));
+$('calc').addEventListener('click',calculate);
 $('lev').addEventListener('change',()=>{selLevel=+$('lev').value;render();});
-render();
+applied=snapshot(); labels(); render(); markDirty();
 
 </script>
 
