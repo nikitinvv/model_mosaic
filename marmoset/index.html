@@ -43,6 +43,9 @@ h2{font-size:1.05rem;font-weight:600;margin:0;text-wrap:balance}
 .calcrow button.dirty{background:var(--accent);color:var(--panel)}
 .calcrow button:disabled{opacity:.6;cursor:progress}
 .calcrow span{font-size:.85rem;color:var(--muted)}
+#scantable td{padding:4px 10px}
+#scantable thead th{position:sticky;top:0;background:var(--panel);z-index:1}
+#scantable tr.scansum td{color:var(--muted);font-size:.8rem;border-bottom:1px solid var(--rule)}
 .totals{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:1px;background:var(--rule);border:1px solid var(--rule);border-radius:6px;overflow:hidden}
 .tot{background:var(--panel);padding:12px 16px;display:flex;flex-direction:column;gap:2px;min-width:0}
 .tot .v{font-family:var(--f-mono);font-size:1.35rem;font-weight:500}
@@ -83,11 +86,12 @@ tfoot td{font-weight:500;border-bottom:0}
   </header>
 
   <section class="controls" aria-label="Scan settings">
-    <div class="ctl"><label for="nx">Sensor width, px</label><input id="nx" type="number" min="256" step="256" value="4096"></div>
-    <div class="ctl"><label for="ny">Sensor height, px</label><input id="ny" type="number" min="256" step="256" value="4096"></div>
-    <div class="ctl"><label for="pix">Pixel size, µm</label><input id="pix" type="number" min="0.05" step="0.05" value="0.5"></div>
+    <div class="ctl"><label for="nx">Sensor width, px</label><input id="nx" type="number" min="256" step="16" value="4432"></div>
+    <div class="ctl"><label for="ny">Sensor height, px</label><input id="ny" type="number" min="256" step="16" value="2368"></div>
+    <div class="ctl"><label for="pix">Pixel size, µm</label><input id="pix" type="number" min="0.01" step="0.01" value="0.46"></div>
+    <div class="ctl"><label for="cpr">Encoder counts per 360°</label><input id="cpr" type="number" min="1000" step="2" value="8192000"></div>
     <div class="ctl"><label for="fps">Frame rate, frames/s</label><input id="fps" type="number" min="0.1" step="1" value="20"></div>
-    <div class="ctl"><label for="exp">Exposure per frame, ms</label><input id="exp" type="number" min="0.1" step="1" value="45"></div>
+    <div class="ctl"><label for="exp">Exposure per frame, ms</label><input id="exp" type="number" min="0.1" step="1" value="40"></div>
     <div class="ctl"><label for="ovh">Overhead per scan, s (flats, moves)</label><input id="ovh" type="number" min="0" step="10" value="60"></div>
     <div class="ctl"><label for="oh">Horizontal overlap between rings</label>
       <div class="row"><input id="oh" type="range" min="2" max="30" step="1" value="10"><output id="oh_o"></output></div></div>
@@ -133,6 +137,14 @@ tfoot td{font-weight:500;border-bottom:0}
       <div class="ctl" style="min-width:150px"><label for="lev">Level</label><select id="lev"></select></div>
     </div>
     <div class="tablewrap" style="padding:8px 8px 4px"><svg id="stepchart" role="img" aria-label="Angular step per ring versus rotation angle" style="display:block;width:100%;min-width:560px;height:auto"></svg></div>
+    <div class="tablewrap" style="max-height:420px;overflow-y:auto"><table id="segtable"></table></div>
+    <p class="eyebrow" id="segcap" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem"></p>
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin-top:6px">
+      <h2 style="font-size:.95rem">PSO segments, all levels (CSV)</h2>
+      <button id="psocopy" type="button" style="font:inherit;font-size:.85rem;padding:4px 14px;border-radius:4px;border:1px solid var(--accent);background:var(--panel);color:var(--accent);cursor:pointer">Copy</button>
+      <span id="psocount" style="font-size:.8rem;color:var(--muted)"></span>
+    </div>
+    <textarea id="psocsv" readonly spellcheck="false" style="width:100%;height:180px;font-family:var(--f-mono);font-size:.78rem;padding:8px;border:1px solid var(--rule);border-radius:6px;background:var(--panel);color:var(--fg);resize:vertical"></textarea>
   </section>
 
   <section class="two">
@@ -145,6 +157,15 @@ tfoot td{font-weight:500;border-bottom:0}
       <h2>Levels (vertical positions)</h2>
       <div class="tablewrap" style="max-height:360px;overflow-y:auto"><table id="levels"></table></div>
     </div>
+  </section>
+
+  <section class="section">
+    <div style="display:flex;flex-wrap:wrap;gap:10px 20px;align-items:end;justify-content:space-between">
+      <div><h2>Scan list</h2>
+        <p class="lede" style="margin-top:4px">One block per scan, in order: levels top to bottom, rings inner to outer. Each row is one recorded angular segment, in angle order over 0–360°. Skipped segments are left out. "Axis to frame centre" is the lateral offset of the rotation axis from the detector centre; z is the level centre from the top of the brain.</p></div>
+      <div class="ctl" style="min-width:140px"><label for="scanlev">Show</label><select id="scanlev"><option value="all">All levels</option></select></div>
+    </div>
+    <div class="tablewrap" style="max-height:560px;overflow-y:auto"><table id="scantable"></table></div>
   </section>
 
   <section class="section">
@@ -174,7 +195,7 @@ function ringColor(k,K){const t=K>1?k/(K-1):0;const h=188-158*t;return `hsl(${h}
 function fmtB(b){const u=['B','KB','MB','GB','TB','PB'];let i=0;while(b>=1000&&i<5){b/=1000;i++;}return (b>=100?b.toFixed(0):b>=10?b.toFixed(1):b.toFixed(2))+' '+u[i];}
 function fmtN(n){return Math.round(n).toLocaleString('en-US');}
 function fmtT(s){const h=s/3600;return h>=48?(h/24).toFixed(1)+' days':h.toFixed(1)+' h';}
-const IDS=['nx','ny','pix','fps','exp','ovh','oh','ov','s','mode','proj','seg'];
+const IDS=['nx','ny','pix','cpr','fps','exp','ovh','oh','ov','s','mode','proj','seg'];
 let applied={};
 function snapshot(){const o={};IDS.forEach(id=>o[id]=$(id).value);return o;}
 function V(id){return applied[id];}
@@ -198,24 +219,64 @@ function depthProfile(za,zb,r0,r1){
   return out;
 }
 // pair theta and theta+180 where both record; hold step constant over segments
-function pairedProfile(S,segDeg){
-  const nb=Math.max(1,Math.round(segDeg/2)), f=new Float64Array(NB);
+// PSO schedule in encoder counts. One half rotation (CPR/2 counts) is cut into segments of about
+// segDeg. In a segment the step d is a whole number of counts, the largest that meets Nyquist, and
+// the segment holds n frames, so it spans exactly n*d counts. Boundaries float slightly; the last
+// recorded segment is fitted so the half ends exactly at CPR/2. The same (start, d, n) list is used
+// for 0-180 and 180-360 (shifted by CPR/2), so the fold pairs identical angles. A half-segment with
+// no tissue is skipped (no triggers).
+function bestDivisor(rem,dmax,lo){for(let d=Math.min(dmax,rem);d>=lo;d--) if(rem%d===0) return d; return 0;}
+function schedule(S,segDeg,s,PIX,CPR,uniformR){
+  const HALF=CPR/2, nb=Math.max(1,Math.round(segDeg/2)), segs=[];
   for(let s0=0;s0<NTH;s0+=nb){
-    const s1=Math.min(NTH,s0+nb);
-    let A=0,B=0,both=false;
-    for(let j=s0;j<s1;j++){A=Math.max(A,S[j]);B=Math.max(B,S[j+NTH]);if(S[j]>0&&S[j+NTH]>0)both=true;}
-    const m=Math.max(A,B);
-    for(let j=s0;j<s1;j++){
-      f[j]=S[j]>0?(both?m:A):0;
-      f[j+NTH]=S[j+NTH]>0?(both?m:B):0;
-    }
+    const s1=Math.min(NTH,s0+nb); let A=false,B=false,dep=0;
+    if(uniformR){A=B=true;dep=uniformR;}
+    else for(let j=s0;j<s1;j++){if(S[j]>0)A=true;if(S[j+NTH]>0)B=true;dep=Math.max(dep,S[j],S[j+NTH]);}
+    const dmax=dep>0?Math.max(1,Math.floor(PIX/(s*dep)/(2*Math.PI)*CPR)):0;
+    segs.push({s0,s1,A,B,dmax,endNom:Math.round(s1*2/360*CPR),n:0,d:0});
   }
-  return f;
+  const rec=segs.map(q=>q.A||q.B), last=segs.length-1;
+  let pos=0;
+  for(let i=0;i<=last;i++){
+    const q=segs[i]; q.start=pos;
+    if(!rec[i]){pos=Math.max(pos,i===last?HALF:q.endNom);q.end=pos;continue;}
+    if(i<last){q.d=q.dmax;q.n=Math.ceil(Math.max(1,q.endNom-pos)/q.d);pos+=q.n*q.d;q.end=pos;continue;}
+    // last segment of the half: end exactly at HALF
+    if(i>0&&!rec[i-1]){                       // empty segment before it absorbs the slack
+      q.d=q.dmax; q.n=Math.max(1,Math.ceil((HALF-segs[i-1].endNom)/q.d));
+      while(q.n>1&&HALF-q.n*q.d<segs[i-1].start) q.n--;
+      q.start=HALF-q.n*q.d; segs[i-1].end=q.start;
+    } else if(i===0){
+      q.d=bestDivisor(HALF,q.dmax,1); q.n=HALF/q.d; q.start=0;
+    } else {                                  // adjust the previous segment's frame count until the rest divides
+      const p=segs[i-1], lo=Math.max(1,Math.ceil(0.8*q.dmax)); let done=false;
+      for(let k=0;k<=600&&!done;k++){
+        const delta=(k%2?1:-1)*Math.ceil(k/2), np=p.n+delta;
+        if(np<1) continue;
+        const st=p.start+np*p.d, rem=HALF-st;
+        if(rem<=0) continue;
+        const d=bestDivisor(rem,q.dmax,lo);
+        if(d){p.n=np;p.end=st;q.start=st;q.d=d;q.n=rem/d;done=true;}
+      }
+      if(!done){const rem=HALF-q.start;q.d=bestDivisor(rem,q.dmax,1);q.n=rem/q.d;}
+    }
+    q.end=HALF; pos=HALF;
+  }
+  const f=new Float64Array(NB);
+  let n=0;
+  segs.forEach(q=>{
+    if(!q.n) return;
+    const fe=PIX/(s*(q.d/CPR*2*Math.PI));
+    for(let j=q.s0;j<q.s1;j++){if(q.A)f[j]=fe;if(q.B)f[j+NTH]=fe;}
+    n+=q.n*((q.A?1:0)+(q.B?1:0));
+  });
+  return {f,segs,n};
 }
 
 function plan(){
-  const NX=Math.round(num('nx',4096)), NY=Math.round(num('ny',4096)), PIX=num('pix',0.5)*1e-3;
-  const fps=num('fps',20), exp=num('exp',45)/1000, ovh=parseFloat(V('ovh'))||0;
+  const NX=Math.round(num('nx',4432)), NY=Math.round(num('ny',2368)), PIX=num('pix',0.46)*1e-3;
+  let CPR=Math.round(num('cpr',8192000)); if(CPR%2) CPR++;
+  const fps=num('fps',20), exp=num('exp',40)/1000, ovh=parseFloat(V('ovh'))||0;
   const W=NX*PIX, WV=NY*PIX;
   const oh=+V('oh')/100, ov=+V('ov')/100, s=+V('s');
   const mode=V('mode'), projMode=V('proj'), seg=+V('seg');
@@ -235,13 +296,10 @@ function plan(){
     const Nuni=s*2*Math.PI*R/PIX;
     const rings=[];
     for(let k=0;k<K;k++){
-      let n=Nuni, prof=null;
-      if(projMode==='adaptive'){
-        prof=pairedProfile(depthProfile(Math.max(0,a),Math.min(H,b),ringIn(k),ringOut(k)),seg);
-        let sum=0; for(let j=0;j<NB;j++) sum+=prof[j];
-        n=s*sum*DTH/PIX;
-      }
-      rings.push({k,n:Math.ceil(n),prof});
+      const sp=projMode==='adaptive'
+        ?schedule(depthProfile(Math.max(0,a),Math.min(H,b),ringIn(k),ringOut(k)),seg,s,PIX,CPR,0)
+        :schedule(null,seg,s,PIX,CPR,R);
+      rings.push({k,n:sp.n,prof:projMode==='adaptive'?sp.f:null,segs:sp.segs});
     }
     const proj=rings.reduce((t,q)=>t+q.n,0);
     const sa=Math.max(0,l===0?0:a+(WV-wv)/2), sb=Math.min(H,l===L-1?H:a+(WV-wv)/2+wv);
@@ -262,7 +320,7 @@ function plan(){
   const brainVox=D.vox*Math.pow(P/PIX,3);
   const cylVox=Math.pow(2*(RMAX+MARGIN)/PIX,2)*H/PIX;
   const time=frames/fps+scans*ovh;
-  return {c,NX,NY,PIX,W,WV,fps,exp,ovh,oh,ov,s,seg,wh,wv,L,ztop,levels,rings,Kmax,scans,frames,uniFrames,raw:frames*frame,vox,sino,brainVox,cylVox,time,frame,mode,projMode};
+  return {CPR,c,NX,NY,PIX,W,WV,fps,exp,ovh,oh,ov,s,seg,wh,wv,L,ztop,levels,rings,Kmax,scans,frames,uniFrames,raw:frames*frame,vox,sino,brainVox,cylVox,time,frame,mode,projMode};
 }
 
 const NS='http://www.w3.org/2000/svg';
@@ -389,6 +447,44 @@ function render(){
   drawVertical($('vyz'),D.yz,Pl,D.cy,D.ny);
   [0,1,2].forEach(i=>drawHorizontal($('h'+i),D.h[i],i,Pl));
   drawStepChart($('stepchart'),Pl);
+  {
+    const lv=Pl.levels[selLevel], segs0=lv.rings[0].segs, C=Pl.CPR;
+    const cell=q=>{
+      if(!q.n||!(q.A||q.B)) return '<td>skip</td>';
+      const half=q.A&&q.B?'':q.A?' <span style="color:var(--muted)">(0–180° only)</span>':' <span style="color:var(--muted)">(180–360° only)</span>';
+      return `<td title="start ${fmtN(q.start)} counts = ${(q.start/C*360).toFixed(5)}°, step ${(q.d/C*360).toFixed(6)}°">${fmtN(q.n)} × ${q.d}${half}</td>`;
+    };
+    const showRows=segs0.length<=40;
+    $('segtable').innerHTML=`<thead><tr><th>θ, nominal</th>${lv.rings.map(r=>`<th><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ringColor(r.k,Pl.Kmax)};margin-right:6px"></span>ring ${r.k+1}</th>`).join('')}</tr></thead><tbody>`+
+      (showRows?segs0.map((q,i)=>`<tr><td>${q.s0*2}° – ${q.s1*2}°</td>${lv.rings.map(r=>cell(r.segs[i])).join('')}</tr>`).join(''):
+        `<tr><td colspan="${lv.K+1}" style="text-align:left;font-family:inherit">${segs0.length} segments per ring. Choose 10° or longer segments to list them.</td></tr>`)+
+      `</tbody><tfoot><tr><td>Frames per 360°</td>${lv.rings.map(r=>`<td>${fmtN(r.n)}</td>`).join('')}</tr></tfoot>`;
+    $('segcap').textContent=`Level L${lv.l+1}. Each cell: frames × step in encoder counts (${fmtN(C)} counts per 360°). The same list runs over 0–180° and again from ${fmtN(C/2)} counts for 180–360°. Each half ends exactly at ${fmtN(C/2)} counts. Hover a cell for its start count and step in degrees.`;
+    // one list of scans: level top -> bottom, ring inner -> outer; segments in angle order 0 -> 360
+    const scans=[]; let no=0;
+    Pl.levels.forEach(v=>v.rings.forEach(r=>{
+      no++;
+      const xoff=r.k*Pl.wh-Pl.c+Pl.W/2, zc=v.a+Pl.WV/2, segs=[];
+      [[0,'A'],[C/2,'B']].forEach(([off,h])=>r.segs.forEach(q=>{
+        if(q.n&&q[h]) segs.push({start:q.start+off,n:q.n,d:q.d,end:q.start+off+q.n*q.d});
+      }));
+      scans.push({no,l:v.l,k:r.k,xoff,zc,segs,frames:segs.reduce((t,q)=>t+q.n,0)});
+    }));
+    const deg=c=>(c/C*360).toFixed(5);
+    const lines=['scan,level,ring,axis_to_frame_centre_mm,level_centre_z_mm,segment,start_deg,n_angles,step_deg,end_deg,start_count,step_count,end_count'];
+    scans.forEach(sc=>sc.segs.forEach((q,i)=>lines.push([sc.no,sc.l+1,sc.k+1,sc.xoff.toFixed(4),sc.zc.toFixed(4),i+1,deg(q.start),q.n,(q.d/C*360).toFixed(7),deg(q.end),q.start,q.d,q.end].join(','))));
+    $('psocsv').value=lines.join('\n');
+    $('psocount').textContent=`${fmtN(scans.length)} scans · ${fmtN(lines.length-1)} segments · ${fmtN(Pl.frames)} frames`;
+    const fl=$('scanlev').value, sel=fl==='all'?scans:scans.filter(x=>x.l===+fl);
+    const optHTML=`<option value="all">All levels</option>`+Pl.levels.map(v=>`<option value="${v.l}">L${v.l+1}</option>`).join('');
+    if($('scanlev').dataset.n!==String(Pl.L)){const keep=fl;$('scanlev').innerHTML=optHTML;$('scanlev').dataset.n=String(Pl.L);$('scanlev').value=[...$('scanlev').options].some(o=>o.value===keep)?keep:'all';}
+    $('scantable').innerHTML=`<thead><tr><th>Scan</th><th>Level</th><th>Ring</th><th>Axis to frame centre, mm</th><th>z centre, mm</th><th>Seg</th><th>Start, °</th><th>N angles</th><th>Step, °</th><th>End, °</th><th>Start count</th><th>Step, counts</th><th>End count</th></tr></thead><tbody>`+
+      sel.map(sc=>sc.segs.map((q,i)=>{
+        const head=i===0, rs=`style="border-top:${head?'2px solid var(--rule)':'0'}"`;
+        const info=head?`<td><b>${sc.no}</b></td><td>L${sc.l+1}</td><td><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ringColor(sc.k,Pl.Kmax)};margin-right:6px"></span>${sc.k+1}</td><td>${sc.xoff.toFixed(3)}</td><td>${sc.zc.toFixed(3)}</td>`:'<td></td><td></td><td></td><td></td><td></td>';
+        return `<tr ${rs}>${info}<td>${i+1}</td><td>${deg(q.start)}</td><td>${fmtN(q.n)}</td><td>${(q.d/C*360).toFixed(6)}</td><td>${deg(q.end)}</td><td>${fmtN(q.start)}</td><td>${q.d}</td><td>${fmtN(q.end)}</td></tr>`;
+      }).join('')+`<tr class="scansum"><td></td><td colspan="4" style="text-align:left">scan ${sc.no} total</td><td></td><td></td><td>${fmtN(sc.frames)}</td><td colspan="5" style="text-align:left">${fmtT(sc.frames/Pl.fps+Pl.ovh)} · ${fmtB(sc.frames*Pl.frame)}</td></tr>`).join('')+'</tbody>';
+  }
   $('rings').innerHTML=`<thead><tr><th>Ring</th><th>Radius, mm</th><th>Axis to frame edge, px</th><th>Levels</th><th>Frames, all levels</th><th>vs uniform</th><th>Raw data</th><th>Scan time</th></tr></thead><tbody>`+
     Pl.rings.map(r=>`<tr data-k="${r.k}" class="${selRing===r.k?'sel':''}"><td><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${ringColor(r.k,Pl.Kmax)};margin-right:8px"></span>${r.k+1}</td><td>${Math.max(0,r.r0).toFixed(2)} – ${r.r1.toFixed(2)}</td><td>${r.k===0?fmtN(Pl.c/PIX)+' inside frame':fmtN(r.r0/PIX)+' outside'}</td><td>${r.nlev}</td><td>${fmtN(r.frames)}</td><td>${(100*r.frames/r.uni).toFixed(0)}%</td><td>${fmtB(r.frames*Pl.frame)}</td><td>${fmtT(r.frames/Pl.fps+r.nlev*Pl.ovh)}</td></tr>`).join('')+
     `</tbody><tfoot><tr><td>Total</td><td></td><td></td><td>${Pl.scans} scans</td><td>${fmtN(Pl.frames)}</td><td>${(100*Pl.frames/Pl.uniFrames).toFixed(0)}%</td><td>${fmtB(Pl.raw)}</td><td>${fmtT(Pl.time)}</td></tr></tfoot>`;
@@ -412,6 +508,7 @@ function render(){
     <p><b>Rings.</b> Every ring is a 360° scan with the axis outside the frame, shifted ${fmtN(Pl.wh/PIX)} px per ring. Ring 1 has the axis ${fmtN(Pl.c/PIX)} px inside the frame, so θ and θ+180° overlap by ${fmtN(2*Pl.c/PIX)} px around the axis (the same overlap as between rings), and ring 1 covers r = 0 to ${(W-Pl.c).toFixed(2)} mm.</p>
     <p><b>Angular step.</b> A tissue point at depth s along the beam moves s·Δθ across the detector per step, so Nyquist needs Δθ ≤ p / S(θ), where S is the deepest tissue along the rays a ring sees. Inner rings see the full diameter and stay near the uniform step p/R. Outer rings and the end levels cut short chords and can use larger steps. Where S = 0 the frames are skipped.</p>
     <p><b>Fold and stitching.</b> Wherever both θ and θ+180° record, they get the same step, so the 360° → 180° fold pairs exact angles. If one half sees no tissue, it is filled with flat on any angles. Rings have different angle sets, so before stitching across rings, interpolate the outer rings along θ onto the inner ring's angles. That is safe because each ring is sampled above its own Nyquist limit.</p>
+    <p><b>Frame counts.</b> Steps are whole encoder counts (${fmtN(Pl.CPR)} per 360°). In each segment the step is the largest whole count that meets Nyquist, and the segment spans exactly frames × step counts. Each half rotation ends exactly at ${fmtN(Pl.CPR/2)} counts, so 180–360° repeats 0–180° count for count and the 360° closes on 0.</p>
     <p><b>Fly scan.</b> The frame rate stays constant and the rotation speed follows the step: speed = step × frame rate, constant over each ${Pl.seg}° segment, and the 0–180° profile repeats over 180–360°. The beam-time estimate counts frames ÷ frame rate plus a fixed overhead per scan. It does not include acceleration ramps.</p>
     <p class="warn"><b>Height.</b> Tissue is present in the first and last slices of the 1.9 µm volume (${D.area[0].toFixed(1)} mm² at the top, ${D.area[D.nz-1].toFixed(1)} mm² at the bottom), so the real sample may be taller than ${H.toFixed(1)} mm. Add a level at each end if those parts are needed.</p>
     <p><b>Container.</b> The container wall (r ≈ 10.2–10.4 mm) was removed from these images. If the tube stays on, the skipped frames see only the tube. For a centred tube that projection is the same at every angle, so fill the gaps with the tube profile from the recorded frames.</p>
@@ -438,7 +535,9 @@ function calculate(){
 IDS.forEach(id=>$(id).addEventListener('input',markDirty));
 IDS.forEach(id=>$(id).addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();calculate();}}));
 $('calc').addEventListener('click',calculate);
+$('psocopy').addEventListener('click',()=>{const t=$('psocsv');const ok=()=>{$('psocopy').textContent='Copied';setTimeout(()=>$('psocopy').textContent='Copy',1500);};try{navigator.clipboard.writeText(t.value).then(ok,()=>{t.select();});}catch(e){t.select();}});
 $('lev').addEventListener('change',()=>{selLevel=+$('lev').value;render();});
+$('scanlev').addEventListener('change',render);
 applied=snapshot(); labels(); render(); markDirty();
 
 </script>
