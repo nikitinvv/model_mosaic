@@ -90,8 +90,8 @@ tfoot td{font-weight:500;border-bottom:0}
     <div class="ctl"><label for="ny">Sensor height, px</label><input id="ny" type="number" min="256" step="16" value="2368"></div>
     <div class="ctl"><label for="pix">Pixel size, µm</label><input id="pix" type="number" min="0.01" step="0.01" value="0.46"></div>
     <div class="ctl"><label for="cpr">Encoder counts per 360°</label><input id="cpr" type="number" min="1000" step="2" value="8192000"></div>
-    <div class="ctl"><label for="fps">Frame rate, frames/s</label><input id="fps" type="number" min="0.1" step="1" value="20"></div>
-    <div class="ctl"><label for="exp">Exposure per frame, ms</label><input id="exp" type="number" min="0.1" step="1" value="40"></div>
+    <div class="ctl"><label for="fps">Frame rate, frames/s</label><input id="fps" type="number" min="0.1" step="1" value="30"></div>
+    <div class="ctl"><label for="exp">Exposure per frame, ms</label><input id="exp" type="number" min="0.1" step="1" value="30"></div>
     <div class="ctl"><label for="ovh">Overhead per scan, s (flats, moves)</label><input id="ovh" type="number" min="0" step="10" value="60"></div>
     <div class="ctl"><label for="oh">Horizontal overlap between rings</label>
       <div class="row"><input id="oh" type="range" min="2" max="30" step="1" value="10"><output id="oh_o"></output></div></div>
@@ -299,7 +299,7 @@ function fromMaster(M,o,k,mode,s,PIX,CPR){
 function plan(){
   const NX=Math.round(num('nx',4432)), NY=Math.round(num('ny',2368)), PIX=num('pix',0.46)*1e-3;
   let CPR=Math.round(num('cpr',8192000)); if(CPR%2) CPR++;
-  const fps=num('fps',20), exp=num('exp',40)/1000, ovh=parseFloat(V('ovh'))||0;
+  const fps=num('fps',30), exp=num('exp',30)/1000, ovh=parseFloat(V('ovh'))||0;
   const W=NX*PIX, WV=NY*PIX;
   const oh=+V('oh')/100, ov=+V('ov')/100, s=+V('s');
   const mode=V('mode'), projMode=V('proj'), seg=+V('seg'), ringMode=V('ringang');
