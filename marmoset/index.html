@@ -103,6 +103,8 @@ tfoot td{font-weight:500;border-bottom:0}
       <select id="mode"><option value="adapt">Fit brain radius at each level</option><option value="full">Full cylinder r = 10.4 mm everywhere</option></select></div>
     <div class="ctl"><label for="proj">Angular step</label>
       <select id="proj"><option value="adaptive" selected>Adaptive, same at θ and θ+180°</option><option value="uniform">Uniform (Nyquist at tissue radius)</option></select></div>
+    <div class="ctl"><label for="ringang">Angles across rings of a level</label>
+      <select id="ringang"><option value="shared" selected>Same angles in all rings (exact stitching)</option><option value="subset">Outer rings every 2nd/4th angle</option><option value="own">Own angles per ring (needs θ interpolation)</option></select></div>
     <div class="ctl"><label for="seg">Adaptive step held constant over</label>
       <select id="seg"><option value="2">2° (≈ continuous)</option><option value="10">10° segments</option><option value="16">16° segments</option><option value="30">30° segments</option><option value="60" selected>60° segments</option></select></div>
     <div class="calcrow"><button id="calc" type="button">Calculate</button><span id="calcstate" aria-live="polite"></span></div>
@@ -195,7 +197,7 @@ function ringColor(k,K){const t=K>1?k/(K-1):0;const h=188-158*t;return `hsl(${h}
 function fmtB(b){const u=['B','KB','MB','GB','TB','PB'];let i=0;while(b>=1000&&i<5){b/=1000;i++;}return (b>=100?b.toFixed(0):b>=10?b.toFixed(1):b.toFixed(2))+' '+u[i];}
 function fmtN(n){return Math.round(n).toLocaleString('en-US');}
 function fmtT(s){const h=s/3600;return h>=48?(h/24).toFixed(1)+' days':h.toFixed(1)+' h';}
-const IDS=['nx','ny','pix','cpr','fps','exp','ovh','oh','ov','s','mode','proj','seg'];
+const IDS=['nx','ny','pix','cpr','fps','exp','ovh','oh','ov','s','mode','proj','seg','ringang'];
 let applied={};
 function snapshot(){const o={};IDS.forEach(id=>o[id]=$(id).value);return o;}
 function V(id){return applied[id];}
@@ -273,13 +275,34 @@ function schedule(S,segDeg,s,PIX,CPR,uniformR){
   return {f,segs,n};
 }
 
+// Ring k on the level master schedule M. It records a half-segment only if its own strip sees
+// tissue there. 'shared': exactly the master angles. 'subset': every m-th master angle, m = 2^j
+// as large as the ring's own Nyquist step allows, so its angles stay a subset of the master's.
+function fromMaster(M,o,k,mode,s,PIX,CPR){
+  const segs=M.segs.map((b,i)=>{
+    const q=o.segs[i], A=!!(q&&q.A), B=!!(q&&q.B);
+    if(!b.n||!(A||B)) return {s0:b.s0,s1:b.s1,A:false,B:false,start:b.start,end:b.end,n:0,d:b.d,m:1};
+    let m=1;
+    if(mode==='subset'&&q.dmax) m=Math.max(1,2**Math.floor(Math.log2(Math.max(1,q.dmax/b.d))));
+    return {s0:b.s0,s1:b.s1,A,B,start:b.start,end:b.end,n:Math.floor((b.n-1)/m)+1,d:b.d*m,m};
+  });
+  const f=new Float64Array(NB); let n=0;
+  segs.forEach(q=>{
+    if(!q.n) return;
+    const fe=PIX/(s*(q.d/CPR*2*Math.PI));
+    for(let j=q.s0;j<q.s1;j++){if(q.A)f[j]=fe;if(q.B)f[j+NTH]=fe;}
+    n+=q.n*((q.A?1:0)+(q.B?1:0));
+  });
+  return {k,n,prof:f,segs};
+}
+
 function plan(){
   const NX=Math.round(num('nx',4432)), NY=Math.round(num('ny',2368)), PIX=num('pix',0.46)*1e-3;
   let CPR=Math.round(num('cpr',8192000)); if(CPR%2) CPR++;
   const fps=num('fps',20), exp=num('exp',40)/1000, ovh=parseFloat(V('ovh'))||0;
   const W=NX*PIX, WV=NY*PIX;
   const oh=+V('oh')/100, ov=+V('ov')/100, s=+V('s');
-  const mode=V('mode'), projMode=V('proj'), seg=+V('seg');
+  const mode=V('mode'), projMode=V('proj'), seg=+V('seg'), ringMode=V('ringang');
   const wh=W*(1-oh), wv=WV*(1-ov), c=oh*W/2;   // c: axis inside ring-1 frame (centre overlap = oh*W)
   const L=Math.max(1,Math.ceil(Math.max(0,H-WV)/wv)+1);
   const Hcov=(L-1)*wv+WV, ztop=H/2-Hcov/2;
@@ -295,11 +318,18 @@ function plan(){
     const K=Kof(R);
     const Nuni=s*2*Math.PI*R/PIX;
     const rings=[];
-    for(let k=0;k<K;k++){
-      const sp=projMode==='adaptive'
-        ?schedule(depthProfile(Math.max(0,a),Math.min(H,b),ringIn(k),ringOut(k)),seg,s,PIX,CPR,0)
-        :schedule(null,seg,s,PIX,CPR,R);
-      rings.push({k,n:sp.n,prof:projMode==='adaptive'?sp.f:null,segs:sp.segs});
+    if(projMode==='adaptive'){
+      const profs=[]; for(let k=0;k<K;k++) profs.push(depthProfile(Math.max(0,a),Math.min(H,b),ringIn(k),ringOut(k)));
+      const own=profs.map(S=>schedule(S,seg,s,PIX,CPR,0));
+      if(ringMode==='own') own.forEach((sp,k)=>rings.push({k,n:sp.n,prof:sp.f,segs:sp.segs}));
+      else {
+        // level master: finest requirement of any ring in each segment; every ring records on it
+        const Sm=new Float64Array(NB); profs.forEach(S=>{for(let j=0;j<NB;j++) if(S[j]>Sm[j]) Sm[j]=S[j];});
+        const M=schedule(Sm,seg,s,PIX,CPR,0);
+        own.forEach((o,k)=>rings.push(fromMaster(M,o,k,ringMode,s,PIX,CPR)));
+      }
+    } else {
+      for(let k=0;k<K;k++){const sp=schedule(null,seg,s,PIX,CPR,R);rings.push({k,n:sp.n,prof:null,segs:sp.segs});}
     }
     const proj=rings.reduce((t,q)=>t+q.n,0);
     const sa=Math.max(0,l===0?0:a+(WV-wv)/2), sb=Math.min(H,l===L-1?H:a+(WV-wv)/2+wv);
@@ -320,7 +350,7 @@ function plan(){
   const brainVox=D.vox*Math.pow(P/PIX,3);
   const cylVox=Math.pow(2*(RMAX+MARGIN)/PIX,2)*H/PIX;
   const time=frames/fps+scans*ovh;
-  return {CPR,c,NX,NY,PIX,W,WV,fps,exp,ovh,oh,ov,s,seg,wh,wv,L,ztop,levels,rings,Kmax,scans,frames,uniFrames,raw:frames*frame,vox,sino,brainVox,cylVox,time,frame,mode,projMode};
+  return {ringMode,CPR,c,NX,NY,PIX,W,WV,fps,exp,ovh,oh,ov,s,seg,wh,wv,L,ztop,levels,rings,Kmax,scans,frames,uniFrames,raw:frames*frame,vox,sino,brainVox,cylVox,time,frame,mode,projMode};
 }
 
 const NS='http://www.w3.org/2000/svg';
@@ -452,7 +482,7 @@ function render(){
     const cell=q=>{
       if(!q.n||!(q.A||q.B)) return '<td>skip</td>';
       const half=q.A&&q.B?'':q.A?' <span style="color:var(--muted)">(0–180° only)</span>':' <span style="color:var(--muted)">(180–360° only)</span>';
-      return `<td title="start ${fmtN(q.start)} counts = ${(q.start/C*360).toFixed(5)}°, step ${(q.d/C*360).toFixed(6)}°">${fmtN(q.n)} × ${q.d}${half}</td>`;
+      return `<td title="start ${fmtN(q.start)} counts = ${(q.start/C*360).toFixed(5)}°, step ${(q.d/C*360).toFixed(6)}°">${fmtN(q.n)} × ${q.d}${q.m>1?` <span style="color:var(--muted)">(every ${q.m})</span>`:''}${half}</td>`;
     };
     const showRows=segs0.length<=40;
     $('segtable').innerHTML=`<thead><tr><th>θ, nominal</th>${lv.rings.map(r=>`<th><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ringColor(r.k,Pl.Kmax)};margin-right:6px"></span>ring ${r.k+1}</th>`).join('')}</tr></thead><tbody>`+
@@ -466,7 +496,7 @@ function render(){
       no++;
       const xoff=r.k*Pl.wh-Pl.c+Pl.W/2, zc=v.a+Pl.WV/2, segs=[];
       [[0,'A'],[C/2,'B']].forEach(([off,h])=>r.segs.forEach(q=>{
-        if(q.n&&q[h]) segs.push({start:q.start+off,n:q.n,d:q.d,end:q.start+off+q.n*q.d});
+        if(q.n&&q[h]) segs.push({start:q.start+off,n:q.n,d:q.d,end:q.end+off});
       }));
       scans.push({no,l:v.l,k:r.k,xoff,zc,segs,frames:segs.reduce((t,q)=>t+q.n,0)});
     }));
@@ -507,7 +537,7 @@ function render(){
     <p><b>Field of view.</b> One frame is ${W.toFixed(3)} × ${WV.toFixed(3)} mm. With the overlaps set above, each ring adds ${Pl.wh.toFixed(3)} mm of radius and each level adds ${Pl.wv.toFixed(3)} mm of height.</p>
     <p><b>Rings.</b> Every ring is a 360° scan with the axis outside the frame, shifted ${fmtN(Pl.wh/PIX)} px per ring. Ring 1 has the axis ${fmtN(Pl.c/PIX)} px inside the frame, so θ and θ+180° overlap by ${fmtN(2*Pl.c/PIX)} px around the axis (the same overlap as between rings), and ring 1 covers r = 0 to ${(W-Pl.c).toFixed(2)} mm.</p>
     <p><b>Angular step.</b> A tissue point at depth s along the beam moves s·Δθ across the detector per step, so Nyquist needs Δθ ≤ p / S(θ), where S is the deepest tissue along the rays a ring sees. Inner rings see the full diameter and stay near the uniform step p/R. Outer rings and the end levels cut short chords and can use larger steps. Where S = 0 the frames are skipped.</p>
-    <p><b>Fold and stitching.</b> Wherever both θ and θ+180° record, they get the same step, so the 360° → 180° fold pairs exact angles. If one half sees no tissue, it is filled with flat on any angles. Rings have different angle sets, so before stitching across rings, interpolate the outer rings along θ onto the inner ring's angles. That is safe because each ring is sampled above its own Nyquist limit.</p>
+    <p><b>Fold and stitching.</b> Wherever both θ and θ+180° record, they use the same counts, so the 360° → 180° fold pairs exact angles. ${Pl.ringMode==='shared'?'All rings of a level record on one angle schedule (the finest requirement of any ring in each segment) and skip only segments with no tissue in their strip. Neighbouring rings therefore have identical angles in every overlap, and stitching needs no interpolation along θ.':Pl.ringMode==='subset'?'Outer rings record every 2nd, 4th, … angle of the level schedule where their own Nyquist step allows. Overlaps match exactly at the shared angles. The outer ring is interpolated along θ at the angles it skips.':'Each ring has its own steps, so before stitching across rings the outer rings must be interpolated along θ onto the inner ring\'s angles.'} Skipped empty segments are filled with flat.</p>
     <p><b>Frame counts.</b> Steps are whole encoder counts (${fmtN(Pl.CPR)} per 360°). In each segment the step is the largest whole count that meets Nyquist, and the segment spans exactly frames × step counts. Each half rotation ends exactly at ${fmtN(Pl.CPR/2)} counts, so 180–360° repeats 0–180° count for count and the 360° closes on 0.</p>
     <p><b>Fly scan.</b> The frame rate stays constant and the rotation speed follows the step: speed = step × frame rate, constant over each ${Pl.seg}° segment, and the 0–180° profile repeats over 180–360°. The beam-time estimate counts frames ÷ frame rate plus a fixed overhead per scan. It does not include acceleration ramps.</p>
     <p class="warn"><b>Height.</b> Tissue is present in the first and last slices of the 1.9 µm volume (${D.area[0].toFixed(1)} mm² at the top, ${D.area[D.nz-1].toFixed(1)} mm² at the bottom), so the real sample may be taller than ${H.toFixed(1)} mm. Add a level at each end if those parts are needed.</p>
