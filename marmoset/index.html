@@ -102,11 +102,13 @@ tfoot td{font-weight:500;border-bottom:0}
     <div class="ctl"><label for="mode">Field of view per level</label>
       <select id="mode"><option value="adapt">Fit brain radius at each level</option><option value="full">Full cylinder r = 10.4 mm everywhere</option></select></div>
     <div class="ctl"><label for="proj">Angular step</label>
-      <select id="proj"><option value="uskip" selected>Uniform, skip empty windows</option><option value="adaptive">Adaptive (larger step along thin directions), skip empty windows</option><option value="uniform">Uniform, no skipping</option></select></div>
+      <select id="proj"><option value="uskip" selected>Uniform, sparse/skip in empty windows</option><option value="adaptive">Adaptive (larger step along thin directions), sparse/skip in empty windows</option><option value="uniform">Uniform, no skipping</option></select></div>
     <input type="hidden" id="ringang" value="shared">
+    <div class="ctl"><label for="gapmode">Empty windows</label><select id="gapmode"><option value="sparse" selected>Record sparse frames</option><option value="skip">Skip</option></select></div>
+    <div class="ctl"><label for="gfr">Empty windows: frames per 360°</label><input id="gfr" type="number" min="10" step="100" value="1000"></div>
     <div class="ctl"><label for="cont">Container rings (sparse)</label><select id="cont"><option value="on" selected>On</option><option value="off">Off</option></select></div>
     <div class="ctl"><label for="rc">Container outer radius, mm</label><input id="rc" type="number" min="1" step="0.05" value="10.6"></div>
-    <div class="ctl"><label for="cmin">Container rings per level, at least</label><input id="cmin" type="number" min="0" step="1" value="2"></div>
+    <div class="ctl"><label for="cextra">Container rings beyond the wall ring</label><input id="cextra" type="number" min="0" step="1" value="2"></div>
     <div class="ctl"><label for="cfr">Container rings: frames per 360°</label><input id="cfr" type="number" min="10" step="100" value="1000"></div>
     <div class="ctl"><label for="minskip">Minimum skipped span, °</label><input id="minskip" type="number" min="0" step="2" value="10"></div>
     <div class="ctl"><label for="seg">Adaptive: step held constant over</label><select id="seg"><option value="10">10° segments</option><option value="30">30° segments</option><option value="60" selected>60° segments</option><option value="90">90° segments</option></select></div>
@@ -218,7 +220,7 @@ function ringColor(k,K){const t=K>1?k/(K-1):0;const h=188-158*t;return `hsl(${h}
 function fmtB(b){const u=['B','KB','MB','GB','TB','PB'];let i=0;while(b>=1000&&i<5){b/=1000;i++;}return (b>=100?b.toFixed(0):b>=10?b.toFixed(1):b.toFixed(2))+' '+u[i];}
 function fmtN(n){return Math.round(n).toLocaleString('en-US');}
 function fmtT(s){const h=s/3600;return h>=48?(h/24).toFixed(1)+' days':h.toFixed(1)+' h';}
-const IDS=['nx','ny','pix','cpr','fps','exp','ovh','oh','ov','s','mode','proj','seg','ringang','minskip','cont','rc','cfr','cmin'];
+const IDS=['nx','ny','pix','cpr','fps','exp','ovh','oh','ov','s','mode','proj','seg','ringang','minskip','cont','rc','cfr','cextra','gapmode','gfr'];
 let applied={};
 function snapshot(){const o={};IDS.forEach(id=>o[id]=$(id).value);return o;}
 function V(id){return applied[id];}
@@ -373,6 +375,25 @@ function fillGaps(S,minDeg){
   return out;
 }
 
+// Empty windows of a dense ring get sparse frames on a coarse grid (step ds counts, ds | CPR/2,
+// so 180-360 repeats 0-180). Dense windows are unchanged; sparse positions fall only inside gaps.
+function addGapFrames(r,C,ds){
+  const dense=windows(r,C).map(w=>({...w})), all=dense.slice(), gapBins=new Uint8Array(NB);
+  const gaps=[]; let pos=0;
+  dense.forEach(w=>{if(w.start>pos) gaps.push([pos,w.start]); pos=Math.max(pos,w.end);});
+  if(pos<C) gaps.push([pos,C]);
+  let extra=0;
+  gaps.forEach(([a,b])=>{
+    let p=Math.ceil(a/ds)*ds; if(p===a&&a>0&&dense.some(w=>w.end===a)) p+=ds;   // keep clear of the dense frame grid edge
+    const st=p; let n=0;
+    while(p<b){ gapBins[Math.min(NB-1,Math.floor(p/C*NB))]=1; n++; p+=ds; }
+    if(n){ all.push({start:st,d:ds,n,end:st+n*ds,sp:true}); extra+=n; }
+  });
+  all.sort((x,y)=>x.start-y.start);
+  r.wins=all; r.gapBins=gapBins; r.gapFrames=extra; r.n+=extra;
+  return r;
+}
+
 function plan(){
   const NX=Math.round(num('nx',4432)), NY=Math.round(num('ny',2368)), PIX=num('pix',0.46)*1e-3;
   let CPR=Math.round(num('cpr',8192000)); if(CPR%2) CPR++;
@@ -381,7 +402,8 @@ function plan(){
   const oh=+V('oh')/100, ov=+V('ov')/100, s=+V('s');
   const mode=V('mode'), projMode=V('proj'), seg=+V('seg'), ringMode=V('ringang');
   const minskip=Math.max(0,parseFloat(V('minskip'))||0);
-  const contOn=V('cont')==='on', RC=num('rc',10.6), CFR=Math.round(num('cfr',1000)), CMIN=Math.max(0,Math.round(parseFloat(V('cmin'))||0));
+  const contOn=V('cont')==='on', RC=num('rc',10.6), CFR=Math.round(num('cfr',1000)), CEXTRA=Math.max(0,Math.round(parseFloat(V('cextra'))||0));
+  const gapMode=V('gapmode'), GFR=Math.round(num('gfr',1000));
   const wh=W*(1-oh), wv=WV*(1-ov), c=oh*W/2;   // c: axis inside ring-1 frame (centre overlap = oh*W)
   const L=Math.max(1,Math.ceil(Math.max(0,H-WV)/wv)+1);
   const Hcov=(L-1)*wv+WV, ztop=H/2-Hcov/2;
@@ -416,8 +438,9 @@ function plan(){
     }
     // container rings: beyond the brain only the uniform container is in the beam, so sparse angles suffice
     const Kd=K;
+    if(gapMode==='sparse'&&projMode!=='uniform'){ const ds=bestDivisor(CPR/2,Math.max(1,Math.floor(CPR/GFR)),1); rings.forEach(r=>addGapFrames(r,CPR,ds)); }
     if(contOn){
-      const Kc=Math.max(Kof(RC+MARGIN),Kd+CMIN), d=bestDivisor(CPR/2,Math.max(1,Math.floor(CPR/CFR)),1), nf=CPR/d;
+      const Kw=Kof(RC+MARGIN)-1, Kc=Math.max(Kd,Kw+1+CEXTRA), d=bestDivisor(CPR/2,Math.max(1,Math.floor(CPR/CFR)),1), nf=CPR/d;
       const f=new Float64Array(NB).fill(PIX/(s*(d/CPR*2*Math.PI)));
       for(let k=Kd;k<Kc;k++) rings.push({k,n:nf,prof:f,segs:[],wins:[{start:0,end:CPR,d,n:nf}],sparse:true});
     }
@@ -435,14 +458,15 @@ function plan(){
   const scans=levels.reduce((t,v)=>t+v.K,0);
   const frames=levels.reduce((t,v)=>t+v.proj,0);
   const uniFrames=levels.reduce((t,v)=>t+v.Kd*v.Nuni,0);
-  const sparseFrames=levels.reduce((t,v)=>t+v.rings.filter(r=>r.sparse).reduce((u,r)=>u+r.n,0),0);
+  const sparseFrames=levels.reduce((t,v)=>t+v.rings.reduce((u,r)=>u+(r.sparse?r.n:(r.gapFrames||0)),0),0);
+  const gapFrames=levels.reduce((t,v)=>t+v.rings.reduce((u,r)=>u+(r.gapFrames||0),0),0);
   const sparseScans=levels.reduce((t,v)=>t+v.K-v.Kd,0);
   let vox=0, sino=0;
   levels.forEach(v=>{const n=2*v.R/PIX, z=v.h/PIX; vox+=n*n*z; sino+=Math.ceil(s*Math.PI*v.R/PIX)*z*n;});
   const brainVox=D.vox*Math.pow(P/PIX,3);
   const cylVox=Math.pow(2*(RMAX+MARGIN)/PIX,2)*H/PIX;
   const time=frames/fps+scans*ovh;
-  return {CMIN,sparseFrames,sparseScans,contOn,RC,CFR,minskip,ringMode,CPR,c,NX,NY,PIX,W,WV,fps,exp,ovh,oh,ov,s,seg,wh,wv,L,ztop,levels,rings,Kmax,scans,frames,uniFrames,raw:frames*frame,vox,sino,brainVox,cylVox,time,frame,mode,projMode};
+  return {gapMode,GFR,gapFrames,CEXTRA,Kwall:Kof(RC+MARGIN)-1,sparseFrames,sparseScans,contOn,RC,CFR,minskip,ringMode,CPR,c,NX,NY,PIX,W,WV,fps,exp,ovh,oh,ov,s,seg,wh,wv,L,ztop,levels,rings,Kmax,scans,frames,uniFrames,raw:frames*frame,vox,sino,brainVox,cylVox,time,frame,mode,projMode};
 }
 
 const NS='http://www.w3.org/2000/svg';
@@ -540,6 +564,7 @@ function drawStepChart(svg,Pl){
     let d='', pen=false;
     for(let j=0;j<NB;j++){
       const f=r.prof[j];
+      if(r.gapBins&&r.gapBins[j]&&!(f>0)){ el('rect',{x:X(j*2),y:ly,width:X(j*2+2)-X(j*2)+0.3,height:lane,fill:c,'fill-opacity':on?0.25:0.1},svg); pen=false; continue; }
       if(f>0){
         const y=Y(lv.R/f), x0=X(j*2), x1=X(j*2+2);
         d+=(pen?`L ${x0} ${y} `:`M ${x0} ${y} `)+`L ${x1} ${y} `; pen=true;
@@ -548,7 +573,7 @@ function drawStepChart(svg,Pl){
     }
     el('path',{d,fill:'none',stroke:c,'stroke-width':on?2.4:1.2,'stroke-opacity':on?1:0.35,'stroke-linejoin':'round'},svg);
   });
-  txt(svg,left,lanesTop+K*(lane+4)+16,'Recorded angles per ring (blank = skipped, filled with flat)',{style:'fill:var(--muted)','font-size':11,'font-family':'Archivo, sans-serif'});
+  txt(svg,left,lanesTop+K*(lane+4)+16,'Recorded angles per ring (solid = dense, faint = sparse, blank = skipped)',{style:'fill:var(--muted)','font-size':11,'font-family':'Archivo, sans-serif'});
   txt(svg,left+4,top+12,'step ÷ uniform step',{style:'fill:var(--muted)','font-size':11,'font-family':'Archivo, sans-serif'});
 }
 
@@ -631,7 +656,7 @@ function render(){
   const expWarn=Pl.exp*Pl.fps>1;
   const save=1-(Pl.frames-Pl.sparseFrames)/Pl.uniFrames;
   $('totals').innerHTML=[
-    ['Scans',fmtN(Pl.scans),`${Pl.L} levels × up to ${Pl.Kmax} rings`+(Pl.sparseScans?` · ${Pl.sparseScans} sparse container scans`:'')],
+    ['Scans',fmtN(Pl.scans),`${Pl.L} levels × up to ${Pl.Kmax} rings`+(Pl.sparseScans?` · ${Pl.sparseScans} sparse container scans`:'')+(Pl.gapFrames?` · ${fmtN(Pl.gapFrames)} sparse frames in empty windows`:'')],
     ['Projections',fmtN(Pl.frames),Pl.projMode!=='uniform'?`${(save*100).toFixed(0)}% fewer than uniform step`:`${fmtB(Pl.frame)} per frame (uint16)`],
     ['Raw data',fmtB(Pl.raw),`${fmtB(Pl.frame)} per frame · flats and darks not included`],
     ['Reconstruction',fmtB(Pl.vox*4),`float32 · ${fmtB(Pl.vox*2)} as uint16`],
@@ -676,7 +701,7 @@ function render(){
       sel.map(sc=>sc.segs.map((q,i)=>{
         const head=i===0, rs=`style="border-top:${head?'2px solid var(--rule)':'0'}"`;
         const info=head?`<td><b>${sc.no}</b></td><td>L${sc.l+1}</td><td><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ringColor(sc.k,Pl.Kmax)};margin-right:6px"></span>${sc.k+1}</td><td>${sc.xoff.toFixed(3)}</td><td>${sc.zc.toFixed(3)}</td>`:'<td></td><td></td><td></td><td></td><td></td>';
-        return `<tr ${rs}>${info}<td>${i+1}</td><td>${deg(q.start)}</td><td>${fmtN(q.n)}</td><td>${(q.d/C*360).toFixed(6)}</td><td>${deg(q.end)}</td><td>${fmtN(q.start)}</td><td>${q.d}</td><td>${fmtN(q.end)}</td></tr>`;
+        return `<tr ${rs}>${info}<td>${i+1}${q.sp?' <span style="color:var(--muted)">sparse</span>':''}</td><td>${deg(q.start)}</td><td>${fmtN(q.n)}</td><td>${(q.d/C*360).toFixed(6)}</td><td>${deg(q.end)}</td><td>${fmtN(q.start)}</td><td>${q.d}</td><td>${fmtN(q.end)}</td></tr>`;
       }).join('')+`<tr class="scansum"><td></td><td colspan="4" style="text-align:left">scan ${sc.no} total</td><td></td><td></td><td>${fmtN(sc.frames)}</td><td colspan="5" style="text-align:left">${fmtT(sc.frames/Pl.fps+Pl.ovh)} · ${fmtB(sc.frames*Pl.frame)}</td></tr>`).join('')+'</tbody>';
   }
   $('rings').innerHTML=`<thead><tr><th>Ring</th><th>Radius, mm</th><th>Axis to frame edge, px</th><th>Levels</th><th>Frames, all levels</th><th>vs uniform</th><th>Raw data</th><th>Scan time</th></tr></thead><tbody>`+
@@ -700,12 +725,12 @@ function render(){
   $('notes').innerHTML=`
     <p><b>Field of view.</b> One frame is ${W.toFixed(3)} × ${WV.toFixed(3)} mm. With the overlaps set above, each ring adds ${Pl.wh.toFixed(3)} mm of radius and each level adds ${Pl.wv.toFixed(3)} mm of height.</p>
     <p><b>Rings.</b> Every ring is a 360° scan with the axis outside the frame, shifted ${fmtN(Pl.wh/PIX)} px per ring. Ring 1 has the axis ${fmtN(Pl.c/PIX)} px inside the frame, so θ and θ+180° overlap by ${fmtN(2*Pl.c/PIX)} px around the axis (the same overlap as between rings), and ring 1 covers r = 0 to ${(W-Pl.c).toFixed(2)} mm.</p>
-    <p><b>Angular step.</b> ${Pl.projMode==='adaptive'?`The step follows the deepest tissue along the beam at each angle, taken over all rings of the level, held constant over ${Pl.seg}° segments and equal at θ and θ+180°. Where the sample is thin along the beam the step is larger. In Fourier space the line spacing then matches the object's extent in each direction, so no frequencies are lost. Reconstruction must weight each projection by its local step, and noise is slightly higher in the sparse directions. All rings record the same angles and drop a frame only where their strip sees no tissue.`:`Every ring of a level uses one uniform step, the Nyquist step p/R for the level's tissue radius R times the angular sampling. The mosaic then has the Fourier coverage of one big detector.${Pl.projMode==='uskip'?' Rings skip angle spans where their strip sees no tissue (decided in 2° windows); those frames would be flat, so nothing is lost. Skipped spans shorter than ${Pl.minskip}° are recorded anyway.':''}`}</p>
+    <p><b>Angular step.</b> ${Pl.projMode==='adaptive'?`The step follows the deepest tissue along the beam at each angle, taken over all rings of the level, held constant over ${Pl.seg}° segments and equal at θ and θ+180°. Where the sample is thin along the beam the step is larger. In Fourier space the line spacing then matches the object's extent in each direction, so no frequencies are lost. Reconstruction must weight each projection by its local step, and noise is slightly higher in the sparse directions. All rings record the same angles and drop a frame only where their strip sees no tissue.`:`Every ring of a level uses one uniform step, the Nyquist step p/R for the level's tissue radius R times the angular sampling. The mosaic then has the Fourier coverage of one big detector.${Pl.projMode==='uskip'?` Rings skip angle spans where their strip sees no tissue (decided in 2° windows); those frames would be flat, so nothing is lost. Skipped spans shorter than ${Pl.minskip}° are recorded anyway.${Pl.gapMode==='sparse'?` Empty windows are not left blank: they get sparse frames (${fmtN(Pl.GFR)} per 360°, ${fmtN(Pl.gapFrames)} frames in total), which measure the container and filling there and catch any tissue if the mounting differs from the plan.`:''}`:''}`}</p>
     <p><b>Fold and stitching.</b> All rings of a level record on the same encoder counts, and 180–360° repeats 0–180° count for count. Stitching across rings and the 360° → 180° fold therefore pair identical angles, with no interpolation. Skipped windows are filled with flat before stitching.</p>
     <p><b>Frame counts.</b> Steps are whole encoder counts (${fmtN(Pl.CPR)} per 360°). In each segment the step is the largest whole count that meets Nyquist, and the segment spans exactly frames × step counts. Each half rotation ends exactly at ${fmtN(Pl.CPR/2)} counts, so 180–360° repeats 0–180° count for count and the 360° closes on 0.</p>
     <p><b>Fly scan.</b> ${Pl.projMode==='adaptive'?`The frame rate stays constant and the rotation speed (step × frame rate) changes at the ${Pl.seg}° segment boundaries; the 0–180° profile repeats over 180–360°.`:'The rotation runs at constant speed (step × frame rate) for the whole 360°.'} Skipping only gates the triggers (PSO windows). The beam-time estimate counts frames ÷ frame rate plus a fixed overhead per scan, without acceleration ramps.</p>
     <p class="warn"><b>Height.</b> Tissue is present in the first and last slices of the 1.9 µm volume (${D.area[0].toFixed(1)} mm² at the top, ${D.area[D.nz-1].toFixed(1)} mm² at the bottom), so the real sample may be taller than ${H.toFixed(1)} mm. Add a level at each end if those parts are needed.</p>
-    <p><b>Container.</b> ${Pl.contOn?`Container rings (hatched, marked *) continue each level out to r = ${Pl.RC} mm + 0.1 mm, and every level gets at least ${Pl.CMIN}, with ${fmtN(Pl.CFR)} frames per 360°: ${Pl.sparseScans} scans, ${fmtN(Pl.sparseFrames)} frames. Beyond the brain the rays cross only the uniform container, whose projection changes slowly with angle (constant if centred, a sinusoid if off-centre), so sparse angles are enough and θ-interpolation onto the dense grid is safe there. They extend every projection over the wall (no truncation) and give the container profile used to fill skipped windows inside the brain rings.`:'Container rings are off: the wall lies outside the field of view at levels where the rings stop at the brain, and skipped windows must be filled with a separately measured container profile.'}</p>
+    <p><b>Container.</b> ${Pl.contOn?`Container rings (hatched, marked *) sit at the same radii at every level, because the container is a cylinder: the ring containing the wall (ring ${Pl.Kwall+1}, r = ${Pl.RC} mm + 0.1 mm) and ${Pl.CEXTRA} more beyond it. Where the brain already reaches into the wall ring it stays dense. Rings between the brain and the wall, at narrow levels, are sparse too, since they see only the container filling. Container rings record ${fmtN(Pl.CFR)} frames per 360°: ${Pl.sparseScans} scans, ${fmtN(Pl.sparseFrames)} frames. Beyond the brain the rays cross only the uniform container, whose projection changes slowly with angle (constant if centred, a sinusoid if off-centre), so sparse angles are enough and θ-interpolation onto the dense grid is safe there. They extend every projection over the wall (no truncation) and give the container profile used to fill skipped windows inside the brain rings.`:'Container rings are off: the wall lies outside the field of view at levels where the rings stop at the brain, and skipped windows must be filled with a separately measured container profile.'}</p>
     <p><b>Where the numbers come from.</b> Tissue radius and depth are measured on the 61 µm data with a 0.1 mm margin and 2° of angular padding. The axis is assumed at the container centre. Angular sampling s scales all frame counts. Scans 180–186 used about s = 0.32.</p>`;
 }
 function labels(){
