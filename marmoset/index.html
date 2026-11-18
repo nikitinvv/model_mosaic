@@ -104,6 +104,9 @@ tfoot td{font-weight:500;border-bottom:0}
     <div class="ctl"><label for="proj">Angular step</label>
       <select id="proj"><option value="uskip" selected>Uniform, skip empty windows</option><option value="adaptive">Adaptive (larger step along thin directions), skip empty windows</option><option value="uniform">Uniform, no skipping</option></select></div>
     <input type="hidden" id="ringang" value="shared">
+    <div class="ctl"><label for="cont">Container rings (sparse)</label><select id="cont"><option value="on" selected>On</option><option value="off">Off</option></select></div>
+    <div class="ctl"><label for="rc">Container outer radius, mm</label><input id="rc" type="number" min="1" step="0.05" value="10.6"></div>
+    <div class="ctl"><label for="cfr">Container rings: frames per 360°</label><input id="cfr" type="number" min="10" step="100" value="1000"></div>
     <div class="ctl"><label for="minskip">Minimum skipped span, °</label><input id="minskip" type="number" min="0" step="2" value="10"></div>
     <div class="ctl"><label for="seg">Adaptive: step held constant over</label><select id="seg"><option value="10">10° segments</option><option value="30">30° segments</option><option value="60" selected>60° segments</option><option value="90">90° segments</option></select></div>
     <div class="calcrow"><button id="calc" type="button">Calculate</button><span id="calcstate" aria-live="polite"></span></div>
@@ -145,7 +148,7 @@ tfoot td{font-weight:500;border-bottom:0}
       <button id="psocopy" type="button" style="font:inherit;font-size:.85rem;padding:4px 14px;border-radius:4px;border:1px solid var(--accent);background:var(--panel);color:var(--accent);cursor:pointer">Copy</button>
       <span id="psocount" style="font-size:.8rem;color:var(--muted)"></span>
     </div>
-    <textarea id="psocsv" readonly spellcheck="false" style="width:100%;height:180px;font-family:var(--f-mono);font-size:.78rem;padding:8px;border:1px solid var(--rule);border-radius:6px;background:var(--panel);color:var(--fg);resize:vertical"></textarea>
+    <textarea id="psocsv" readonly spellcheck="false" style="box-sizing:border-box;width:100%;height:180px;font-family:var(--f-mono);font-size:.78rem;padding:8px;border:1px solid var(--rule);border-radius:6px;background:var(--panel);color:var(--fg);resize:vertical"></textarea>
   </section>
 
   <section class="two">
@@ -214,7 +217,7 @@ function ringColor(k,K){const t=K>1?k/(K-1):0;const h=188-158*t;return `hsl(${h}
 function fmtB(b){const u=['B','KB','MB','GB','TB','PB'];let i=0;while(b>=1000&&i<5){b/=1000;i++;}return (b>=100?b.toFixed(0):b>=10?b.toFixed(1):b.toFixed(2))+' '+u[i];}
 function fmtN(n){return Math.round(n).toLocaleString('en-US');}
 function fmtT(s){const h=s/3600;return h>=48?(h/24).toFixed(1)+' days':h.toFixed(1)+' h';}
-const IDS=['nx','ny','pix','cpr','fps','exp','ovh','oh','ov','s','mode','proj','seg','ringang','minskip'];
+const IDS=['nx','ny','pix','cpr','fps','exp','ovh','oh','ov','s','mode','proj','seg','ringang','minskip','cont','rc','cfr'];
 let applied={};
 function snapshot(){const o={};IDS.forEach(id=>o[id]=$(id).value);return o;}
 function V(id){return applied[id];}
@@ -377,6 +380,7 @@ function plan(){
   const oh=+V('oh')/100, ov=+V('ov')/100, s=+V('s');
   const mode=V('mode'), projMode=V('proj'), seg=+V('seg'), ringMode=V('ringang');
   const minskip=Math.max(0,parseFloat(V('minskip'))||0);
+  const contOn=V('cont')==='on', RC=num('rc',10.6), CFR=Math.round(num('cfr',1000));
   const wh=W*(1-oh), wv=WV*(1-ov), c=oh*W/2;   // c: axis inside ring-1 frame (centre overlap = oh*W)
   const L=Math.max(1,Math.ceil(Math.max(0,H-WV)/wv)+1);
   const Hcov=(L-1)*wv+WV, ztop=H/2-Hcov/2;
@@ -409,26 +413,35 @@ function plan(){
     } else {
       for(let k=0;k<K;k++){const sp=schedule(null,seg,s,PIX,CPR,R);rings.push({k,n:sp.n,prof:null,segs:sp.segs});}
     }
+    // container rings: beyond the brain only the uniform container is in the beam, so sparse angles suffice
+    const Kd=K;
+    if(contOn){
+      const Kc=Kof(RC+MARGIN), d=bestDivisor(CPR/2,Math.max(1,Math.floor(CPR/CFR)),1), nf=CPR/d;
+      const f=new Float64Array(NB).fill(PIX/(s*(d/CPR*2*Math.PI)));
+      for(let k=Kd;k<Kc;k++) rings.push({k,n:nf,prof:f,segs:[],wins:[{start:0,end:CPR,d,n:nf}],sparse:true});
+    }
     const proj=rings.reduce((t,q)=>t+q.n,0);
     const sa=Math.max(0,l===0?0:a+(WV-wv)/2), sb=Math.min(H,l===L-1?H:a+(WV-wv)/2+wv);
-    levels.push({l,a,b,R,K,rings,proj,Nuni,h:Math.max(0,sb-sa)});
+    levels.push({l,a,b,R,K:rings.length,Kd,rings,proj,Nuni,h:Math.max(0,sb-sa)});
   }
   const Kmax=Math.max(...levels.map(v=>v.K));
   const rings=[];
   for(let k=0;k<Kmax;k++){
     let nlev=0,frames=0,uni=0;
-    levels.forEach(v=>{if(k<v.K){nlev++;frames+=v.rings[k].n;uni+=v.Nuni;}});
+    levels.forEach(v=>{if(k<v.K){nlev++;frames+=v.rings[k].n;uni+=v.rings[k].sparse?v.rings[k].n:v.Nuni;}});
     rings.push({k,r0:ringIn(k),r1:ringOut(k),nlev,frames,uni});
   }
   const scans=levels.reduce((t,v)=>t+v.K,0);
   const frames=levels.reduce((t,v)=>t+v.proj,0);
-  const uniFrames=levels.reduce((t,v)=>t+v.K*v.Nuni,0);
+  const uniFrames=levels.reduce((t,v)=>t+v.Kd*v.Nuni,0);
+  const sparseFrames=levels.reduce((t,v)=>t+v.rings.filter(r=>r.sparse).reduce((u,r)=>u+r.n,0),0);
+  const sparseScans=levels.reduce((t,v)=>t+v.K-v.Kd,0);
   let vox=0, sino=0;
   levels.forEach(v=>{const n=2*v.R/PIX, z=v.h/PIX; vox+=n*n*z; sino+=Math.ceil(s*Math.PI*v.R/PIX)*z*n;});
   const brainVox=D.vox*Math.pow(P/PIX,3);
   const cylVox=Math.pow(2*(RMAX+MARGIN)/PIX,2)*H/PIX;
   const time=frames/fps+scans*ovh;
-  return {minskip,ringMode,CPR,c,NX,NY,PIX,W,WV,fps,exp,ovh,oh,ov,s,seg,wh,wv,L,ztop,levels,rings,Kmax,scans,frames,uniFrames,raw:frames*frame,vox,sino,brainVox,cylVox,time,frame,mode,projMode};
+  return {sparseFrames,sparseScans,contOn,RC,CFR,minskip,ringMode,CPR,c,NX,NY,PIX,W,WV,fps,exp,ovh,oh,ov,s,seg,wh,wv,L,ztop,levels,rings,Kmax,scans,frames,uniFrames,raw:frames*frame,vox,sino,brainVox,cylVox,time,frame,mode,projMode};
 }
 
 const NS='http://www.w3.org/2000/svg';
@@ -448,8 +461,8 @@ function drawVertical(svg,img,Pl,centre,width){
   el('image',{href:'data:image/png;base64,'+img,x:x0,y:0,width:width*P,height:H,preserveAspectRatio:'none'},svg);
   const lw=0.035*sc;
   Pl.levels.forEach(v=>{for(let k=0;k<v.K;k++){
-    const c=ringColor(k,Pl.Kmax), on=selRing===null||selRing===k, x=k*Pl.wh-Pl.c;
-    el('rect',{x,y:v.a,width:W,height:WV,fill:c,'fill-opacity':on?0.22:0.05,stroke:c,'stroke-opacity':on?0.95:0.25,'stroke-width':lw},svg);
+    const c=ringColor(k,Pl.Kmax), on=selRing===null||selRing===k, x=k*Pl.wh-Pl.c, sp=v.rings[k].sparse;
+    el('rect',{x,y:v.a,width:W,height:WV,fill:sp?'none':c,'fill-opacity':on?0.22:0.05,stroke:sp?'#fff':c,'stroke-opacity':on?(sp?0.7:0.95):0.25,'stroke-width':lw,'stroke-dasharray':sp?`${0.06*sc} ${0.06*sc}`:''},svg);
     el('rect',{x:-x-W,y:v.a,width:W,height:WV,fill:'none',stroke:c,'stroke-opacity':on?0.55:0.15,'stroke-width':lw,'stroke-dasharray':`${0.12*sc} ${0.1*sc}`},svg);
   }});
   el('line',{x1:0,x2:0,y1:vb[1]+0.3*sc,y2:vb[1]+vb[3]-0.3*sc,stroke:'#fff','stroke-width':lw,'stroke-dasharray':`${0.3*sc} ${0.15*sc}`},svg);
@@ -478,7 +491,7 @@ function drawHorizontal(svg,img,i,Pl){
   el('image',{href:'data:image/png;base64,'+img,x:-D.cx*P-P/2,y:-D.cy*P-P/2,width:D.nx*P,height:D.ny*P,preserveAspectRatio:'none'},svg);
   for(let k=lv.K-1;k>=0;k--){
     const c=ringColor(k,Pl.Kmax), on=selRing===null||selRing===k, r0=Math.max(0,k*Pl.wh-Pl.c), r1=k*Pl.wh-Pl.c+W;
-    el('circle',{cx:0,cy:0,r:r1,fill:'none',stroke:c,'stroke-width':0.06,'stroke-opacity':on?0.95:0.25},svg);
+    el('circle',{cx:0,cy:0,r:r1,fill:'none',stroke:lv.rings[k].sparse?'#fff':c,'stroke-width':0.06,'stroke-opacity':on?0.95:0.25,'stroke-dasharray':lv.rings[k].sparse?'0.15 0.12':''},svg);
     if(selRing===k) el('circle',{cx:0,cy:0,r:(r0+r1)/2,fill:'none',stroke:c,'stroke-width':r1-r0,'stroke-opacity':0.18},svg);
   }
   const kd=selRing!==null&&selRing<lv.K?selRing:lv.K-1, cd=ringColor(kd,Pl.Kmax), xd=kd*Pl.wh-Pl.c;
@@ -487,6 +500,7 @@ function drawHorizontal(svg,img,i,Pl){
   txt(svg,xd+W/2,-S-1.25,'detector',{fill:'#fff','font-size':0.5,'text-anchor':'middle','font-family':MONO});
   el('path',{d:`M ${-S+0.5} ${S+0.6} l 0 -1.6 m -0.25 0.4 l 0.25 -0.4 l 0.25 0.4`,stroke:'#fff','stroke-width':0.07,fill:'none'},svg);
   txt(svg,-S+0.85,S+0.4,'beam',{fill:'#fff','font-size':0.5,'font-family':'Archivo, sans-serif'});
+  if(Pl.contOn) el('circle',{cx:0,cy:0,r:Pl.RC,fill:'none',stroke:'#ff6','stroke-width':0.05,'stroke-dasharray':'0.3 0.2','stroke-opacity':0.8},svg);
   el('circle',{cx:0,cy:0,r:0.12,fill:'#fff'},svg);
   el('line',{x1:S-5.4,x2:S-0.4,y1:S+0.6,y2:S+0.6,stroke:'#fff','stroke-width':0.12},svg);
   txt(svg,S-2.9,S+0.35,'5 mm',{fill:'#fff','font-size':0.5,'text-anchor':'middle','font-family':MONO});
@@ -514,7 +528,7 @@ function drawStepChart(svg,Pl){
   lv.rings.forEach(r=>{
     const c=ringColor(r.k,Pl.Kmax), on=selRing===null||selRing===r.k;
     const ly=lanesTop+r.k*(lane+4);
-    txt(svg,left-6,ly+lane-2,'r'+(r.k+1),{style:'fill:var(--muted)','font-size':11,'text-anchor':'end','font-family':MONO});
+    txt(svg,left-6,ly+lane-2,'r'+(r.k+1)+(r.sparse?'*':''),{style:'fill:var(--muted)','font-size':11,'text-anchor':'end','font-family':MONO});
     el('rect',{x:X(0),y:ly,width:X(360)-X(0),height:lane,style:'fill:var(--rule)','fill-opacity':0.35},svg);
     if(!r.prof){el('rect',{x:X(0),y:ly,width:X(360)-X(0),height:lane,fill:c,'fill-opacity':on?0.9:0.3},svg);return;}
     let d='', pen=false;
@@ -609,9 +623,9 @@ function render(){
   $('lev').innerHTML=Pl.levels.map(v=>`<option value="${v.l}"${v.l===selLevel?' selected':''}>L${v.l+1} · z ${Math.max(0,v.a).toFixed(1)}–${Math.min(H,v.b).toFixed(1)} mm · ${v.K} rings</option>`).join('');
   if(selRing!==null&&selRing>=Pl.Kmax) selRing=null;
   const expWarn=Pl.exp*Pl.fps>1;
-  const save=1-Pl.frames/Pl.uniFrames;
+  const save=1-(Pl.frames-Pl.sparseFrames)/Pl.uniFrames;
   $('totals').innerHTML=[
-    ['Scans',fmtN(Pl.scans),`${Pl.L} levels × up to ${Pl.Kmax} rings`],
+    ['Scans',fmtN(Pl.scans),`${Pl.L} levels × up to ${Pl.Kmax} rings`+(Pl.sparseScans?` · ${Pl.sparseScans} sparse container scans`:'')],
     ['Projections',fmtN(Pl.frames),Pl.projMode!=='uniform'?`${(save*100).toFixed(0)}% fewer than uniform step`:`${fmtB(Pl.frame)} per frame (uint16)`],
     ['Raw data',fmtB(Pl.raw),`${fmtB(Pl.frame)} per frame · flats and darks not included`],
     ['Reconstruction',fmtB(Pl.vox*4),`float32 · ${fmtB(Pl.vox*2)} as uint16`],
@@ -631,10 +645,10 @@ function render(){
       const half=q.A&&q.B?'':q.A?' <span style="color:var(--muted)">(0–180° only)</span>':' <span style="color:var(--muted)">(180–360° only)</span>';
       return `<td title="start ${fmtN(q.start)} counts = ${(q.start/C*360).toFixed(5)}°, step ${(q.d/C*360).toFixed(6)}°">${fmtN(q.n)} × ${q.d}${q.m>1?` <span style="color:var(--muted)">(every ${q.m})</span>`:''}${half}</td>`;
     };
-    const showRows=segs0.length<=40&&!lv.rings[0].wins;
+    const showRows=segs0.length<=40&&!lv.rings.some(r=>r.wins);
     $('segtable').innerHTML=`<thead><tr><th>θ, nominal</th>${lv.rings.map(r=>`<th><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ringColor(r.k,Pl.Kmax)};margin-right:6px"></span>ring ${r.k+1}</th>`).join('')}</tr></thead><tbody>`+
       (showRows?segs0.map((q,i)=>`<tr><td>${q.s0*2}° – ${q.s1*2}°</td>${lv.rings.map(r=>cell(r.segs[i])).join('')}</tr>`).join(''):
-        lv.rings.map(r=>{const w=windows(r,C);return `<tr><td>ring ${r.k+1}</td><td colspan="${lv.K}" style="text-align:left">${fmtN(r.n)} frames · step ${w.length?[...new Set(w.map(x=>x.d))].join('/'):'–'} counts · recorded ${w.map(x=>`${(x.start/C*360).toFixed(1)}–${(x.end/C*360).toFixed(1)}°`).join(', ')||'none'}</td></tr>`;}).join(''))+
+        lv.rings.map(r=>{const w=windows(r,C);return `<tr><td>ring ${r.k+1}${r.sparse?' (container, sparse)':''}</td><td colspan="${lv.K}" style="text-align:left">${fmtN(r.n)} frames · step ${w.length?[...new Set(w.map(x=>x.d))].join('/'):'–'} counts · recorded ${w.map(x=>`${(x.start/C*360).toFixed(1)}–${(x.end/C*360).toFixed(1)}°`).join(', ')||'none'}</td></tr>`;}).join(''))+
       `</tbody><tfoot><tr><td>Frames per 360°</td>${lv.rings.map(r=>`<td>${fmtN(r.n)}</td>`).join('')}</tr></tfoot>`;
     $('segcap').textContent=`Level L${lv.l+1}. Each cell: frames × step in encoder counts (${fmtN(C)} counts per 360°). The same list runs over 0–180° and again from ${fmtN(C/2)} counts for 180–360°. Each half ends exactly at ${fmtN(C/2)} counts. Hover a cell for its start count and step in degrees.`;
     // one list of scans: level top -> bottom, ring inner -> outer; segments in angle order 0 -> 360
@@ -664,7 +678,7 @@ function render(){
     `</tbody><tfoot><tr><td>Total</td><td></td><td></td><td>${Pl.scans} scans</td><td>${fmtN(Pl.frames)}</td><td>${(100*Pl.frames/Pl.uniFrames).toFixed(0)}%</td><td>${fmtB(Pl.raw)}</td><td>${fmtT(Pl.time)}</td></tr></tfoot>`;
   $('rings').querySelectorAll('tbody tr').forEach(tr=>tr.onclick=()=>{const k=+tr.dataset.k;selRing=selRing===k?null:k;render();});
   $('levels').innerHTML=`<thead><tr><th>Level</th><th>z, mm</th><th>Tissue r, mm</th><th>Rings</th><th>Frames per ring</th><th>Frames</th><th>Raw data</th></tr></thead><tbody>`+
-    Pl.levels.map(v=>`<tr data-l="${v.l}" class="${selLevel===v.l?'sel':''}"><td>L${v.l+1}</td><td>${Math.max(0,v.a).toFixed(2)} – ${Math.min(H,v.b).toFixed(2)}</td><td>${(v.R-MARGIN).toFixed(2)}</td><td>${v.K}</td><td>${v.rings.map(r=>(r.n/1000).toFixed(0)+'k').join(' ')}</td><td>${fmtN(v.proj)}</td><td>${fmtB(v.proj*Pl.frame)}</td></tr>`).join('')+'</tbody>';
+    Pl.levels.map(v=>`<tr data-l="${v.l}" class="${selLevel===v.l?'sel':''}"><td>L${v.l+1}</td><td>${Math.max(0,v.a).toFixed(2)} – ${Math.min(H,v.b).toFixed(2)}</td><td>${(v.R-MARGIN).toFixed(2)}</td><td>${v.K}</td><td>${v.rings.map(r=>r.sparse?`<span style="color:var(--muted)">${(r.n/1000).toFixed(1)}k*</span>`:(r.n/1000).toFixed(0)+'k').join(' ')}</td><td>${fmtN(v.proj)}</td><td>${fmtB(v.proj*Pl.frame)}</td></tr>`).join('')+'</tbody>';
   $('levels').querySelectorAll('tbody tr').forEach(tr=>tr.onclick=()=>{selLevel=+tr.dataset.l;render();});
   const nmax=Math.round(2*Math.max(...Pl.levels.map(v=>v.R))/PIX);
   const sz=(label,vox,desc)=>`<tr><td>${label}</td><td>${desc}</td><td>${fmtB(vox*4)}</td><td>${fmtB(vox*2)}</td><td>${fmtB(vox)}</td></tr>`;
@@ -685,7 +699,7 @@ function render(){
     <p><b>Frame counts.</b> Steps are whole encoder counts (${fmtN(Pl.CPR)} per 360°). In each segment the step is the largest whole count that meets Nyquist, and the segment spans exactly frames × step counts. Each half rotation ends exactly at ${fmtN(Pl.CPR/2)} counts, so 180–360° repeats 0–180° count for count and the 360° closes on 0.</p>
     <p><b>Fly scan.</b> ${Pl.projMode==='adaptive'?`The frame rate stays constant and the rotation speed (step × frame rate) changes at the ${Pl.seg}° segment boundaries; the 0–180° profile repeats over 180–360°.`:'The rotation runs at constant speed (step × frame rate) for the whole 360°.'} Skipping only gates the triggers (PSO windows). The beam-time estimate counts frames ÷ frame rate plus a fixed overhead per scan, without acceleration ramps.</p>
     <p class="warn"><b>Height.</b> Tissue is present in the first and last slices of the 1.9 µm volume (${D.area[0].toFixed(1)} mm² at the top, ${D.area[D.nz-1].toFixed(1)} mm² at the bottom), so the real sample may be taller than ${H.toFixed(1)} mm. Add a level at each end if those parts are needed.</p>
-    <p><b>Container.</b> The container wall (r ≈ 10.2–10.4 mm) was removed from these images. If the tube stays on, the skipped frames see only the tube. For a centred tube that projection is the same at every angle, so fill the gaps with the tube profile from the recorded frames.</p>
+    <p><b>Container.</b> ${Pl.contOn?`Container rings (dashed, marked *) continue each level out to r = ${Pl.RC} mm + 0.1 mm with ${fmtN(Pl.CFR)} frames per 360°: ${Pl.sparseScans} scans, ${fmtN(Pl.sparseFrames)} frames. Beyond the brain the rays cross only the uniform container, whose projection changes slowly with angle (constant if centred, a sinusoid if off-centre), so sparse angles are enough and θ-interpolation onto the dense grid is safe there. They extend every projection over the wall (no truncation) and give the container profile used to fill skipped windows inside the brain rings.`:'Container rings are off: the wall lies outside the field of view at levels where the rings stop at the brain, and skipped windows must be filled with a separately measured container profile.'}</p>
     <p><b>Where the numbers come from.</b> Tissue radius and depth are measured on the 61 µm data with a 0.1 mm margin and 2° of angular padding. The axis is assumed at the container centre. Angular sampling s scales all frame counts. Scans 180–186 used about s = 0.32.</p>`;
 }
 function labels(){
