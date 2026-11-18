@@ -104,6 +104,7 @@ tfoot td{font-weight:500;border-bottom:0}
     <div class="ctl"><label for="proj">Angular step</label>
       <select id="proj"><option value="uskip" selected>Uniform, skip empty windows</option><option value="adaptive">Adaptive (larger step along thin directions), skip empty windows</option><option value="uniform">Uniform, no skipping</option></select></div>
     <input type="hidden" id="ringang" value="shared">
+    <div class="ctl"><label for="minskip">Minimum skipped span, °</label><input id="minskip" type="number" min="0" step="2" value="10"></div>
     <div class="ctl"><label for="seg">Adaptive: step held constant over</label><select id="seg"><option value="10">10° segments</option><option value="30">30° segments</option><option value="60" selected>60° segments</option><option value="90">90° segments</option></select></div>
     <div class="calcrow"><button id="calc" type="button">Calculate</button><span id="calcstate" aria-live="polite"></span></div>
   </section>
@@ -213,7 +214,7 @@ function ringColor(k,K){const t=K>1?k/(K-1):0;const h=188-158*t;return `hsl(${h}
 function fmtB(b){const u=['B','KB','MB','GB','TB','PB'];let i=0;while(b>=1000&&i<5){b/=1000;i++;}return (b>=100?b.toFixed(0):b>=10?b.toFixed(1):b.toFixed(2))+' '+u[i];}
 function fmtN(n){return Math.round(n).toLocaleString('en-US');}
 function fmtT(s){const h=s/3600;return h>=48?(h/24).toFixed(1)+' days':h.toFixed(1)+' h';}
-const IDS=['nx','ny','pix','cpr','fps','exp','ovh','oh','ov','s','mode','proj','seg','ringang'];
+const IDS=['nx','ny','pix','cpr','fps','exp','ovh','oh','ov','s','mode','proj','seg','ringang','minskip'];
 let applied={};
 function snapshot(){const o={};IDS.forEach(id=>o[id]=$(id).value);return o;}
 function V(id){return applied[id];}
@@ -351,6 +352,23 @@ function gatedRing(M,S,k,s,PIX,CPR){
   return {k,n,prof:f,segs:[],wins:out};
 }
 
+// Fill skipped spans (circular runs of 2-deg bins with no tissue) shorter than minDeg: those angles
+// are recorded anyway, so every skipped PSO window is at least minDeg long.
+function fillGaps(S,minDeg){
+  const nmin=Math.ceil(minDeg/2-1e-9); if(nmin<=1) return S;
+  const out=Float64Array.from(S), has=j=>out[(j+NB)%NB]>0;
+  let start=-1; for(let j=0;j<NB;j++) if(has(j)){start=j;break;}
+  if(start<0) return out;                       // no tissue at all: nothing to fill
+  let j=start;
+  for(let c=0;c<NB;){
+    if(has(j)){j=(j+1)%NB;c++;continue;}
+    let len=0; while(!has(j+len)&&len<NB) len++;
+    if(len<nmin) for(let q=0;q<len;q++) out[(j+q)%NB]=1e-6;   // recorded, but does not change the step
+    j=(j+len)%NB; c+=len;
+  }
+  return out;
+}
+
 function plan(){
   const NX=Math.round(num('nx',4432)), NY=Math.round(num('ny',2368)), PIX=num('pix',0.46)*1e-3;
   let CPR=Math.round(num('cpr',8192000)); if(CPR%2) CPR++;
@@ -358,6 +376,7 @@ function plan(){
   const W=NX*PIX, WV=NY*PIX;
   const oh=+V('oh')/100, ov=+V('ov')/100, s=+V('s');
   const mode=V('mode'), projMode=V('proj'), seg=+V('seg'), ringMode=V('ringang');
+  const minskip=Math.max(0,parseFloat(V('minskip'))||0);
   const wh=W*(1-oh), wv=WV*(1-ov), c=oh*W/2;   // c: axis inside ring-1 frame (centre overlap = oh*W)
   const L=Math.max(1,Math.ceil(Math.max(0,H-WV)/wv)+1);
   const Hcov=(L-1)*wv+WV, ztop=H/2-Hcov/2;
@@ -376,7 +395,7 @@ function plan(){
     if(projMode==='adaptive'){
       // step from the deepest tissue along the beam over all rings (the inner rings set it), held per segment,
       // paired with theta+180; every ring records these angles unless its strip sees no tissue
-      const profs=[]; for(let k=0;k<K;k++) profs.push(depthProfile(Math.max(0,a),Math.min(H,b),ringIn(k),ringOut(k)));
+      const profs=[]; for(let k=0;k<K;k++) profs.push(fillGaps(depthProfile(Math.max(0,a),Math.min(H,b),ringIn(k),ringOut(k)),minskip));
       const Sm=new Float64Array(NB); profs.forEach(S=>{for(let j=0;j<NB;j++) if(S[j]>Sm[j]) Sm[j]=S[j];});
       const M=schedule(Sm,seg,s,PIX,CPR,0);
       profs.forEach((S,k)=>rings.push(gatedRing(M,S,k,s,PIX,CPR)));
@@ -384,7 +403,7 @@ function plan(){
       // one uniform grid for the level (like one big detector); each ring skips 2-deg windows with no tissue
       const M=schedule(null,2,s,PIX,CPR,R);
       for(let k=0;k<K;k++){
-        const o=schedule(depthProfile(Math.max(0,a),Math.min(H,b),ringIn(k),ringOut(k)),2,s,PIX,CPR,0);
+        const o=schedule(fillGaps(depthProfile(Math.max(0,a),Math.min(H,b),ringIn(k),ringOut(k)),minskip),2,s,PIX,CPR,0);
         rings.push(fromMaster(M,o,k,'shared',s,PIX,CPR));
       }
     } else {
@@ -409,7 +428,7 @@ function plan(){
   const brainVox=D.vox*Math.pow(P/PIX,3);
   const cylVox=Math.pow(2*(RMAX+MARGIN)/PIX,2)*H/PIX;
   const time=frames/fps+scans*ovh;
-  return {ringMode,CPR,c,NX,NY,PIX,W,WV,fps,exp,ovh,oh,ov,s,seg,wh,wv,L,ztop,levels,rings,Kmax,scans,frames,uniFrames,raw:frames*frame,vox,sino,brainVox,cylVox,time,frame,mode,projMode};
+  return {minskip,ringMode,CPR,c,NX,NY,PIX,W,WV,fps,exp,ovh,oh,ov,s,seg,wh,wv,L,ztop,levels,rings,Kmax,scans,frames,uniFrames,raw:frames*frame,vox,sino,brainVox,cylVox,time,frame,mode,projMode};
 }
 
 const NS='http://www.w3.org/2000/svg';
@@ -661,7 +680,7 @@ function render(){
   $('notes').innerHTML=`
     <p><b>Field of view.</b> One frame is ${W.toFixed(3)} × ${WV.toFixed(3)} mm. With the overlaps set above, each ring adds ${Pl.wh.toFixed(3)} mm of radius and each level adds ${Pl.wv.toFixed(3)} mm of height.</p>
     <p><b>Rings.</b> Every ring is a 360° scan with the axis outside the frame, shifted ${fmtN(Pl.wh/PIX)} px per ring. Ring 1 has the axis ${fmtN(Pl.c/PIX)} px inside the frame, so θ and θ+180° overlap by ${fmtN(2*Pl.c/PIX)} px around the axis (the same overlap as between rings), and ring 1 covers r = 0 to ${(W-Pl.c).toFixed(2)} mm.</p>
-    <p><b>Angular step.</b> ${Pl.projMode==='adaptive'?`The step follows the deepest tissue along the beam at each angle, taken over all rings of the level, held constant over ${Pl.seg}° segments and equal at θ and θ+180°. Where the sample is thin along the beam the step is larger. In Fourier space the line spacing then matches the object's extent in each direction, so no frequencies are lost. Reconstruction must weight each projection by its local step, and noise is slightly higher in the sparse directions. All rings record the same angles and drop a frame only where their strip sees no tissue.`:`Every ring of a level uses one uniform step, the Nyquist step p/R for the level's tissue radius R times the angular sampling. The mosaic then has the Fourier coverage of one big detector.${Pl.projMode==='uskip'?' Rings skip 2° windows where their strip sees no tissue; those frames would be flat, so nothing is lost.':''}`}</p>
+    <p><b>Angular step.</b> ${Pl.projMode==='adaptive'?`The step follows the deepest tissue along the beam at each angle, taken over all rings of the level, held constant over ${Pl.seg}° segments and equal at θ and θ+180°. Where the sample is thin along the beam the step is larger. In Fourier space the line spacing then matches the object's extent in each direction, so no frequencies are lost. Reconstruction must weight each projection by its local step, and noise is slightly higher in the sparse directions. All rings record the same angles and drop a frame only where their strip sees no tissue.`:`Every ring of a level uses one uniform step, the Nyquist step p/R for the level's tissue radius R times the angular sampling. The mosaic then has the Fourier coverage of one big detector.${Pl.projMode==='uskip'?' Rings skip angle spans where their strip sees no tissue (decided in 2° windows); those frames would be flat, so nothing is lost. Skipped spans shorter than ${Pl.minskip}° are recorded anyway.':''}`}</p>
     <p><b>Fold and stitching.</b> All rings of a level record on the same encoder counts, and 180–360° repeats 0–180° count for count. Stitching across rings and the 360° → 180° fold therefore pair identical angles, with no interpolation. Skipped windows are filled with flat before stitching.</p>
     <p><b>Frame counts.</b> Steps are whole encoder counts (${fmtN(Pl.CPR)} per 360°). In each segment the step is the largest whole count that meets Nyquist, and the segment spans exactly frames × step counts. Each half rotation ends exactly at ${fmtN(Pl.CPR/2)} counts, so 180–360° repeats 0–180° count for count and the 360° closes on 0.</p>
     <p><b>Fly scan.</b> ${Pl.projMode==='adaptive'?`The frame rate stays constant and the rotation speed (step × frame rate) changes at the ${Pl.seg}° segment boundaries; the 0–180° profile repeats over 180–360°.`:'The rotation runs at constant speed (step × frame rate) for the whole 360°.'} Skipping only gates the triggers (PSO windows). The beam-time estimate counts frames ÷ frame rate plus a fixed overhead per scan, without acceleration ramps.</p>
