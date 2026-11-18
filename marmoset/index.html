@@ -107,10 +107,10 @@ tfoot td{font-weight:500;border-bottom:0}
     <input type="hidden" id="ringang" value="shared">
     <div class="ctl"><label for="gapmode">Empty windows</label><select id="gapmode"><option value="sparse" selected>Record sparse frames</option><option value="skip">Skip</option></select></div>
     <div class="ctl"><label for="gfr">Empty windows: frames per 360°</label><input id="gfr" type="number" min="10" step="100" value="1000"></div>
-    <div class="ctl"><label for="sx0">Sample x with axis at detector centre, mm</label><input id="sx0" type="number" step="0.001" value="0"></div>
+    <div class="ctl"><label for="sx0">Sample x with the rotation axis at detector centre, mm</label><input id="sx0" type="number" step="0.001" value="0"></div>
     <div class="ctl"><label for="sxs">Sample x direction</label><select id="sxs"><option value="1" selected>+ (x = x0 + offset)</option><option value="-1">− (x = x0 − offset)</option></select></div>
-    <div class="ctl"><label for="sy0">Sample y with brain top (z = 0) at detector centre, mm</label><input id="sy0" type="number" step="0.001" value="0"></div>
-    <div class="ctl"><label for="sys">Sample y direction</label><select id="sys"><option value="1" selected>+ (y = y0 + z)</option><option value="-1">− (y = y0 − z)</option></select></div>
+    <div class="ctl"><label for="sy0">Sample y at level 1 (top), mm</label><input id="sy0" type="number" step="0.001" value="-15"></div>
+    <div class="ctl"><label for="sys">Sample y direction</label><select id="sys"><option value="1" selected>+ (lower levels: larger y)</option><option value="-1">− (lower levels: smaller y)</option></select></div>
     <div class="ctl"><label for="cont">Container rings (sparse)</label><select id="cont"><option value="on" selected>On</option><option value="off">Off</option></select></div>
     <div class="ctl"><label for="rc">Container outer radius, mm</label><input id="rc" type="number" min="1" step="0.05" value="10.6"></div>
     <div class="ctl"><label for="cextra">Container rings beyond the wall ring</label><input id="cextra" type="number" min="0" step="1" value="2"></div>
@@ -144,7 +144,7 @@ tfoot td{font-weight:500;border-bottom:0}
 
   <section class="section">
     <h2>Predicted frames for alignment</h2>
-    <p class="lede" style="margin-top:0">What the detector should show after flat-field correction at one position, computed from the 1.9 µm reconstruction. Compare with real frames at 0°, 90°, 180° and 270° to set the vertical position, the axis column and the angle zero. Red circles mark the strongest features to match.</p>
+    <p class="lede" style="margin-top:0">What the detector should show after flat-field correction at one position, computed from the 1.9 µm reconstruction. Compare with real frames at 0°, 90°, 180° and 270° to set the vertical position, the axis column and the angle zero.</p>
     <div class="controls" aria-label="Predicted frame settings" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
       <div class="ctl"><label for="pang">Angle</label><select id="pang"><option value="0">0°</option><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select></div>
       <div class="ctl"><label for="plev">Level</label><select id="plev"></select></div>
@@ -435,9 +435,10 @@ function compress(pos){                 // sorted positions -> windows with cons
 
 // Motor positions: sample x moves the axis relative to the detector centre (ring), sample y moves the
 // sample vertically (level). x0/y0 are the readings at the reference, sxs/sys the directions (+1/-1).
-function motors(xoff,zc){
-  const x0=parseFloat(V('sx0'))||0, y0=parseFloat(V('sy0'))||0, sxs=+V('sxs')||1, sys=+V('sys')||1;
-  return {mx:x0+sxs*xoff, my:y0+sys*zc};
+function motors(xoff,zc,Pl){
+  const x0=parseFloat(V('sx0'))||0, y1=parseFloat(V('sy0')), sxs=+V('sxs')||1, sys=+V('sys')||1;
+  const zc1=Pl.ztop+Pl.WV/2;                     // centre of level 1 (top)
+  return {mx:x0+sxs*xoff, my:(isFinite(y1)?y1:-15)+sys*(zc-zc1)};
 }
 
 function plan(){
@@ -760,21 +761,8 @@ function drawPred(){
   ctx.imageSmoothingEnabled=true; ctx.drawImage(off,0,0,CW,CH);
   const sx=CW/wF, sy=CH/hF, axc=-r0/Pl.PIX;
   if(axc>=0&&axc<=Pl.NX){const X=axc/Pl.NX*CW; ctx.strokeStyle='#3cf'; ctx.setLineDash([6,4]); ctx.beginPath(); ctx.moveTo(X,0); ctx.lineTo(X,CH); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle='#3cf'; ctx.font='14px IBM Plex Mono, monospace'; ctx.fillText(`axis, column ${Math.round(axc)}`,X+6,18);}
-  // keypoints: strongest local edges of the tissue detail
-  const hp=boxBlur(ex,wF,hF,Math.max(2,Math.round(0.05/vox))), det=new Float32Array(ex.length);
-  for(let i=0;i<ex.length;i++) det[i]=ex[i]-hp[i];
-  const sm=boxBlur(det,wF,hF,1), gm=new Float32Array(ex.length);
-  for(let y=1;y<hF-1;y++) for(let x=1;x<wF-1;x++){const i=y*wF+x; gm[i]=ex[i]>0?Math.hypot(sm[i+1]-sm[i-1],sm[i+wF]-sm[i-wF]):0;}
-  const gs=boxBlur(gm,wF,hF,2), sep=Math.max(3,Math.round(300*Pl.PIX/vox)), kp=[];
-  for(let y=2;y<hF-2;y++) for(let x=2;x<wF-2;x++){const v=gs[y*wF+x]; if(v<=0) continue; let mx=true;
-    for(let dy=-sep;dy<=sep&&mx;dy++){const yy=y+dy; if(yy<0||yy>=hF) continue; for(let dx=-sep;dx<=sep;dx++){const xx=x+dx; if(xx<0||xx>=wF) continue; if(gs[yy*wF+xx]>v){mx=false;break;}}}
-    if(mx) kp.push([v,x,y]);}
-  kp.sort((a,b)=>b[0]-a[0]); const top=kp.slice(0,8);
-  ctx.lineWidth=2; ctx.font='bold 14px IBM Plex Mono, monospace';
-  top.forEach(([v,x,y],q)=>{const X=(x+0.5)*sx,Y=(y+0.5)*sy; ctx.strokeStyle='#ff3b3b'; ctx.beginPath(); ctx.arc(X,Y,16,0,2*Math.PI); ctx.stroke(); ctx.fillStyle='#ff3b3b'; ctx.fillText(String(q+1),X+18,Y-10);});
   ctx.fillStyle='#ff6'; ctx.font='13px IBM Plex Mono, monospace'; ctx.fillText(`T ${lo.toFixed(3)}–${hi.toFixed(3)} (stretched)`,8,CH-10);
-  const dpx=(x,y)=>[Math.round((x+0.5)/wF*Pl.NX),Math.round((y+0.5)/hF*Pl.NY)];
-  $('predkp').innerHTML=top.length?`Keypoints (detector column, row): `+top.map(([v,x,y],q)=>{const [c,r]=dpx(x,y);return `<b>${q+1}</b> (${c}, ${r})`;}).join(' · '):'No tissue detail in this frame.';
+  $('predkp').textContent=`Expected frame, ${Pl.NX} × ${Pl.NY} px at ${+(Pl.PIX*1e3).toFixed(3)} µm, contrast stretched.`;
   // overview: whole sample at this angle, divided by the container-only transmission
   const ov=$('predov'), OW=ov.width=420, P=PEX[(ang%180===0)?'0':'90'], OH=ov.height=Math.round(OW*P.h/P.w);
   const oc=ov.getContext('2d'), oid=oc.createImageData(OW,OH), ef=P.w/OW;
@@ -786,7 +774,7 @@ function drawPred(){
   const toX=t=>(t+PM.tm)/(2*PM.tm)*OW, toY=z=>z/(P.h*PM.vox)*OH;
   oc.strokeStyle='rgba(255,255,255,.6)'; oc.setLineDash([4,3]); oc.beginPath(); oc.moveTo(toX(0),0); oc.lineTo(toX(0),OH); oc.stroke(); oc.setLineDash([]);
   oc.strokeStyle='#ffa500'; oc.lineWidth=2; oc.strokeRect(toX(r0),toY(z0),toX(r0+W)-toX(r0),toY(z0+WV)-toY(z0));
-  {const mo=motors(r0+W/2,z0+WV/2); $('predmot').innerHTML=`Motors for this frame: <b>sample x = ${mo.mx.toFixed(4)} mm</b>, <b>sample y = ${mo.my.toFixed(4)} mm</b>`;}
+  {const mo=motors(r0+W/2,z0+WV/2,Pl); $('predmot').innerHTML=`Motors for this frame: <b>sample x = ${mo.mx.toFixed(4)} mm</b>, <b>sample y = ${mo.my.toFixed(4)} mm</b>`;}
   $('predcap').textContent=`Level L${lv.l+1} (z ${Math.max(0,z0).toFixed(2)}–${(z0+WV).toFixed(2)} mm from top), ring ${rk+1}${lv.rings[rk]&&lv.rings[rk].sparse?' (container ring)':''} (t ${r0.toFixed(2)}–${(r0+W).toFixed(2)} mm from the axis), ${ang}°. Flat-field-corrected transmission T = exp(−∫μ): brain from the 1.9 µm reconstruction (7.6 µm sampling) plus uniform medium inside r = ${rin} mm${wmu?` and a wall ${rin}–${rout} mm with μ = ${wmu}/mm`:''}. Tissue is dark. No phase contrast. 180° and 270° are mirror images of 0° and 90°. The real detector may be mirrored or the angle sign reversed relative to this convention.`;
 }
 function fillPredSelects(Pl){
@@ -839,7 +827,7 @@ function render(){
     Pl.levels.forEach(v=>v.rings.forEach(r=>{
       no++;
       const xoff=r.k*Pl.wh-Pl.c+Pl.W/2, zc=v.a+Pl.WV/2, segs=windows(r,C);
-      const mo=motors(xoff,zc);
+      const mo=motors(xoff,zc,Pl);
       scans.push({no,l:v.l,k:r.k,xoff,zc,mx:mo.mx,my:mo.my,segs,frames:segs.reduce((t,q)=>t+q.n,0)});
     }));
     const deg=c=>(c/C*360).toFixed(5);
