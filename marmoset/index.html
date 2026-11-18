@@ -524,6 +524,21 @@ function drawHorizontal(svg,img,i,Pl){
     el('circle',{cx:0,cy:0,r:r1,fill:'none',stroke:sp?'#fff':c,'stroke-width':sp?0.1:0.06,'stroke-opacity':on?0.95:0.25,'stroke-dasharray':sp?'0.25 0.15':''},svg);
     if(selRing===k) el('circle',{cx:0,cy:0,r:(r0+r1)/2,fill:'none',stroke:c,'stroke-width':r1-r0,'stroke-opacity':0.18},svg);
   }
+  // angular coverage bands: at rotation angle theta a ring's strip looks toward direction (cos theta, sin theta)
+  const arc=(r,a0,a1)=>{const x0=r*Math.cos(a0),y0=r*Math.sin(a0),x1=r*Math.cos(a1),y1=r*Math.sin(a1);return `M ${x0} ${y0} A ${r} ${r} 0 ${a1-a0>Math.PI?1:0} 1 ${x1} ${y1}`;};
+  lv.rings.forEach(rg=>{
+    if(rg.sparse) return;
+    const k=rg.k, c=ringColor(k,Pl.Kmax), on=selRing===null||selRing===k, rb=k*Pl.wh-Pl.c+W-0.22;
+    const st=j=>rg.prof?(rg.prof[j]>0?2:(rg.gapBins&&rg.gapBins[j]?1:0)):2;
+    let j0=0;
+    for(let j=1;j<=NB;j++){
+      if(j<NB&&st(j)===st(j0)) continue;
+      const v=st(j0), a0=j0*2*Math.PI/NB, a1=j*2*Math.PI/NB;
+      if(v===2) el('path',{d:arc(rb,a0,a1),fill:'none',stroke:c,'stroke-width':0.28,'stroke-opacity':on?0.95:0.3},svg);
+      else if(v===1) el('path',{d:arc(rb,a0,a1),fill:'none',stroke:'#fff','stroke-width':0.28,'stroke-opacity':on?0.45:0.15,'stroke-dasharray':'0.12 0.1'},svg);
+      j0=j;
+    }
+  });
   const kd=selRing!==null&&selRing<lv.K?selRing:lv.K-1, cd=ringColor(kd,Pl.Kmax), xd=kd*Pl.wh-Pl.c;
   el('rect',{x:xd,y:-S,width:W,height:2*S,fill:cd,'fill-opacity':0.13,stroke:cd,'stroke-width':0.03,'stroke-dasharray':'0.15 0.1'},svg);
   el('rect',{x:xd,y:-S-1.1,width:W,height:0.35,fill:cd},svg);
@@ -535,7 +550,7 @@ function drawHorizontal(svg,img,i,Pl){
   el('line',{x1:S-5.4,x2:S-0.4,y1:S+0.6,y2:S+0.6,stroke:'#fff','stroke-width':0.12},svg);
   txt(svg,S-2.9,S+0.35,'5 mm',{fill:'#fff','font-size':0.5,'text-anchor':'middle','font-family':MONO});
   const name=['Top','Middle','Bottom'][i];
-  $('c'+i).innerHTML=`<b>${name}</b> · z = ${z.toFixed(1)} mm from top · level L${lv.l+1} · ${lv.K} rings to r = ${((lv.K-1)*Pl.wh-Pl.c+W).toFixed(2)} mm (tissue ${(lv.R-MARGIN).toFixed(2)} mm). Strip shown: ring ${kd+1}.`;
+  $('c'+i).innerHTML=`<b>${name}</b> · z = ${z.toFixed(1)} mm from top · level L${lv.l+1} · ${lv.K} rings to r = ${((lv.K-1)*Pl.wh-Pl.c+W).toFixed(2)} mm (tissue ${(lv.R-MARGIN).toFixed(2)} mm). Bands on each ring: bright = dense angles, faint dashed = sparse, none = skipped; hatched = container ring. Strip shown: ring ${kd+1}.`;
 }
 
 function drawStepChart(svg,Pl){
