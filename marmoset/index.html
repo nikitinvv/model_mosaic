@@ -107,6 +107,10 @@ tfoot td{font-weight:500;border-bottom:0}
     <input type="hidden" id="ringang" value="shared">
     <div class="ctl"><label for="gapmode">Empty windows</label><select id="gapmode"><option value="sparse" selected>Record sparse frames</option><option value="skip">Skip</option></select></div>
     <div class="ctl"><label for="gfr">Empty windows: frames per 360°</label><input id="gfr" type="number" min="10" step="100" value="1000"></div>
+    <div class="ctl"><label for="sx0">Sample x with axis at detector centre, mm</label><input id="sx0" type="number" step="0.001" value="0"></div>
+    <div class="ctl"><label for="sxs">Sample x direction</label><select id="sxs"><option value="1" selected>+ (x = x0 + offset)</option><option value="-1">− (x = x0 − offset)</option></select></div>
+    <div class="ctl"><label for="sy0">Sample y with brain top (z = 0) at detector centre, mm</label><input id="sy0" type="number" step="0.001" value="0"></div>
+    <div class="ctl"><label for="sys">Sample y direction</label><select id="sys"><option value="1" selected>+ (y = y0 + z)</option><option value="-1">− (y = y0 − z)</option></select></div>
     <div class="ctl"><label for="cont">Container rings (sparse)</label><select id="cont"><option value="on" selected>On</option><option value="off">Off</option></select></div>
     <div class="ctl"><label for="rc">Container outer radius, mm</label><input id="rc" type="number" min="1" step="0.05" value="10.6"></div>
     <div class="ctl"><label for="cextra">Container rings beyond the wall ring</label><input id="cextra" type="number" min="0" step="1" value="2"></div>
@@ -153,6 +157,7 @@ tfoot td{font-weight:500;border-bottom:0}
       <figure><canvas id="predov" style="width:100%;height:auto;display:block"></canvas><figcaption>Whole sample at this angle (divided by the container), frame in orange, axis dashed.</figcaption></figure>
       <figure><canvas id="predframe" style="width:100%;height:auto;display:block"></canvas><figcaption id="predkp"></figcaption></figure>
     </div>
+    <p id="predmot" style="margin:0;font-size:.9rem"></p>
     <p class="eyebrow" id="predcap" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem"></p>
     <span id="predstate" style="font-size:.8rem;color:var(--muted)"></span>
   </section>
@@ -189,7 +194,7 @@ tfoot td{font-weight:500;border-bottom:0}
   <section class="section">
     <div style="display:flex;flex-wrap:wrap;gap:10px 20px;align-items:end;justify-content:space-between">
       <div><h2>Scan list</h2>
-        <p class="lede" style="margin-top:4px">One block per scan, in order: levels top to bottom, rings inner to outer. Each row is one recorded angular segment, in angle order over 0–360°. Skipped segments are left out. "Axis to frame centre" is the lateral offset of the rotation axis from the detector centre; z is the level centre from the top of the brain.</p></div>
+        <p class="lede" style="margin-top:4px">One block per scan, in order: levels top to bottom, rings inner to outer. Sample x and sample y are the motor positions, from the reference readings and directions set above. Each row is one recorded angular segment, in angle order over 0–360°. Skipped segments are left out. "Axis to frame centre" is the lateral offset of the rotation axis from the detector centre; z is the level centre from the top of the brain.</p></div>
       <div class="ctl" style="min-width:140px"><label for="scanlev">Show</label><select id="scanlev"><option value="all">All levels</option></select></div>
     </div>
     <div class="tablewrap" style="max-height:560px;overflow-y:auto"><table id="scantable"></table></div>
@@ -240,7 +245,7 @@ function ringColor(k,K){const t=K>1?k/(K-1):0;const h=188-158*t;return `hsl(${h}
 function fmtB(b){const u=['B','KB','MB','GB','TB','PB'];let i=0;while(b>=1000&&i<5){b/=1000;i++;}return (b>=100?b.toFixed(0):b>=10?b.toFixed(1):b.toFixed(2))+' '+u[i];}
 function fmtN(n){return Math.round(n).toLocaleString('en-US');}
 function fmtT(s){const h=s/3600;return h>=48?(h/24).toFixed(1)+' days':h.toFixed(1)+' h';}
-const IDS=['nx','ny','pix','cpr','fps','exp','ovh','oh','ov','s','mode','proj','seg','ringang','minskip','cont','rc','cfr','cextra','gapmode','gfr'];
+const IDS=['nx','ny','pix','cpr','fps','exp','ovh','oh','ov','s','mode','proj','seg','ringang','minskip','cont','rc','cfr','cextra','gapmode','gfr','sx0','sxs','sy0','sys'];
 let applied={};
 function snapshot(){const o={};IDS.forEach(id=>o[id]=$(id).value);return o;}
 function V(id){return applied[id];}
@@ -426,6 +431,13 @@ function compress(pos){                 // sorted positions -> windows with cons
   }
   w.forEach(x=>{ if(x.n===1) x.d=1; x.end=x.start+x.n*x.d; delete x.fixed; });
   return w;
+}
+
+// Motor positions: sample x moves the axis relative to the detector centre (ring), sample y moves the
+// sample vertically (level). x0/y0 are the readings at the reference, sxs/sys the directions (+1/-1).
+function motors(xoff,zc){
+  const x0=parseFloat(V('sx0'))||0, y0=parseFloat(V('sy0'))||0, sxs=+V('sxs')||1, sys=+V('sys')||1;
+  return {mx:x0+sxs*xoff, my:y0+sys*zc};
 }
 
 function plan(){
@@ -774,6 +786,7 @@ function drawPred(){
   const toX=t=>(t+PM.tm)/(2*PM.tm)*OW, toY=z=>z/(P.h*PM.vox)*OH;
   oc.strokeStyle='rgba(255,255,255,.6)'; oc.setLineDash([4,3]); oc.beginPath(); oc.moveTo(toX(0),0); oc.lineTo(toX(0),OH); oc.stroke(); oc.setLineDash([]);
   oc.strokeStyle='#ffa500'; oc.lineWidth=2; oc.strokeRect(toX(r0),toY(z0),toX(r0+W)-toX(r0),toY(z0+WV)-toY(z0));
+  {const mo=motors(r0+W/2,z0+WV/2); $('predmot').innerHTML=`Motors for this frame: <b>sample x = ${mo.mx.toFixed(4)} mm</b>, <b>sample y = ${mo.my.toFixed(4)} mm</b>`;}
   $('predcap').textContent=`Level L${lv.l+1} (z ${Math.max(0,z0).toFixed(2)}–${(z0+WV).toFixed(2)} mm from top), ring ${rk+1}${lv.rings[rk]&&lv.rings[rk].sparse?' (container ring)':''} (t ${r0.toFixed(2)}–${(r0+W).toFixed(2)} mm from the axis), ${ang}°. Flat-field-corrected transmission T = exp(−∫μ): brain from the 1.9 µm reconstruction (7.6 µm sampling) plus uniform medium inside r = ${rin} mm${wmu?` and a wall ${rin}–${rout} mm with μ = ${wmu}/mm`:''}. Tissue is dark. No phase contrast. 180° and 270° are mirror images of 0° and 90°. The real detector may be mirrored or the angle sign reversed relative to this convention.`;
 }
 function fillPredSelects(Pl){
@@ -826,22 +839,23 @@ function render(){
     Pl.levels.forEach(v=>v.rings.forEach(r=>{
       no++;
       const xoff=r.k*Pl.wh-Pl.c+Pl.W/2, zc=v.a+Pl.WV/2, segs=windows(r,C);
-      scans.push({no,l:v.l,k:r.k,xoff,zc,segs,frames:segs.reduce((t,q)=>t+q.n,0)});
+      const mo=motors(xoff,zc);
+      scans.push({no,l:v.l,k:r.k,xoff,zc,mx:mo.mx,my:mo.my,segs,frames:segs.reduce((t,q)=>t+q.n,0)});
     }));
     const deg=c=>(c/C*360).toFixed(5);
-    const lines=['scan,level,ring,axis_to_frame_centre_mm,level_centre_z_mm,segment,start_deg,n_angles,step_deg,end_deg,start_count,step_count,end_count'];
-    scans.forEach(sc=>sc.segs.forEach((q,i)=>lines.push([sc.no,sc.l+1,sc.k+1,sc.xoff.toFixed(4),sc.zc.toFixed(4),i+1,deg(q.start),q.n,(q.d/C*360).toFixed(7),deg(q.end),q.start,q.d,q.end].join(','))));
+    const lines=['scan,level,ring,sample_x_mm,sample_y_mm,axis_to_frame_centre_mm,level_centre_z_mm,segment,start_deg,n_angles,step_deg,end_deg,start_count,step_count,end_count'];
+    scans.forEach(sc=>sc.segs.forEach((q,i)=>lines.push([sc.no,sc.l+1,sc.k+1,sc.mx.toFixed(4),sc.my.toFixed(4),sc.xoff.toFixed(4),sc.zc.toFixed(4),i+1,deg(q.start),q.n,(q.d/C*360).toFixed(7),deg(q.end),q.start,q.d,q.end].join(','))));
     $('psocsv').value=lines.join('\n');
     $('psocount').textContent=`${fmtN(scans.length)} scans · ${fmtN(lines.length-1)} segments · ${fmtN(Pl.frames)} frames`;
     const fl=$('scanlev').value, sel=fl==='all'?scans:scans.filter(x=>x.l===+fl);
     const optHTML=`<option value="all">All levels</option>`+Pl.levels.map(v=>`<option value="${v.l}">L${v.l+1}</option>`).join('');
     if($('scanlev').dataset.n!==String(Pl.L)){const keep=fl;$('scanlev').innerHTML=optHTML;$('scanlev').dataset.n=String(Pl.L);$('scanlev').value=[...$('scanlev').options].some(o=>o.value===keep)?keep:'all';}
-    $('scantable').innerHTML=`<thead><tr><th>Scan</th><th>Level</th><th>Ring</th><th>Axis to frame centre, mm</th><th>z centre, mm</th><th>Seg</th><th>Start, °</th><th>N angles</th><th>Step, °</th><th>End, °</th><th>Start count</th><th>Step, counts</th><th>End count</th></tr></thead><tbody>`+
+    $('scantable').innerHTML=`<thead><tr><th>Scan</th><th>Level</th><th>Ring</th><th>Sample x, mm</th><th>Sample y, mm</th><th>Axis to frame centre, mm</th><th>z centre, mm</th><th>Seg</th><th>Start, °</th><th>N angles</th><th>Step, °</th><th>End, °</th><th>Start count</th><th>Step, counts</th><th>End count</th></tr></thead><tbody>`+
       sel.map(sc=>sc.segs.map((q,i)=>{
         const head=i===0, rs=`style="border-top:${head?'2px solid var(--rule)':'0'}"`;
-        const info=head?`<td><b>${sc.no}</b></td><td>L${sc.l+1}</td><td><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ringColor(sc.k,Pl.Kmax)};margin-right:6px"></span>${sc.k+1}</td><td>${sc.xoff.toFixed(3)}</td><td>${sc.zc.toFixed(3)}</td>`:'<td></td><td></td><td></td><td></td><td></td>';
+        const info=head?`<td><b>${sc.no}</b></td><td>L${sc.l+1}</td><td><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${ringColor(sc.k,Pl.Kmax)};margin-right:6px"></span>${sc.k+1}</td><td><b>${sc.mx.toFixed(4)}</b></td><td><b>${sc.my.toFixed(4)}</b></td><td>${sc.xoff.toFixed(3)}</td><td>${sc.zc.toFixed(3)}</td>`:'<td></td><td></td><td></td><td></td><td></td><td></td><td></td>';
         return `<tr ${rs}>${info}<td>${i+1}${q.sp?' <span style="color:var(--muted)">sparse</span>':''}</td><td>${deg(q.start)}</td><td>${fmtN(q.n)}</td><td>${(q.d/C*360).toFixed(6)}</td><td>${deg(q.end)}</td><td>${fmtN(q.start)}</td><td>${q.d}</td><td>${fmtN(q.end)}</td></tr>`;
-      }).join('')+`<tr class="scansum"><td></td><td colspan="4" style="text-align:left">scan ${sc.no} total</td><td></td><td></td><td>${fmtN(sc.frames)}</td><td colspan="5" style="text-align:left">${fmtT(sc.frames/Pl.fps+Pl.ovh)} · ${fmtB(sc.frames*Pl.frame)}</td></tr>`).join('')+'</tbody>';
+      }).join('')+`<tr class="scansum"><td></td><td colspan="6" style="text-align:left">scan ${sc.no} total</td><td></td><td></td><td>${fmtN(sc.frames)}</td><td colspan="5" style="text-align:left">${fmtT(sc.frames/Pl.fps+Pl.ovh)} · ${fmtB(sc.frames*Pl.frame)}</td></tr>`).join('')+'</tbody>';
   }
   $('rings').innerHTML=`<thead><tr><th>Ring</th><th>Radius, mm</th><th>Axis to frame edge, px</th><th>Levels</th><th>Frames, all levels</th><th>vs uniform</th><th>Raw data</th><th>Scan time</th></tr></thead><tbody>`+
     Pl.rings.map(r=>`<tr data-k="${r.k}" class="${selRing===r.k?'sel':''}"><td><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${ringColor(r.k,Pl.Kmax)};margin-right:8px"></span>${r.k+1}</td><td>${Math.max(0,r.r0).toFixed(2)} – ${r.r1.toFixed(2)}</td><td>${r.k===0?fmtN(Pl.c/PIX)+' inside frame':fmtN(r.r0/PIX)+' outside'}</td><td>${r.nlev}</td><td>${fmtN(r.frames)}</td><td>${(100*r.frames/r.uni).toFixed(0)}%</td><td>${fmtB(r.frames*Pl.frame)}</td><td>${fmtT(r.frames/Pl.fps+r.nlev*Pl.ovh)}</td></tr>`).join('')+
