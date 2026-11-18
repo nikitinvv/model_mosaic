@@ -377,21 +377,35 @@ function fillGaps(S,minDeg){
 
 // Empty windows of a dense ring get sparse frames on a coarse grid (step ds counts, ds | CPR/2,
 // so 180-360 repeats 0-180). Dense windows are unchanged; sparse positions fall only inside gaps.
-function addGapFrames(r,C,ds){
-  const dense=windows(r,C).map(w=>({...w})), all=dense.slice(), gapBins=new Uint8Array(NB);
-  const gaps=[]; let pos=0;
-  dense.forEach(w=>{if(w.start>pos) gaps.push([pos,w.start]); pos=Math.max(pos,w.end);});
-  if(pos<C) gaps.push([pos,C]);
-  let extra=0;
-  gaps.forEach(([a,b])=>{
-    let p=Math.ceil(a/ds)*ds; if(p===a&&a>0&&dense.some(w=>w.end===a)) p+=ds;   // keep clear of the dense frame grid edge
-    const st=p; let n=0;
-    while(p<b){ gapBins[Math.min(NB-1,Math.floor(p/C*NB))]=1; n++; p+=ds; }
-    if(n){ all.push({start:st,d:ds,n,end:st+n*ds,sp:true}); extra+=n; }
-  });
-  all.sort((x,y)=>x.start-y.start);
-  r.wins=all; r.gapBins=gapBins; r.gapFrames=extra; r.n+=extra;
+function addGapFrames(r,C,spPos){
+  const dense=windows(r,C).map(w=>({...w})), gapBins=new Uint8Array(NB);
+  const inDense=p=>dense.some(w=>p>=w.start&&p<w.start+w.n*w.d);
+  const pick=spPos.filter(p=>!inDense(p));
+  pick.forEach(p=>gapBins[Math.min(NB-1,Math.floor(p/C*NB))]=1);
+  const all=dense.concat(compress(pick).map(w=>({...w,sp:true}))).sort((x,y)=>x.start-y.start);
+  r.wins=all; r.gapBins=gapBins; r.gapFrames=pick.length; r.n+=pick.length;
   return r;
+}
+
+// Frame positions (counts) of a level master schedule, as every m-th master frame. The same master
+// indices are used in both halves, so 180-360 repeats 0-180 and the positions coincide with the dense
+// rings' angles.
+function subsetPositions(M,C,m){
+  const out=[]; let idx=0;
+  M.segs.forEach(q=>{ for(let j=0;j<q.n;j++,idx++){ if(idx%m) continue; const p=q.start+j*q.d; if(q.A) out.push(p); if(q.B) out.push(p+C/2); } });
+  return out.sort((a,b)=>a-b);
+}
+function masterCount(M){ return M.segs.reduce((t,q)=>t+q.n,0); }
+function compress(pos){                 // sorted positions -> windows with constant step
+  const w=[];
+  for(let i=0;i<pos.length;i++){
+    const l=w[w.length-1];
+    if(l&&l.n===1&&pos[i]-l.start>0&&(i+1>=pos.length||true)&&!l.fixed){ l.d=pos[i]-l.start; l.n=2; l.fixed=true; continue; }
+    if(l&&l.start+l.n*l.d===pos[i]){ l.n++; continue; }
+    w.push({start:pos[i],d:1,n:1});
+  }
+  w.forEach(x=>{ if(x.n===1) x.d=1; x.end=x.start+x.n*x.d; delete x.fixed; });
+  return w;
 }
 
 function plan(){
@@ -418,31 +432,34 @@ function plan(){
     const R=mode==='full'?RMAX+MARGIN:r+MARGIN;
     const K=Kof(R);
     const Nuni=s*2*Math.PI*R/PIX;
-    const rings=[];
+    const rings=[]; let Mlev=null;
     if(projMode==='adaptive'){
       // step from the deepest tissue along the beam over all rings (the inner rings set it), held per segment,
       // paired with theta+180; every ring records these angles unless its strip sees no tissue
       const profs=[]; for(let k=0;k<K;k++) profs.push(fillGaps(depthProfile(Math.max(0,a),Math.min(H,b),ringIn(k),ringOut(k)),minskip));
       const Sm=new Float64Array(NB); profs.forEach(S=>{for(let j=0;j<NB;j++) if(S[j]>Sm[j]) Sm[j]=S[j];});
-      const M=schedule(Sm,seg,s,PIX,CPR,0);
+      const M=schedule(Sm,seg,s,PIX,CPR,0); Mlev=M;
       profs.forEach((S,k)=>rings.push(gatedRing(M,S,k,s,PIX,CPR)));
     } else if(projMode==='uskip'){
       // one uniform grid for the level (like one big detector); each ring skips 2-deg windows with no tissue
-      const M=schedule(null,2,s,PIX,CPR,R);
+      const M=schedule(null,2,s,PIX,CPR,R); Mlev=M;
       for(let k=0;k<K;k++){
         const o=schedule(fillGaps(depthProfile(Math.max(0,a),Math.min(H,b),ringIn(k),ringOut(k)),minskip),2,s,PIX,CPR,0);
         rings.push(fromMaster(M,o,k,'shared',s,PIX,CPR));
       }
     } else {
+      Mlev=schedule(null,seg,s,PIX,CPR,R);
       for(let k=0;k<K;k++){const sp=schedule(null,seg,s,PIX,CPR,R);rings.push({k,n:sp.n,prof:null,segs:sp.segs});}
     }
     // container rings: beyond the brain only the uniform container is in the beam, so sparse angles suffice
-    const Kd=K;
-    if(gapMode==='sparse'&&projMode!=='uniform'){ const ds=bestDivisor(CPR/2,Math.max(1,Math.floor(CPR/GFR)),1); rings.forEach(r=>addGapFrames(r,CPR,ds)); }
+    const Kd=K, Nm=masterCount(Mlev);
+    if(gapMode==='sparse'&&projMode!=='uniform'){ const sp=subsetPositions(Mlev,CPR,Math.max(1,Math.round(Nm/(GFR/2)))); rings.forEach(r=>addGapFrames(r,CPR,sp)); }
+    // container rings: every m-th angle of the dense schedule (same angles as the dense rings, only sparser)
     if(contOn){
-      const Kw=Kof(RC+MARGIN)-1, Kc=Math.max(Kd,Kw+1+CEXTRA), d=bestDivisor(CPR/2,Math.max(1,Math.floor(CPR/CFR)),1), nf=CPR/d;
-      const f=new Float64Array(NB).fill(PIX/(s*(d/CPR*2*Math.PI)));
-      for(let k=Kd;k<Kc;k++) rings.push({k,n:nf,prof:f,segs:[],wins:[{start:0,end:CPR,d,n:nf}],sparse:true});
+      const Kw=Kof(RC+MARGIN)-1, Kc=Math.max(Kd,Kw+1+CEXTRA);
+      const pos=subsetPositions(Mlev,CPR,Math.max(1,Math.round(Nm/(CFR/2)))), wins=compress(pos);
+      const dmean=CPR/Math.max(1,pos.length), f=new Float64Array(NB).fill(PIX/(s*(dmean/CPR*2*Math.PI)));
+      for(let k=Kd;k<Kc;k++) rings.push({k,n:pos.length,prof:f,segs:[],wins:wins.map(w=>({...w})),sparse:true});
     }
     const proj=rings.reduce((t,q)=>t+q.n,0);
     const sa=Math.max(0,l===0?0:a+(WV-wv)/2), sb=Math.min(H,l===L-1?H:a+(WV-wv)/2+wv);
