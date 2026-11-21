@@ -126,7 +126,7 @@ setInterval(function(){
     const badK = new Set(bb.map(b => (b.level - 1) + ',' + (b.ring - 1)));
     document.querySelectorAll('rect.tile').forEach(r => { r.classList.toggle('ms-bad', badK.has(r.getAttribute('data-l') + ',' + r.getAttribute('data-k'))); });
   }
-  // On a web server (e.g. GitHub Pages) the status comes from status.json next to the page, every 10 min.
+  // On a web server (e.g. GitHub Pages) the status comes from status.json next to the page, every 30 min.
   async function pullStatus(){
     if (!/^https?:/.test(location.protocol)) return;
     try {
@@ -138,7 +138,7 @@ setInterval(function(){
       tick();
     } catch (e) {}
   }
-  setTimeout(pullStatus, 1500); setInterval(pullStatus, 600000);
+  setTimeout(pullStatus, 1500); setInterval(pullStatus, 1800000);
   function tick(){
     try {
       const el = document.getElementById('scan_status_data');
