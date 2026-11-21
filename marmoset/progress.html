@@ -31,7 +31,7 @@ circle.ring-arc.ms-current{stroke:#ffb347!important;stroke-opacity:1!important;s
   <div id="ms_bar_wrap"><div id="ms_bar"></div></div>
 </div>
 <script id="scan_status_data" type="application/json">{}</script>
-<script id="status_overrides" type="application/json">{"exclude_levels": [1, 2, 3]}</script>
+<script id="status_overrides" type="application/json">{"exclude_levels": [1, 2, 3], "extra_done_lr": [[4, 1], [4, 2], [4, 3], [4, 4], [4, 5], [4, 6], [4, 7], [5, 1], [5, 2], [5, 3], [5, 4], [5, 5], [5, 6], [5, 7], [6, 1], [6, 2], [6, 3], [6, 4], [6, 5], [6, 6], [6, 7], [7, 1], [7, 2], [7, 3], [7, 4], [7, 5], [7, 6], [7, 7], [8, 1], [8, 2], [8, 3], [8, 4], [8, 5], [8, 6], [8, 7], [9, 1], [9, 2], [9, 3], [9, 4], [9, 5], [9, 6], [9, 7], [10, 1], [10, 2], [10, 3], [10, 4], [10, 5], [10, 6], [10, 7], [11, 1], [11, 2], [11, 3], [11, 4], [11, 5], [11, 6], [11, 7], [12, 1], [12, 2], [12, 3], [12, 4], [12, 5], [12, 6], [12, 7], [13, 1], [13, 2], [13, 3], [13, 4], [13, 5], [13, 6], [13, 7], [14, 1], [14, 2], [14, 3], [14, 4], [14, 5], [14, 6], [14, 7], [15, 1], [15, 2], [15, 3], [15, 4], [15, 5], [15, 6], [15, 7]]}</script>
 <script>
 // Reload every 5 min while a scan is running, to pick up the driver's latest status.
 setInterval(function(){
@@ -69,7 +69,19 @@ setInterval(function(){
     if (exL.size && Array.isArray(st.done_lr)) {
       const keep = [], keepNo = [];
       st.done_lr.forEach((x, i) => { if (exL.has(x[0])) nExcl++; else { keep.push(x); if (st.done) keepNo.push(st.done[i]); } });
-      st = Object.assign({}, st, {done_lr: keep, done: keepNo, total: (st.total || 0) - nExcl, excluded_note: nExcl ? ('L' + [...exL].sort((a,b)=>a-b).join(', L') + ' not collected') : ''});
+      st = Object.assign({}, st, {done_lr: keep, done: keepNo});
+    }
+    if (exL.size) {                                   // excluded levels also leave the total
+      const nPlan = (typeof lastPl !== 'undefined' && lastPl) ? lastPl.levels.filter(v => exL.has(v.l + 1)).reduce((t, v) => t + v.K, 0) : 0;
+      st = Object.assign({}, st, {total: (st0.total || 0) - Math.max(nExcl, nPlan),
+                                  excluded_note: 'L' + [...exL].sort((a,b)=>a-b).join(', L') + ' not collected'});
+    }
+    const extra = ov.extra_done_lr || [];              // collected in earlier runs (checked on disk)
+    if (extra.length && Array.isArray(st.done_lr)) {
+      const have = new Set(st.done_lr.map(x => x[0] + ',' + x[1]));
+      const curK0 = st.current_lr ? st.current_lr[0] + ',' + st.current_lr[1] : '';
+      const add = extra.filter(x => !have.has(x[0] + ',' + x[1]) && !exL.has(x[0]) && (x[0] + ',' + x[1]) !== curK0);
+      st = Object.assign({}, st, {done_lr: st.done_lr.concat(add)});
     }
     const done = new Set(st.done || []);
     const cur = st.current;
@@ -92,7 +104,7 @@ setInterval(function(){
     });
     window.__msWarn = (!useLR && typeof lastPl !== 'undefined' && lastPl && st.total && lastPl.scans !== st.total)
       ? `page plan has ${lastPl.scans} scans, the running plan ${st.total}: set the page to the CSV's settings and press Calculate` : '';
-    const ndone = (st.done||[]).length;
+    const ndone = Array.isArray(st.done_lr) ? st.done_lr.length : (st.done||[]).length;
     const total = st.total || 0;
     // Fractional progress: completed scans + fraction of the current scan's segments.
     let frac = total ? ndone / total : 0;
@@ -685,7 +697,7 @@ function plan(){
   }
   const scans=levels.reduce((t,v)=>t+v.K,0);
   const frames=levels.reduce((t,v)=>t+v.proj,0);
-  const uniFrames=levels.reduce((t,v)=>t+v.Kd*v.Nuni,0);
+  const uniFrames=levels.reduce((t,v)=>t+v.K*(sameLev?s*2*Math.PI*Rall/PIX:v.Nuni),0);   // all rings dense over 360 deg, no skipping
   const sparseFrames=levels.reduce((t,v)=>t+v.rings.reduce((u,r)=>u+(r.sparse?r.n:(r.gapFrames||0)),0),0);
   const gapFrames=levels.reduce((t,v)=>t+v.rings.reduce((u,r)=>u+(r.gapFrames||0),0),0);
   const sparseScans=levels.reduce((t,v)=>t+v.K-v.Kd,0);
@@ -976,10 +988,10 @@ function render(){
   $('lev').innerHTML=Pl.levels.map(v=>`<option value="${v.l}"${v.l===selLevel?' selected':''}>L${v.l+1} · z ${Math.max(0,v.a).toFixed(1)}–${Math.min(H,v.b).toFixed(1)} mm · ${v.K} rings</option>`).join('');
   if(selRing!==null&&selRing>=Pl.Kmax) selRing=null;
   const expWarn=Pl.exp*Pl.fps>1;
-  const save=1-(Pl.frames-Pl.sparseFrames)/Pl.uniFrames;
+  const save=1-Pl.frames/Pl.uniFrames;
   $('totals').innerHTML=[
     ['Scans',fmtN(Pl.scans),`${Pl.L} levels × up to ${Pl.Kmax} rings`+(Pl.sparseScans?` · ${Pl.sparseScans} sparse container scans`:'')+(Pl.gapFrames?` · ${fmtN(Pl.gapFrames)} sparse frames in empty windows`:'')],
-    ['Projections',fmtN(Pl.frames),Pl.projMode!=='uniform'?`${(save*100).toFixed(0)}% fewer than uniform step`:`${fmtB(Pl.frame)} per frame (uint16)`],
+    ['Projections',fmtN(Pl.frames),Pl.projMode!=='uniform'?`${(save*100).toFixed(0)}% fewer than scanning every ring densely over 360°`:`${fmtB(Pl.frame)} per frame (uint16)`],
     ['Raw data',fmtB(Pl.raw),`${fmtB(Pl.frame)} per frame · flats and darks not included`],
     ['Reconstruction',fmtB(Pl.vox*4),`float32 · ${fmtB(Pl.vox*2)} as uint16`],
     ['Beam time',fmtT(Pl.time),expWarn?`<span class="warn">exposure ${(Pl.exp*1000).toFixed(0)} ms > frame period ${(1000/Pl.fps).toFixed(0)} ms</span>`:`${Pl.fps} fps · ${fmtB(Pl.frame*Pl.fps)}/s to disk · ${fmtN(Pl.ovh)} s/scan overhead`],
